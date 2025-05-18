@@ -1,5 +1,0 @@
-ase
-scipy
-networkx
-matplotlib
-mace-torch

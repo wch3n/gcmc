@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gcmc"
+version = "0.1.0"
+description = "GCMC and clustering analysis"
+authors = [
+    { name="Wei Chen", email="wei.chen@uclouvain.be" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "ase",
+    "scipy",
+    "networkx",
+    "matplotlib",
+    "mace-torch"
+]
+
+[project.urls]
+Homepage = "https://github.com/wch3n/gcmc"

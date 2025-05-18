@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: gcmc
+Version: 0.1.0
+Summary: GCMC and clustering analysis
+Author-email: Wei Chen <wei.chen@uclouvain.be>
+License: MIT
+Project-URL: Homepage, https://github.com/wch3n/gcmc
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: ase
+Requires-Dist: scipy
+Requires-Dist: networkx
+Requires-Dist: matplotlib
+Requires-Dist: mace-torch

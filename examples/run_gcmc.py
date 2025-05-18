@@ -5,12 +5,12 @@ from gcmc import MultiLayerSiteGCMC, find_fcc_hollow_sites, analyze_and_plot
 
 mxene_poscar = './POSCAR'
 mace_models = './ft-omat_0-00_stagetwo.model'
-chemical_potential = -5.0 # bulk ref: -3.0
+chemical_potential = -3.0 # bulk ref: -3.0
 temperature = 300
-nsteps = 2000
+nsteps = 1000
 traj_file = f'cu_gcmc_{temperature}_{chemical_potential}.traj'
 relax = True
-relax_steps = 100
+relax_steps = 200
 n_layers = 5
 layer_spacing = 2.2
 fcc_offset = 1.8

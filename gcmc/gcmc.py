@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 import random
 from ase import Atom
-from ase.optimize import BFGS, FIRE
+from ase.optimize import LBFGS, FIRE
 from ase.io import write, read
 from ase.io.trajectory import Trajectory
 
@@ -27,7 +27,8 @@ class MultiLayerSiteGCMC:
         traj_file='gcmc.traj',
         checkpoint_traj='gcmc_checkpoint.traj',
         checkpoint_data='gcmc_checkpoint.pkl',
-        checkpoint_interval=1000
+        checkpoint_interval=1000,
+        seed=81
     ):
         """
         Initialize the GCMC simulation.
@@ -75,6 +76,8 @@ class MultiLayerSiteGCMC:
         self.checkpoint_traj = checkpoint_traj
         self.checkpoint_data = checkpoint_data
         self.checkpoint_interval = checkpoint_interval
+        self.rng = random.Random(seed)
+        self.seed = seed
 
         self.pillar_xy = np.unique(np.round(self.all_sites[:, :2], 3), axis=0)
 
@@ -126,7 +129,7 @@ class MultiLayerSiteGCMC:
                     possible.append(site)
         if not possible:
             return None
-        site = random.choice(possible)
+        site = self.rng.choice(possible)
         atoms_new = self.atoms.copy()
         atoms_new.append(Atom(self.element, site))
         return atoms_new
@@ -141,7 +144,7 @@ class MultiLayerSiteGCMC:
                 possible.append(site)
         if not possible:
             return None
-        site = random.choice(possible)
+        site = self.rng.choice(possible)
         atoms_new = self.atoms.copy()
         for i, atom in enumerate(atoms_new):
             if atom.symbol == self.element and np.linalg.norm(atom.position - site) < 0.5:
@@ -151,8 +154,8 @@ class MultiLayerSiteGCMC:
 
     def relax_structure(self, atoms):
         if self.relax:
-            dyn = BFGS(atoms, logfile=None)
-            dyn.run(fmax=0.05, steps=self.relax_steps)
+            dyn = LBFGS(atoms, logfile=None)
+            dyn.run(fmax=0.01, steps=self.relax_steps)
         return atoms
 
     def metropolis_accept(self, e_new, move_type):
@@ -160,12 +163,12 @@ class MultiLayerSiteGCMC:
         n_new = n_old + (1 if move_type == 'insert' else -1)
         delta_e = e_new - self.e_old
         if move_type == 'insert':
-            arg = -self.beta * (delta_e - self.mu)
+            tau = -self.beta * (delta_e - self.mu)
         elif move_type == 'delete':
-            arg = -self.beta * (delta_e + self.mu)
+            tau = -self.beta * (delta_e + self.mu)
         else:
             raise ValueError("move_type must be 'insert' or 'delete'")
-        return np.exp(min(arg, 0)), arg
+        return np.exp(min(tau, 0)), tau
 
     def _save_checkpoint(self):
         """Save the current structure and MC counters/step."""
@@ -201,7 +204,7 @@ class MultiLayerSiteGCMC:
         traj_mode = 'a' if os.path.exists(self.traj_file) else 'w'
         with Trajectory(self.traj_file, traj_mode) as traj:
             for s in range(self.step, self.nsteps):
-                move_type = random.choice(['insert', 'delete'])
+                move_type = self.rng.choice(['insert', 'delete'])
                 if move_type == 'insert':
                     self.attempted_insertions += 1
                     atoms_new = self.attempt_insertion()
@@ -216,8 +219,8 @@ class MultiLayerSiteGCMC:
                 if self.relax:
                     atoms_new = self.relax_structure(atoms_new)
                 e_new = atoms_new.get_potential_energy()
-                prob, arg = self.metropolis_accept(e_new, move_type)
-                if random.random() < prob:
+                prob, tau = self.metropolis_accept(e_new, move_type)
+                if self.rng.random() < prob:
                     # Accept the move
                     self.atoms = atoms_new
                     self.e_old = e_new
@@ -225,9 +228,9 @@ class MultiLayerSiteGCMC:
                         self.accepted_insertions += 1
                     else:
                         self.accepted_deletions += 1
-                    print(f"Step {s}: Accepted {move_type} (arg={arg:8.2f}, E={e_new:8.2f} eV)")
+                    print(f"Step {s:5d}: Accepted {move_type} (tau = {tau:8.2f}, E = {e_new:10.2f} eV)")
                 else:
-                    print(f"Step {s}: Rejected {move_type} (arg={arg:8.2f})")
+                    print(f"Step {s:5d}: Rejected {move_type} (tau = {tau:8.2f})")
                 # Save snapshot (strip calculator, and only if not empty)
                 traj.write(self.atoms, step=s, move=move_type)
                 # Checkpoint every checkpoint_interval steps

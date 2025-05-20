@@ -8,7 +8,7 @@ from ase import Atom, Atoms
 from ase.optimize import LBFGS
 from ase.io import write, read
 from ase.io.trajectory import Trajectory
-from ase.neighborlist import NeighborList
+from scipy.spatial import cKDTree
 
 logger = logging.getLogger("gcmc")
 logger.setLevel(logging.INFO)
@@ -18,14 +18,35 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 logger.propagate = False
 
-class StandardSweepGCMC:
+class GCMC:
     """
-    Grand Canonical Monte Carlo for surface clusters with:
-      - Standard sweep: N MC attempts per sweep, N = max(#adsorbates, min_moves)
-      - Random in-plane insertion (no grid), insert at pillar top (never afloat)
-      - Side-exposed deletion and displacement only (never buried)
-      - Full support for functional groups, max layers, relaxation, checkpointing
-      - General for any adsorbate element
+    General Grand Canonical Monte Carlo (GCMC) for surface adsorption,
+    enforcing 'support' for all moves (no floating atoms, no overlaps).
+
+    Parameters (attributes are the same as the __init__ args):
+    ----------------------------------------------------------
+    atoms: ASE Atoms object (initial slab with or without functionals)
+    calculator: ASE-compatible calculator
+    mu: Chemical potential (eV) for adsorbate
+    T: Simulation temperature (K)
+    element: Adsorbate species symbol (e.g. 'Cu')
+    nsteps: Number of MC sweeps
+    relax: Whether to relax after each move
+    relax_steps: Max steps for relaxation
+    traj_file, unique_traj_file: Trajectory outputs
+    checkpoint_traj, checkpoint_data: Restart files
+    checkpoint_interval: Interval between checkpoints
+    seed: Random seed
+    tol: Minimal allowed distance between adsorbates/functionals (Å)
+    xy_tol: In-plane tolerance for 'support' logic (Å)
+    z_tol: z-tolerance for defining exposed (top) adsorbates (Å)
+    max_layers, layer_spacing: Restrict max adsorbate layers (optional)
+    T_anneal, nsteps_anneal: Simulated annealing controls (optional)
+    vertical_offset: Height offset above support atom for new adsorbate (Å)
+    functional_elements: Which elements to consider as functionals (if None, autodetected)
+    min_moves: Minimum MC moves per sweep
+    w_insert, w_delete, w_displace: Relative weights for move type probabilities
+    max_trials: Maximum attempts for insertion/displacement per move
     """
 
     def __init__(
@@ -35,30 +56,28 @@ class StandardSweepGCMC:
         mu: float,
         T: float,
         element: str = 'Cu',
-        substrate_elements: Tuple[str, ...] = ("Ti", "C"),
         nsteps: int = 1000,
         relax: bool = False,
         relax_steps: int = 20,
         traj_file: str = 'gcmc_full.traj',
-        accepted_traj_file: str = 'gcmc_accepted.traj',
+        unique_traj_file: str = 'gcmc_unique.traj',
         checkpoint_traj: str = 'gcmc_checkpoint.traj',
         checkpoint_data: str = 'gcmc_checkpoint.pkl',
         checkpoint_interval: int = 1000,
         seed: int = 81,
-        tol: float = 1.2,
+        tol: float = 1.5,
         xy_tol: float = 1.2,
-        z_tol: float = 0.5,
+        z_tol: float = 0.3,
         max_layers: Optional[int] = None,
         layer_spacing: float = 2.0,
         T_anneal: Optional[float] = None,
         nsteps_anneal: Optional[int] = None,
-        functional_elements: Optional[Tuple[str, ...]] = None,
         vertical_offset: float = 1.8,
-        adsorbate_neighbor_cutoff: float = 2.8,
-        min_moves: int = 5,  # Minimum number of moves per sweep (important at low coverage)
-        w_insert: float = 0.2,
-        w_delete: float = 0.2,
-        w_displace: float = 0.6,
+        functional_elements: Optional[Tuple[str, ...]] = None,
+        min_moves: int = 5,
+        w_insert: float = 0.1,
+        w_delete: float = 0.1,
+        w_displace: float = 0.8,
         max_trials: int = 10,
     ) -> None:
         self.atoms: Atoms = atoms
@@ -67,12 +86,11 @@ class StandardSweepGCMC:
         self.T_prod: float = T
         self.T: float = T
         self.element: str = element
-        self.substrate_elements: Tuple[str, ...] = substrate_elements
         self.nsteps: int = nsteps
         self.relax: bool = relax
         self.relax_steps: int = relax_steps
         self.traj_file: str = traj_file
-        self.accepted_traj_file: str = accepted_traj_file
+        self.unique_traj_file: str = unique_traj_file
         self.checkpoint_traj: str = checkpoint_traj
         self.checkpoint_data: str = checkpoint_data
         self.checkpoint_interval: int = checkpoint_interval
@@ -83,26 +101,16 @@ class StandardSweepGCMC:
         self.layer_spacing: float = layer_spacing
         self.T_anneal: Optional[float] = T_anneal
         self.nsteps_anneal: Optional[int] = nsteps_anneal
-        self.rng: random.Random = random.Random(seed)
-        self.seed: int = seed
         self.vertical_offset: float = vertical_offset
-        self.adsorbate_neighbor_cutoff: float = adsorbate_neighbor_cutoff
         self.min_moves: int = min_moves
         self.w_insert: float = w_insert
         self.w_delete: float = w_delete
         self.w_displace: float = w_displace
         self.max_trials: int = max_trials
+        self.rng: random.Random = random.Random(seed)
+        self.seed: int = seed
 
-        # --- Auto-detect functional elements if not provided ---
-        all_elements = set(atom.symbol for atom in self.atoms)
-        if functional_elements is None:
-            self.functional_elements = tuple(
-                e for e in all_elements if e not in self.substrate_elements and e != self.element
-            )
-        else:
-            self.functional_elements = functional_elements
-        logger.info(f"Functional elements: {self.functional_elements}")
-
+        # Move counters
         self.attempted_insertions: int = 0
         self.accepted_insertions: int = 0
         self.attempted_deletions: int = 0
@@ -111,20 +119,14 @@ class StandardSweepGCMC:
         self.accepted_displacements: int = 0
         self.step: int = 0
 
-        try:
-            self.substrate_z: float = max(
-                atom.position[2] for atom in self.atoms
-                if atom.symbol in self.substrate_elements
-            )
-        except ValueError:
-            logger.error("No substrate atoms found in the initial structure!")
-            raise
-
+        # Layer capping, if used
+        self.init_z_max: float = max(atom.position[2] for atom in self.atoms)
         if self.max_layers is not None:
-            self.max_z = self.substrate_z + self.max_layers * self.layer_spacing
+            self.max_z = self.init_z_max + self.max_layers * self.layer_spacing
         else:
             self.max_z = None
 
+        # Restart logic
         if os.path.exists(self.checkpoint_traj) and os.path.exists(self.checkpoint_data):
             self._load_checkpoint()
             logger.info(f"Resuming from checkpoint at step {self.step}")
@@ -133,116 +135,169 @@ class StandardSweepGCMC:
             self.e_old: float = self.atoms.get_potential_energy()
 
     def _get_adsorbate_atoms(self) -> List[Atom]:
+        """Return all adsorbate atoms currently present."""
         return [atom for atom in self.atoms if atom.symbol == self.element]
+
+    def get_exposed_adsorbate_indices(self) -> List[int]:
+        """
+        Return indices of 'exposed' adsorbates (those with no other adsorbate above within xy_tol).
+        """
+        ads_indices = [i for i, atom in enumerate(self.atoms) if atom.symbol == self.element]
+        positions = np.array([self.atoms[i].position for i in ads_indices])
+        exposed = []
+        for idx, pos in zip(ads_indices, positions):
+            # Check for any adsorbate above within xy_tol in-plane
+            above = [
+                True for other_pos in positions
+                if (other_pos[2] > pos[2]) and
+                   (np.linalg.norm(other_pos[:2] - pos[:2]) < self.xy_tol)
+            ]
+            if not any(above):
+                exposed.append(idx)
+        return exposed
 
     def attempt_random_insertion(self) -> Optional[Atoms]:
         """
-        Random in-plane insertion: Pick random (x, y) in cell, insert atop nearest pillar.
+        Try to insert a new adsorbate at a random (x, y) above the highest local support atom (any species),
+        provided there is support beneath and no overlap (tol) with any existing atom.
+        Detailed debug info if insertion fails.
         """
         for trial in range(self.max_trials):
             cell = self.atoms.get_cell()
             rx, ry = self.rng.random(), self.rng.random()
             xy = rx * cell[0, :2] + ry * cell[1, :2]
-            # Find atoms close to (x, y)
-            matches = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
-            if not matches:
-                continue  # No pillar here, skip
-            z_top = max(atom.position[2] for atom in matches)
-            site = np.array([xy[0], xy[1], z_top + self.vertical_offset])
-            if self.max_z is not None and site[2] > self.max_z:
+            supports = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
+            if not supports:
+                logger.debug(
+                    f"Insertion trial {trial}: No support found beneath xy=({xy[0]:.2f}, {xy[1]:.2f})"
+                )
+                continue  # No support beneath
+            z_insert = max(atom.position[2] for atom in supports) + self.vertical_offset
+            if self.max_z is not None and z_insert > self.max_z:
+                logger.debug(
+                    f"Insertion trial {trial}: z={z_insert:.2f} exceeds max_z={self.max_z:.2f} at xy=({xy[0]:.2f}, {xy[1]:.2f})"
+                )
                 continue
+            site = np.array([xy[0], xy[1], z_insert])
             too_close = any(
-                np.linalg.norm(atom.position - site) < 1.0
+                np.linalg.norm(atom.position - site) < self.tol
                 for atom in self.atoms
-                if atom.symbol in self.functional_elements or atom.symbol == self.element
             )
-            if not too_close:
-                atoms_new = self.atoms.copy()
-                atoms_new.append(Atom(self.element, site))
-                return atoms_new
-        logger.debug("Random insertion failed: all trials blocked or not on a pillar.")
+            if too_close:
+                logger.debug(
+                    f"Insertion trial {trial}: Position ({site[0]:.2f}, {site[1]:.2f}, {site[2]:.2f}) too close to another atom."
+                )
+                continue
+            # Successful trial
+            atoms_new = self.atoms.copy()
+            atoms_new.append(Atom(self.element, site))
+            return atoms_new
+        logger.debug("Random insertion failed: all trials blocked or no support beneath.")
         return None
 
-    def get_side_exposed_adsorbate_indices(self) -> List[int]:
-        """
-        Returns indices of all adsorbate atoms that are side-exposed (not fully encapsulated).
-        Uses ASE's NeighborList with PBC, considers edge atoms (fcc: <6 adsorbate neighbors).
-        """
-        atoms = self.atoms
-        symbols = atoms.get_chemical_symbols()
-        adsorbate_indices = [i for i, sym in enumerate(symbols) if sym == self.element]
-        if not adsorbate_indices:
-            return []
-        cutoffs = [self.adsorbate_neighbor_cutoff if sym == self.element else 0.0 for sym in symbols]
-        nl = NeighborList(cutoffs, skin=0.0, self_interaction=False, bothways=True)
-        nl.update(atoms)
-        removable = []
-        for idx in adsorbate_indices:
-            indices, offsets = nl.get_neighbors(idx)
-            adsorbate_neighbors = [j for j in indices if symbols[j] == self.element]
-            if len(adsorbate_neighbors) < 6:
-                removable.append(idx)
-        return removable
-
-    def get_top_layer_adsorbate_indices(self) -> List[int]:
-        """
-        Returns indices of adsorbate atoms in the topmost adsorbate layer.
-        This is a simpler definition than side-exposed: only atoms within z_tol of the max z among adsorbates.
-        """
-        adsorbate_indices = [i for i, atom in enumerate(self.atoms) if atom.symbol == self.element]
-        if not adsorbate_indices:
-            return []
-        z_adsorbates = [self.atoms[i].position[2] for i in adsorbate_indices]
-        z_max = max(z_adsorbates)
-        return [i for i in adsorbate_indices if abs(self.atoms[i].position[2] - z_max) < self.z_tol]
-
     def attempt_deletion(self) -> Optional[Atoms]:
-        side_exposed_indices = self.get_top_layer_adsorbate_indices()
-        if not side_exposed_indices:
-            logger.debug("No side-exposed adsorbate found for deletion.")
+        """
+        Attempt to delete a randomly chosen 'exposed' adsorbate (no one above within xy_tol).
+        Detailed debug info if deletion fails.
+        """
+        exposed_indices = self.get_exposed_adsorbate_indices()
+        if not exposed_indices:
+            logger.debug("Deletion: No exposed adsorbates available for deletion.")
             return None
-        atom_idx = self.rng.choice(side_exposed_indices)
+        atom_idx = self.rng.choice(exposed_indices)
+        ads_atom = self.atoms[atom_idx]
+        logger.debug(
+            f"Attempting to delete adsorbate at idx={atom_idx}, "
+            f"position=({ads_atom.position[0]:.2f}, {ads_atom.position[1]:.2f}, {ads_atom.position[2]:.2f})"
+        )
         atoms_new = self.atoms.copy()
         del atoms_new[atom_idx]
         return atoms_new
 
     def attempt_displacement(self) -> Optional[Atoms]:
-        side_exposed_indices = self.get_top_layer_adsorbate_indices()
-        if not side_exposed_indices:
-            logger.debug("No side-exposed adsorbate found for displacement.")
+        """
+        Attempt to move a randomly chosen exposed adsorbate to a new valid supported position,
+        ensuring no overlaps and the move does not create or leave floating atoms.
+        Detailed debug info if displacement fails.
+        """
+        exposed_indices = self.get_exposed_adsorbate_indices()
+        if not exposed_indices:
+            logger.debug("Displacement: No exposed adsorbate available for displacement.")
             return None
         for trial in range(self.max_trials):
             cell = self.atoms.get_cell()
             rx, ry = self.rng.random(), self.rng.random()
             xy = rx * cell[0, :2] + ry * cell[1, :2]
-            matches = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
-            if not matches:
+            supports = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
+            if not supports:
+                logger.debug(
+                    f"Displacement trial {trial}: No support found beneath xy=({xy[0]:.2f}, {xy[1]:.2f})"
+                )
                 continue
-            z_top = max(atom.position[2] for atom in matches)
-            new_pos = np.array([xy[0], xy[1], z_top + self.vertical_offset])
-            if self.max_z is not None and new_pos[2] > self.max_z:
+            z_new = max(atom.position[2] for atom in supports) + self.vertical_offset
+            if self.max_z is not None and z_new > self.max_z:
+                logger.debug(
+                    f"Displacement trial {trial}: z={z_new:.2f} exceeds max_z={self.max_z:.2f} at xy=({xy[0]:.2f}, {xy[1]:.2f})"
+                )
                 continue
+            new_pos = np.array([xy[0], xy[1], z_new])
             too_close = any(
-                np.linalg.norm(atom.position - new_pos) < 1.0
+                np.linalg.norm(atom.position - new_pos) < self.tol
                 for atom in self.atoms
-                if atom.symbol in self.functional_elements or atom.symbol == self.element
             )
             if too_close:
+                logger.debug(
+                    f"Displacement trial {trial}: Position ({new_pos[0]:.2f}, {new_pos[1]:.2f}, {new_pos[2]:.2f}) too close to another atom."
+                )
                 continue
-            src_idx = self.rng.choice(side_exposed_indices)
+            src_idx = self.rng.choice(exposed_indices)
+            old_pos = self.atoms[src_idx].position
+            logger.debug(
+                f"Displacement trial {trial}: Moving adsorbate idx={src_idx} "
+                f"from ({old_pos[0]:.2f}, {old_pos[1]:.2f}, {old_pos[2]:.2f}) "
+                f"to ({new_pos[0]:.2f}, {new_pos[1]:.2f}, {new_pos[2]:.2f})"
+            )
             atoms_new = self.atoms.copy()
             atoms_new[src_idx].position = new_pos
             return atoms_new
-        logger.debug("Random displacement failed: all trials blocked or not on a pillar.")
+        logger.debug("Displacement failed: all trials blocked or no support beneath.")
         return None
 
-    def relax_structure(self, atoms: Atoms) -> Atoms:
-        if self.relax:
-            dyn = LBFGS(atoms, logfile=None)
-            dyn.run(fmax=0.05, steps=self.relax_steps)
-        return atoms
+    def all_adsorbates_supported(self, atoms: Atoms, cutoff: float = 3.5) -> bool:
+        """
+        Returns True if all adsorbate atoms have at least one neighbor (any atom except itself) within `cutoff` Å.
+        Otherwise, returns False (i.e., desorbed/unsupported atom exists).
+        """
+        pos_all = atoms.positions
+        sym_all = atoms.get_chemical_symbols()
+        ads_indices = [i for i, s in enumerate(sym_all) if s == self.element]
+        if not ads_indices:
+            return True
+
+        tree = cKDTree(pos_all)
+        for idx in ads_indices:
+            # Find all neighbors within cutoff (excluding self)
+            neighbor_indices = tree.query_ball_point(pos_all[idx], cutoff)
+            neighbor_indices = [j for j in neighbor_indices if j != idx]
+            if not neighbor_indices:
+                return False  # Found an orphan/desorbed atom
+        return True
+
+    def relax_structure(self, atoms: Atoms) -> Tuple[Atoms, bool]:
+        """
+        Returns (relaxed_atoms, converged).
+        Converged is True if relaxation stopped by reaching fmax criterion.
+        """
+        atoms_relaxed = atoms.copy()
+        atoms_relaxed.calc = self.calculator
+        dyn = LBFGS(atoms_relaxed, logfile=None)
+        converged = dyn.run(fmax=0.05, steps=self.relax_steps)
+        return atoms_relaxed, converged
 
     def metropolis_accept(self, e_new: float, move_type: str) -> Tuple[float, float]:
+        """
+        Return (acceptance probability, tau argument) for Metropolis criterion.
+        """
         delta_e = e_new - self.e_old
         if move_type == 'insert':
             tau = -self.beta * (delta_e - self.mu)
@@ -256,6 +311,7 @@ class StandardSweepGCMC:
         return np.exp(min(tau, 0)), tau
 
     def _save_checkpoint(self) -> None:
+        """Save current structure and state for restart."""
         atoms_to_save = self.atoms.copy()
         atoms_to_save.calc = None
         write(self.checkpoint_traj, atoms_to_save)
@@ -276,6 +332,7 @@ class StandardSweepGCMC:
         logger.info(f"Checkpoint saved at step {self.step}.")
 
     def _load_checkpoint(self) -> None:
+        """Restart from previous checkpoint."""
         self.atoms = read(self.checkpoint_traj)
         self.atoms.calc = self.calculator
         with open(self.checkpoint_data, 'rb') as f:
@@ -292,17 +349,25 @@ class StandardSweepGCMC:
             self.rng.setstate(state['rng_state'])
         self.T = state.get('T', self.T_prod)
 
-    def run(self, max_moves: Optional[int] = 50) -> None:
-        accepted_traj_mode: str = 'a' if os.path.exists(self.accepted_traj_file) else 'w'
+    def _acceptance_rate(self, attempted: int, accepted: int) -> float:
+        """Helper to compute acceptance rate percentage."""
+        return (accepted / attempted * 100) if attempted > 0 else 0.0
+
+    def run(self, max_moves: Optional[int] = 200, log_every: int = 1) -> None:
+        """
+        Run the GCMC simulation for nsteps sweeps.
+        Each sweep = N moves, where N = max(number of adsorbates, min_moves), capped by max_moves if set.
+        """
+        accepted_traj_mode: str = 'a' if os.path.exists(self.unique_traj_file) else 'w'
         temp_was_logged: bool = False
         full_traj_mode: str = 'a' if os.path.exists(self.traj_file) else 'w'
         traj_full = Trajectory(self.traj_file, full_traj_mode)
 
-        header_fmt = "{:>7s} {:>12s} {:>8s} {:>10s} {:>12s}"
-        step_fmt   = "{:7d} {:>12s} {:>8s} {:10.2f} {:12.4f}"
-        logger.info(header_fmt.format("Sweep", "Move", "Status", "Tau", "Energy (eV)"))
+        header_fmt = "{:>7s} {:>7s} {:>12s} {:>8s} {:>10s} {:>12s}"
+        step_fmt   = "{:7d} {:7d} {:>12s} {:>8s} {:10.2f} {:12.4f}"
+        logger.info(header_fmt.format("Sweep", "Trial", "Move", "Status", "Tau", "Energy (eV)"))
 
-        with Trajectory(self.accepted_traj_file, accepted_traj_mode) as traj_acc:
+        with Trajectory(self.unique_traj_file, accepted_traj_mode) as traj_acc:
             for sweep in range(self.step, self.nsteps):
 
                 # Simulated Annealing if enabled
@@ -357,9 +422,21 @@ class StandardSweepGCMC:
                         logger.warning(f"Unrecognized move type: {move_type}")
                         continue
 
-                    atoms_new.calc = self.calculator
                     if self.relax:
-                        atoms_new = self.relax_structure(atoms_new)
+                        atoms_relaxed, converged = self.relax_structure(atoms_new)
+                        # Check for excessive movement
+                        disp = np.linalg.norm(atoms_new.get_positions() - atoms_relaxed.get_positions(), axis=1).max()
+                        if not converged:
+                            logger.debug("Rejected: relaxation did not converge.")
+                            continue
+                        if disp > 3.0:  # adjust as appropriate
+                            logger.debug(f"Rejected: atoms moved too much during relaxation (max disp {disp:.2f} Å).")
+                            continue
+                        atoms_new = atoms_relaxed  # Accept the relaxed geometry
+                        # filter out desorbed configurations
+                        if not self.all_adsorbates_supported(atoms_new):
+                            logger.debug("Rejected: found desorbed adsorbates after relaxation.")
+                            continue  
                     e_new: float = atoms_new.get_potential_energy()
                     prob, tau = self.metropolis_accept(e_new, move_type)
                     status: str
@@ -374,23 +451,42 @@ class StandardSweepGCMC:
                         elif move_type == 'displace':
                             self.accepted_displacements += 1
                         status = "ACCEPT"
-                        logger.info(step_fmt.format(sweep, move_type_log, status, tau, e_new))
+                        logger.info(step_fmt.format(sweep, m, move_type_log, status, tau, e_new))
                         self.atoms.calc = None
                         traj_acc.write(self.atoms, step=sweep, move=move_type_log, energy=self.e_old, status=status)
                     else:
                         status = "REJECT"
-                        logger.info(step_fmt.format(sweep, move_type_log, status, tau, self.e_old))
+                        logger.info(step_fmt.format(sweep, m, move_type_log, status, tau, self.e_old))
                     self.atoms.calc = None
                     traj_full.write(self.atoms, step=sweep, move=move_type_log, energy=self.e_old, status=status)
+
+                if sweep % log_every == 0:
+                    msg = (
+                        f"Sweep {sweep:5d}: "
+                        f"Ins {self.accepted_insertions}/{self.attempted_insertions} "
+                        f"({self._acceptance_rate(self.attempted_insertions, self.accepted_insertions):5.1f}%), "
+                        f"Del {self.accepted_deletions}/{self.attempted_deletions} "
+                        f"({self._acceptance_rate(self.attempted_deletions, self.accepted_deletions):5.1f}%), "
+                        f"Disp {self.accepted_displacements}/{self.attempted_displacements} "
+                        f"({self._acceptance_rate(self.attempted_displacements, self.accepted_displacements):5.1f}%)"
+                    )
+                    logger.debug(msg)
 
                 self.step = sweep + 1
                 if (self.checkpoint_interval and (self.step % self.checkpoint_interval == 0)):
                     self._save_checkpoint()
 
-            self._save_checkpoint()
-            logger.info("GCMC completed.")
-            logger.info(f"Insertions: attempted {self.attempted_insertions}, accepted {self.accepted_insertions}")
-            logger.info(f"Deletions: attempted {self.attempted_deletions}, accepted {self.accepted_deletions}")
-            logger.info(f"Displacements: attempted {self.attempted_displacements}, accepted {self.accepted_displacements}")
+        self._save_checkpoint()
+        logger.info("GCMC completed.")
+        logger.info(
+            f"Total trial moves: {self.attempted_insertions + self.attempted_deletions + self.attempted_displacements:6d}, "
+            f"Total acceptance: "
+            f"Ins {self.accepted_insertions}/{self.attempted_insertions} "
+            f"({self._acceptance_rate(self.attempted_insertions, self.accepted_insertions):.1f}%), "
+            f"Del {self.accepted_deletions}/{self.attempted_deletions} "
+            f"({self._acceptance_rate(self.attempted_deletions, self.accepted_deletions):.1f}%), "
+            f"Disp {self.accepted_displacements}/{self.attempted_displacements} "
+            f"({self._acceptance_rate(self.attempted_displacements, self.accepted_displacements):.1f}%)"
+        )
 
         traj_full.close()

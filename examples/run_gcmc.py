@@ -1,7 +1,7 @@
 from ase.io import read
 from ase.constraints import FixAtoms
 from mace.calculators import MACECalculator
-from gcmc import StandardSweepGCMC, analyze_and_plot
+from gcmc import GCMC, analyze_and_plot
 
 # Read MXene structure 
 atoms = read('./POSCAR')
@@ -15,14 +15,13 @@ mace_calc = MACECalculator(model_paths=[mace_models], device='cuda')
 
 # Run GCMC
 print("Starting GCMC...")
-gcmc = StandardSweepGCMC(
+gcmc = GCMC(
     atoms=atoms,
     calculator=mace_calc,
     mu=-0.4,
     T=300,
     element='Cu',
-    substrate_elements=("Ti", "C"),  # or any other tuple!
-    nsteps=100,
+    nsteps=50,
     relax=False,
     relax_steps=100,
     T_anneal=None,

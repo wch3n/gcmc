@@ -33,6 +33,7 @@ class GCMC:
     nsteps: Number of MC sweeps
     relax: Whether to relax after each move
     relax_steps: Max steps for relaxation
+    fmax: convergence criteron for forces
     traj_file, unique_traj_file: Trajectory outputs
     checkpoint_traj, checkpoint_data: Restart files
     checkpoint_interval: Interval between checkpoints
@@ -59,6 +60,7 @@ class GCMC:
         nsteps: int = 1000,
         relax: bool = False,
         relax_steps: int = 20,
+        fmax: float = 0.05,
         traj_file: str = 'gcmc_full.traj',
         unique_traj_file: str = 'gcmc_unique.traj',
         checkpoint_traj: str = 'gcmc_checkpoint.traj',
@@ -89,6 +91,7 @@ class GCMC:
         self.nsteps: int = nsteps
         self.relax: bool = relax
         self.relax_steps: int = relax_steps
+        self.fmax: float = fmax
         self.traj_file: str = traj_file
         self.unique_traj_file: str = unique_traj_file
         self.checkpoint_traj: str = checkpoint_traj
@@ -291,7 +294,7 @@ class GCMC:
         atoms_relaxed = atoms.copy()
         atoms_relaxed.calc = self.calculator
         dyn = LBFGS(atoms_relaxed, logfile=None)
-        converged = dyn.run(fmax=0.05, steps=self.relax_steps)
+        converged = dyn.run(fmax=self.fmax, steps=self.relax_steps)
         return atoms_relaxed, converged
 
     def metropolis_accept(self, e_new: float, move_type: str) -> Tuple[float, float]:

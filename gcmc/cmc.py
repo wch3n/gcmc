@@ -8,6 +8,7 @@ from typing import Any, Optional, Tuple
 import numpy as np
 from ase import Atoms
 from ase.io import write, Trajectory
+from ase.geometry import get_distances
 
 from .base import BaseMC
 from .utils import generate_adsorbate_configuration
@@ -58,6 +59,7 @@ class CMC(BaseMC):
         xy_tol: float = 0.5,
         support_xy_tol: Optional[float] = 2.5,
         z_max_support: float = 3.0,
+        vertical_offset: float = 1.8,
         relax: bool = False,
         relax_steps: int = 10,
         fmax: float = 0.05,
@@ -85,6 +87,7 @@ class CMC(BaseMC):
         self.xy_tol = xy_tol
         self.support_xy_tol = support_xy_tol
         self.z_max_support = z_max_support
+        self.vertical_offset = vertical_offset
         self.relax = relax
         self.traj_file = traj_file
         self.unique_traj_file = unique_traj_file
@@ -143,50 +146,56 @@ class CMC(BaseMC):
             site_type=site_type,
             xy_tol=xy_tol,
             support_xy_tol=support_xy_tol,
+            vertical_offset=vertical_offset,
             seed=seed,
             **kwargs
         )
 
     def attempt_displacement(self) -> Optional[Atoms]:
-        """
-        Attempt to displace a randomly chosen adsorbate, ensuring supported final state.
-        Returns a new Atoms object if move is proposed, else None.
-        """
         ads_indices = self.ads_indices
         if len(ads_indices) == 0:
             logger.warning("No adsorbates to displace.")
             return None
 
         idx = self.rng.choice(ads_indices)
-        atoms_new = self.atoms.copy()
-        atom = atoms_new[idx]
-        pos = atom.position.copy()
-        cell = atoms_new.get_cell()
+        pos = self.atoms.positions[idx].copy()
+        cell = self.atoms.get_cell()
+        pbc = self.atoms.get_pbc()
 
-        # Displacement in xy with PBC
+        # Displacement in xy, wrap to PBC
         delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
         new_xy = pos[:2] + delta
-        if atoms_new.get_pbc()[0] or atoms_new.get_pbc()[1]:
-            cell = atoms_new.get_cell()
-            xy_matrix = cell[:2, :2]  # Only take x and y
+
+        if any(pbc[:2]):
+            xy_matrix = cell[:2, :2]
             frac = np.linalg.solve(xy_matrix.T, new_xy)
             frac = frac % 1.0
             new_xy = np.dot(xy_matrix.T, frac)
 
-        # Find support beneath new site
-        all_pos = atoms_new.get_positions()
-        z_below = [
-            p[2]
-            for j, p in enumerate(all_pos)
-            if j != idx
-            and np.linalg.norm(p[:2] - new_xy) < self.support_xy_tol
-            and (pos[2] - p[2]) > 0
-        ]
-        if not z_below:
+        # PBC-aware support check in xy, vectorized
+        all_pos = self.atoms.get_positions()
+        N = len(all_pos)
+
+        # Pad positions to shape (N,3) with z=0 for xy-distances
+        new_xyz = np.zeros((1, 3))
+        new_xyz[0, :2] = new_xy[:2]
+        all_xyz = np.zeros((N, 3))
+        all_xyz[:, :2] = all_pos[:, :2]
+
+        dxy = get_distances(new_xyz, all_xyz, cell=cell, pbc=pbc)[1].flatten()
+        dz = pos[2] - all_pos[:, 2]
+        mask = (dxy < self.support_xy_tol) & (dz > 0) & (dz < self.z_max_support)
+        # Exclude the atom itself
+        mask[idx] = False
+
+        if not np.any(mask):
             logger.debug(f"Displacement rejected: no support at new position {new_xy}.")
             return None
-        new_z = max(z_below) + 1.8  # vertical_offset
-        atom.position = [new_xy[0], new_xy[1], new_z]
+        new_z = np.max(all_pos[:, 2][mask]) + self.vertical_offset
+
+        # Only now copy atoms and apply the move
+        atoms_new = self.atoms.copy()
+        atoms_new[idx].position = [new_xy[0], new_xy[1], new_z]
         return atoms_new
 
     def metropolis_accept(self, e_new: float, T: float = 300.0) -> float:

@@ -1,19 +1,22 @@
-# gcmc/__init__.py
+# -*- coding: utf-8 -*-
+"""
+gcmc package: Monte Carlo simulation tools for surface/adsorbate systems.
 
-from .utils import (
-    generate_adsorbate_configuration,
-    get_toplayer_xy,
-    get_hollow_xy,
-    classify_hollow_sites,
-)
+Exports:
+- BaseMC: Common MC functionality (ensemble-neutral)
+- GCMC: Grand Canonical Monte Carlo
+- CMC: Canonical Monte Carlo
+- utils: Adsorbate configuration generation, site registry, etc.
+"""
+
+from .base import BaseMC
 from .gcmc import GCMC
-from .cmc import CanonicalMC
+from .cmc import CMC
+from . import utils
 
 __all__ = [
-    "generate_adsorbate_configuration",
-    "get_toplayer_xy",
-    "get_hollow_xy",
-    "classify_hollow_sites",
+    "BaseMC",
     "GCMC",
-    "CanonicalMC",
+    "CMC",
+    "utils",
 ]

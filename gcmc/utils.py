@@ -127,7 +127,7 @@ def generate_adsorbate_configuration(
     element: str = "Cu",
     coverage: float = 1.0,
     xy_tol: float = 0.5,
-    support_xy_tol: float = 2.0,
+    support_xy_tol: float = 2.5,
     vertical_offset: float = 1.8,
     substrate_element: str = "Ti",
     seed: int = 42,

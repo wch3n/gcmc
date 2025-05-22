@@ -1,18 +1,18 @@
-import os
-import pickle
+# -*- coding: utf-8 -*-
+"""
+cmc.py - Canonical Monte Carlo for surface adsorbate systems, with from_clean_surface classmethod
+"""
+
 import logging
-import random
+from typing import Any, Optional, Tuple
 import numpy as np
-from typing import Optional, Tuple, Any, Literal
+from ase import Atoms
+from ase.io import write, Trajectory
 
-from ase import Atoms, Atom
-from ase.io import write, read
-from ase.io.trajectory import Trajectory
-from ase.optimize import LBFGS
-
+from .base import BaseMC
 from .utils import generate_adsorbate_configuration
 
-logger = logging.getLogger("cmc")
+logger = logging.getLogger("mc")
 logger.setLevel(logging.INFO)
 if not logger.hasHandlers():
     handler = logging.StreamHandler()
@@ -20,281 +20,262 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 logger.propagate = False
 
-class BaseMC:
+
+class CMC(BaseMC):
     """
-    Base MC class: shared logic for checkpointing, relaxation, etc.
-    """
-    def __init__(
-        self,
-        T: float,
-        relax: bool,
-        relax_steps: int,
-        traj_file: str = "traj.traj",
-        accepted_traj_file: str = "unique.traj",
-        checkpoint_traj: str = "checkpoint.traj",
-        checkpoint_data: str = "checkpoint.pkl",
-        checkpoint_interval: int = 1000,
-        seed: int = 81,
-        fmax: float = 0.05,
-    ):
-        self.T = T
-        self.beta = 1 / (8.617333e-5 * T)
-        self.relax = relax
-        self.relax_steps = relax_steps
-        self.fmax = fmax
-        self.traj_file = traj_file
-        self.accepted_traj_file = accepted_traj_file
-        self.checkpoint_traj = checkpoint_traj
-        self.checkpoint_data = checkpoint_data
-        self.checkpoint_interval = checkpoint_interval
-        self.seed = seed
-        self.rng = random.Random(seed)
-        self.step = 0
-        self.calculator: Optional[Any] = None
-
-    def _save_checkpoint(self) -> None:
-        atoms_to_save = self.atoms.copy()
-        atoms_to_save.calc = None
-        write(self.checkpoint_traj, atoms_to_save)
-        state = {
-            "step": self.step,
-            "e_old": self.e_old,
-            "rng_state": self.rng.getstate(),
-        }
-        with open(self.checkpoint_data, "wb") as f:
-            pickle.dump(state, f)
-        logger.info(f"Checkpoint saved at step {self.step}.")
-
-    def _load_checkpoint(self) -> None:
-        self.atoms = read(self.checkpoint_traj)
-        with open(self.checkpoint_data, "rb") as f:
-            state = pickle.load(f)
-        self.step = state.get("step", 0)
-        self.e_old = state.get("e_old", None)
-        if "rng_state" in state:
-            self.rng.setstate(state["rng_state"])
-
-    def relax_structure(self, atoms: Atoms) -> Atoms:
-        """
-        Optionally relax structure using LBFGS optimizer.
-        """
-        if self.relax:
-            atoms_relax = atoms.copy()
-            atoms_relax.calc = self.calculator
-            dyn = LBFGS(atoms_relax, logfile=None)
-            dyn.run(fmax=self.fmax, steps=self.relax_steps)
-            return atoms_relax
-        else:
-            return atoms
-
-class CanonicalMC(BaseMC):
-    """
-    Canonical Monte Carlo (CMC) with explicit sweeps for fixed-N adsorbates.
+    Canonical Monte Carlo class for fixed-number adsorbate systems.
 
     Args:
-        substrate_atoms: ASE Atoms object (no adsorbates).
-        calculator: ASE calculator.
-        T: Temperature (K).
-        nsweeps: Number of sweeps (each sweep = N displacement moves).
-        relax: Whether to relax each accepted structure.
-        relax_steps: Steps for relaxation.
-        traj_file, accepted_traj_file: Trajectory output.
-        checkpoint_traj, checkpoint_data: Checkpointing.
-        checkpoint_interval: Save frequency.
-        seed: RNG seed.
-        max_trials: Maximum trials per displacement.
-        displacement_sigma: Maximum in-plane displacement (Å).
-        adsorbate_element: Symbol of adsorbate ("Cu").
-        substrate_element: Symbol of substrate ("Ti").
-        site_type: "fcc", "hcp", or "atop".
-        coverage: ML coverage.
-        xy_tol, support_xy_tol, vertical_offset: Geometry parameters.
-
-    Usage:
-        cmc = CanonicalMC(...)
-        cmc.run(nsweeps=5000)
+        atoms: ASE Atoms object (with adsorbates)
+        calculator: ASE calculator
+        adsorbate_element: Symbol of adsorbate (e.g., "Cu")
+        substrate_elements: Tuple of substrate elements (e.g., ("Ti", "C"))
+        functional_elements: Tuple of functional group elements (optional)
+        coverage: ML coverage (e.g., 1.0 = 1 ML)
+        site_type: "fcc", "hcp", or "atop"
+        displacement_sigma: Width of displacement moves (Angstrom)
+        xy_tol: Tolerance for site registry
+        support_xy_tol: Lateral cutoff for "support" check
+        z_max_support: Max z-separation for "support" (Angstrom)
+        relax: Whether to relax after move
+        relax_steps: LBFGS steps per move
+        fmax: LBFGS convergence (eV/Angstrom)
+        seed: RNG seed
+        traj_file: Output file for trajectory
+        unique_traj_file: Output file for unique (accepted) structures
     """
 
     def __init__(
         self,
-        substrate_atoms: Atoms,
+        atoms: Atoms,
         calculator: Any,
-        T: float,
-        relax: bool = False,
-        relax_steps: int = 20,
-        fmax: float = 0.05,
-        traj_file: str = "cmc_full.traj",
-        accepted_traj_file: str = "cmc_unique.traj",
-        checkpoint_traj: str = "cmc_checkpoint.traj",
-        checkpoint_data: str = "cmc_checkpoint.pkl",
-        checkpoint_interval: int = 1000,
-        seed: int = 81,
-        max_trials: int = 10,
-        displacement_sigma: float = 5.0,
         adsorbate_element: str = "Cu",
-        substrate_element: str = "Ti",
-        site_type: Literal["atop", "fcc", "hcp"] = "fcc",
+        substrate_elements: Tuple[str, ...] = ("Ti", "C"),
+        functional_elements: Optional[Tuple[str, ...]] = None,
         coverage: float = 1.0,
+        site_type: str = "fcc",
+        displacement_sigma: float = 1.5,
         xy_tol: float = 0.5,
-        support_xy_tol: float = 2.0,
-        vertical_offset: float = 1.8,
-    ) -> None:
+        support_xy_tol: Optional[float] = 2.5,
+        z_max_support: float = 3.0,
+        relax: bool = False,
+        relax_steps: int = 10,
+        fmax: float = 0.05,
+        seed: int = 81,
+        traj_file: str = "cmc.traj",
+        unique_traj_file: str = "cmc_unique.traj",
+    ):
+        if support_xy_tol is None:
+            support_xy_tol = xy_tol
         super().__init__(
-            T=T,
-            relax=relax,
+            atoms=atoms,
+            calculator=calculator,
+            adsorbate_element=adsorbate_element,
+            substrate_elements=substrate_elements,
+            functional_elements=functional_elements,
+            neighbor_tol=3.0,
+            detach_tol=3.0,
             relax_steps=relax_steps,
             fmax=fmax,
-            traj_file=traj_file,
-            accepted_traj_file=accepted_traj_file,
-            checkpoint_traj=checkpoint_traj,
-            checkpoint_data=checkpoint_data,
-            checkpoint_interval=checkpoint_interval,
-            seed=seed
+            seed=seed,
         )
-        self.max_trials = max_trials
-        self.displacement_sigma = displacement_sigma
-        self.adsorbate_element = adsorbate_element
-        self.substrate_element = substrate_element
-        self.site_type = site_type
         self.coverage = coverage
+        self.site_type = site_type
+        self.displacement_sigma = displacement_sigma
         self.xy_tol = xy_tol
         self.support_xy_tol = support_xy_tol
-        self.vertical_offset = vertical_offset
+        self.z_max_support = z_max_support
+        self.relax = relax
+        self.traj_file = traj_file
+        self.unique_traj_file = unique_traj_file
 
-        self.calculator = calculator
-        self.atoms = generate_adsorbate_configuration(
-            atoms=substrate_atoms,
+        self.e_old = self.get_potential_energy(self.atoms)
+        self._update_indices()
+        self.accepted_moves = 0
+        self.total_moves = 0
+
+    @classmethod
+    def from_clean_surface(
+        cls,
+        atoms: Atoms,
+        calculator: Any,
+        adsorbate_element: str = "Cu",
+        substrate_elements: Tuple[str, ...] = ("Ti", "C"),
+        top_layer_element: str = "Ti",  # New explicit argument!
+        functional_elements: Optional[Tuple[str, ...]] = None,
+        coverage: float = 1.0,
+        site_type: str = "fcc",
+        xy_tol: float = 0.5,
+        support_xy_tol: Optional[float] = 2.5,
+        vertical_offset: float = 1.8,
+        seed: int = 81,
+        **kwargs
+    ) -> "CMC":
+        """
+        Instantiate CMC with generated adsorbate configuration from a clean substrate.
+        The initial, rigid structure will be saved as 'cmc_initial.traj'.
+        """
+        if support_xy_tol is None:
+            support_xy_tol = xy_tol
+
+        logger.info("Generating initial adsorbate configuration (rigid) ...")
+        atoms_with_ads = generate_adsorbate_configuration(
+            atoms=atoms,
             site_type=site_type,
             element=adsorbate_element,
             coverage=coverage,
             xy_tol=xy_tol,
             support_xy_tol=support_xy_tol,
             vertical_offset=vertical_offset,
-            substrate_element=substrate_element,
+            substrate_element=top_layer_element, 
             seed=seed,
         )
-        write('init_atoms.xyz', self.atoms)
-        self.atoms.calc = calculator
+        write("cmc_initial.traj", atoms_with_ads)
+        logger.info("Rigid initial structure written to cmc_initial.traj.")
 
-        if os.path.exists(self.checkpoint_traj) and os.path.exists(self.checkpoint_data):
-            self._load_checkpoint()
-            logger.info(f"Resuming from checkpoint at step {self.step}")
-        else:
-            if self.relax:
-                self.atoms = self.relax_structure(self.atoms)
-            self.e_old = self.atoms.get_potential_energy()
+        return cls(
+            atoms=atoms_with_ads,
+            calculator=calculator,
+            adsorbate_element=adsorbate_element,
+            substrate_elements=substrate_elements,
+            functional_elements=functional_elements,
+            coverage=coverage,
+            site_type=site_type,
+            xy_tol=xy_tol,
+            support_xy_tol=support_xy_tol,
+            seed=seed,
+            **kwargs
+        )
 
-    def attempt_displacement(self) -> Optional[Tuple[Atoms, int, np.ndarray, np.ndarray]]:
+    def attempt_displacement(self) -> Optional[Atoms]:
         """
-        Attempt to randomly displace a single adsorbate atom within allowed bounds.
-        Returns (Atoms object, index moved, old_xy, new_xy) if move is possible, else None.
-        Includes debug info for each trial.
+        Attempt to displace a randomly chosen adsorbate, ensuring supported final state.
+        Returns a new Atoms object if move is proposed, else None.
         """
-        ads_indices = [i for i, atom in enumerate(self.atoms) if atom.symbol == self.adsorbate_element]
-        if not ads_indices:
-            logger.warning("No adsorbate atoms found for displacement.")
+        ads_indices = self.ads_indices
+        if len(ads_indices) == 0:
+            logger.warning("No adsorbates to displace.")
             return None
-        for trial in range(self.max_trials):
-            idx = self.rng.choice(ads_indices)
-            atom = self.atoms[idx]
-            dx = self.rng.uniform(-self.displacement_sigma, self.displacement_sigma)
-            dy = self.rng.uniform(-self.displacement_sigma, self.displacement_sigma)
-            new_xy = atom.position[:2] + np.array([dx, dy])
-            neighbors_z = [
-                at.position[2]
-                for at in self.atoms
-                if np.linalg.norm(at.position[:2] - new_xy) < self.support_xy_tol
-            ]
-            if not neighbors_z:
-                logger.debug(f"[TRIAL {trial}] No support found at xy={new_xy}.")
-                continue
-            z_max = max(neighbors_z)
-            new_pos = np.array([new_xy[0], new_xy[1], z_max + self.vertical_offset])
-            too_close = any(
-                i != idx and atom2.symbol == self.adsorbate_element
-                and np.linalg.norm(new_pos - atom2.position) < self.xy_tol
-                for i, atom2 in enumerate(self.atoms)
-            )
-            if too_close:
-                logger.debug(f"[TRIAL {trial}] Rejected: new pos too close to other adsorbate (xy={new_xy}, z={new_pos[2]:.2f}).")
-                continue
-            logger.debug(f"[TRIAL {trial}] Displace atom {idx} from {atom.position[:2]} to {new_xy}, z={new_pos[2]:.2f}")
-            atoms_new = self.atoms.copy()
-            atoms_new[idx].position = new_pos
-            atoms_new.calc = self.calculator
-            return atoms_new, idx, atom.position[:2], new_xy
-        logger.debug("All displacement trials failed.")
-        return None
 
-    def metropolis_accept(self, e_new: float) -> float:
+        idx = self.rng.choice(ads_indices)
+        atoms_new = self.atoms.copy()
+        atom = atoms_new[idx]
+        pos = atom.position.copy()
+        cell = atoms_new.get_cell()
+
+        # Displacement in xy with PBC
+        delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
+        new_xy = pos[:2] + delta
+        if atoms_new.get_pbc()[0] or atoms_new.get_pbc()[1]:
+            cell = atoms_new.get_cell()
+            xy_matrix = cell[:2, :2]  # Only take x and y
+            frac = np.linalg.solve(xy_matrix.T, new_xy)
+            frac = frac % 1.0
+            new_xy = np.dot(xy_matrix.T, frac)
+
+        # Find support beneath new site
+        all_pos = atoms_new.get_positions()
+        z_below = [
+            p[2]
+            for j, p in enumerate(all_pos)
+            if j != idx
+            and np.linalg.norm(p[:2] - new_xy) < self.support_xy_tol
+            and (pos[2] - p[2]) > 0
+        ]
+        if not z_below:
+            logger.debug(f"Displacement rejected: no support at new position {new_xy}.")
+            return None
+        new_z = max(z_below) + 1.8  # vertical_offset
+        atom.position = [new_xy[0], new_xy[1], new_z]
+        return atoms_new
+
+    def metropolis_accept(self, e_new: float, T: float = 300.0) -> float:
+        """Return acceptance probability for Metropolis criterion at temperature T (default 300K)."""
         delta_e = e_new - self.e_old
-        return min(1.0, np.exp(-self.beta * delta_e))
+        try:
+            prob = min(1.0, np.exp(-delta_e / (8.617333e-5 * T)))
+        except OverflowError:
+            prob = 0.0
+        return prob
 
-    def run(self, nsweeps: int = 1000) -> None:
+    def run(
+        self,
+        nsweeps: int = 100,
+        trials_per_sweep: Optional[int] = None,
+        T: float = 300.0,
+    ) -> None:
         """
-        Perform nsweeps MC sweeps (each sweep = N adsorbate displacement attempts).
-        Log acceptance rate after each sweep.
+        Run canonical MC simulation.
+        Args:
+            nsweeps: Number of MC sweeps (outer loop)
+            trials_per_sweep: Number of attempted moves per sweep (if None, uses max(#adsorbates, 5))
+            T: Temperature (K) for Metropolis criterion
         """
-        ads_indices = [i for i, atom in enumerate(self.atoms) if atom.symbol == self.adsorbate_element]
-        n_ads = len(ads_indices)
-        if n_ads == 0:
-            logger.error("No adsorbates to move!")
-            return
+        from ase.io import Trajectory
 
-        accepted_traj_mode: str = 'a' if os.path.exists(self.accepted_traj_file) else 'w'
-        full_traj_mode: str = 'a' if os.path.exists(self.traj_file) else 'w'
-        traj_full = Trajectory(self.traj_file, full_traj_mode)
-        header_fmt = "{:>7s} {:>10s} {:>8s} {:>10s} {:>12s} {:>10s} {:>10s} {:>10s}"
-        step_fmt   = "{:7d} {:>10s} {:>8s} {:10.2f} {:12.4f} {:10.3f} {:10d} {:10d}"
-        logger.info(header_fmt.format("Step", "Move", "Status", "ΔE", "Energy (eV)", "AccRate", "Sweep", "Trial"))
-
-        step_counter = self.step
-        for sweep in range(nsweeps):
-            n_accepted_sweep = 0
-            for trial in range(n_ads):
-                result = self.attempt_displacement()
-                move_type = "displace"
-                if result is None:
-                    status = "REJECT"
-                    logger.info(step_fmt.format(
-                        step_counter, move_type, status, 0.0, self.e_old,
-                        n_accepted_sweep/(trial+1), sweep, trial
-                    ))
-                    traj_full.write(self.atoms, step=step_counter, move=move_type, energy=self.e_old, status=status)
-                    step_counter += 1
-                    continue
-                atoms_new, idx, old_xy, new_xy = result
-                atoms_new.calc = self.calculator
-                if self.relax:
-                    atoms_new = self.relax_structure(atoms_new)
-                e_new = atoms_new.get_potential_energy()
-                acc_prob = self.metropolis_accept(e_new)
-                logger.debug(
-                    f"[SWEEP {sweep}][TRIAL {trial}] Atom {idx} from {old_xy} to {new_xy}, "
-                    f"e_old={self.e_old:.4f}, e_new={e_new:.4f}, ΔE={e_new-self.e_old:.4f}, p_accept={acc_prob:.3f}"
-                )
-                if self.rng.random() < acc_prob:
-                    self.atoms = atoms_new
-                    self.e_old = e_new
-                    n_accepted_sweep += 1
-                    status = "ACCEPT"
-                    # Write only accepted to accepted_traj_file
-                    with Trajectory(self.accepted_traj_file, 'a') as traj_acc:
-                        traj_acc.write(self.atoms, step=step_counter, move=move_type, energy=self.e_old, status=status)
-                else:
-                    status = "REJECT"
-                logger.info(step_fmt.format(
-                    step_counter, move_type, status, e_new-self.e_old, self.e_old,
-                    n_accepted_sweep/(trial+1), sweep, trial
-                ))
-                traj_full.write(self.atoms, step=step_counter, move=move_type, energy=self.e_old, status=status)
-                step_counter += 1
-            logger.info(
-                f"[SWEEP {sweep}] Displacement acceptance: {n_accepted_sweep}/{n_ads} ({n_accepted_sweep/n_ads:.3f})"
+        logger.info(
+            "{:>8s} {:>10s} {:>10s} {:>12s} {:>12s} {:>10s}".format(
+                "Sweep", "Trial", "Status", "DeltaE", "Energy", "AccRate"
             )
-            if self.checkpoint_interval and (sweep+1) % self.checkpoint_interval == 0:
-                self._save_checkpoint()
-        self._save_checkpoint()
-        logger.info("CMC completed.")
+        )
 
-        traj_full.close()
+        traj = Trajectory(self.traj_file, "w")
+        traj_unique = Trajectory(self.unique_traj_file, "w")
+
+        for sweep in range(nsweeps):
+            # Dynamic moves per sweep
+            if trials_per_sweep is None:
+                n_ads = len(self.ads_indices)
+                moves_this_sweep = max(n_ads, 5)
+            else:
+                moves_this_sweep = trials_per_sweep
+
+            for trial in range(moves_this_sweep):
+                self.total_moves += 1
+                atoms_new = self.attempt_displacement()
+                if atoms_new is None:
+                    status = "REJECT"
+                    delta_e = 0.0
+                else:
+                    if self.relax:
+                        atoms_new, converged = self.relax_structure(atoms_new)
+                        if not converged:
+                            logger.debug("Relaxation did not converge; rejecting move.")
+                            status = "REJECT"
+                            delta_e = 0.0
+                            continue
+                    e_new = self.get_potential_energy(atoms_new)
+                    prob = self.metropolis_accept(e_new, T)
+                    delta_e = e_new - self.e_old
+
+                    if prob > self.rng.random():
+                        if self.has_afloat_adsorbates(
+                            atoms_new,
+                            support_xy_tol=self.support_xy_tol,
+                            z_max_support=self.z_max_support,
+                        ):
+                            logger.debug("Afloat adsorbate found; move rejected.")
+                            status = "REJECT"
+                            continue
+                        self.atoms = atoms_new
+                        self.e_old = e_new
+                        self._update_indices()
+                        status = "ACCEPT"
+                        self.accepted_moves += 1
+                        traj_unique.write(self.atoms)
+                    else:
+                        status = "REJECT"
+
+                acc_rate = (
+                    self.accepted_moves / self.total_moves if self.total_moves else 0.0
+                )
+                logger.info(
+                    "{:8d} {:10d} {:>10s} {:12.4f} {:12.4f} {:10.4f}".format(
+                        sweep, trial, status, delta_e, self.e_old, acc_rate
+                    )
+                )
+                traj.write(self.atoms)
+
+        traj.close()
+        traj_unique.close()
+        logger.info("CMC simulation completed.")

@@ -4,8 +4,9 @@ cmc.py - Canonical Monte Carlo for surface adsorbate systems, with from_clean_su
 """
 
 import logging
-from typing import Any, Optional, Tuple
 import numpy as np
+import os
+from typing import Any, Optional, Tuple
 from ase import Atoms
 from ase.io import write, Trajectory
 from ase.geometry import get_distances
@@ -38,12 +39,13 @@ class CMC(BaseMC):
         xy_tol: Tolerance for site registry
         support_xy_tol: Lateral cutoff for "support" check
         z_max_support: Max z-separation for "support" (Angstrom)
+        vertical_offset: Vertical offset of adsorbate relative to the substrate (Angstrom)
         relax: Whether to relax after move
         relax_steps: LBFGS steps per move
         fmax: LBFGS convergence (eV/Angstrom)
         seed: RNG seed
         traj_file: Output file for trajectory
-        unique_traj_file: Output file for unique (accepted) structures
+        accepted_traj_file: Output file for accepted (accepted) structures
     """
 
     def __init__(
@@ -60,12 +62,20 @@ class CMC(BaseMC):
         support_xy_tol: Optional[float] = 2.5,
         z_max_support: float = 3.0,
         vertical_offset: float = 1.8,
+        detach_tol: float = 3.0,
         relax: bool = False,
         relax_steps: int = 10,
+        relax_z_only: bool = False,
         fmax: float = 0.05,
+        verbose_relax: bool = False,
         seed: int = 81,
         traj_file: str = "cmc.traj",
-        unique_traj_file: str = "cmc_unique.traj",
+        accepted_traj_file: str = "cmc_accepted.traj",
+        rejected_traj_file: str = "cmc_rejected.traj",
+        checkpoint_atoms: str = "checkpoint.traj",
+        checkpoint_data: str = "checkpoint.pkl",
+        checkpoint_interval: int = 100,  # Save every N sweeps
+        resume: bool = False,
     ):
         if support_xy_tol is None:
             support_xy_tol = xy_tol
@@ -75,9 +85,9 @@ class CMC(BaseMC):
             adsorbate_element=adsorbate_element,
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
-            neighbor_tol=3.0,
-            detach_tol=3.0,
+            detach_tol=detach_tol,
             relax_steps=relax_steps,
+            relax_z_only=relax_z_only,
             fmax=fmax,
             seed=seed,
         )
@@ -88,14 +98,22 @@ class CMC(BaseMC):
         self.support_xy_tol = support_xy_tol
         self.z_max_support = z_max_support
         self.vertical_offset = vertical_offset
+        self.detach_tol = detach_tol
         self.relax = relax
+        self.verbose_relax = verbose_relax
         self.traj_file = traj_file
-        self.unique_traj_file = unique_traj_file
+        self.accepted_traj_file = accepted_traj_file
+        self.rejected_traj_file = rejected_traj_file
+        self.checkpoint_atoms = checkpoint_atoms
+        self.checkpoint_data = checkpoint_data
+        self.checkpoint_interval = checkpoint_interval
+        self.resume = resume
 
         self.e_old = self.get_potential_energy(self.atoms)
         self._update_indices()
         self.accepted_moves = 0
         self.total_moves = 0
+
 
     @classmethod
     def from_clean_surface(
@@ -111,6 +129,7 @@ class CMC(BaseMC):
         xy_tol: float = 0.5,
         support_xy_tol: Optional[float] = 2.5,
         vertical_offset: float = 1.8,
+        detach_tol: float = 3.0,
         seed: int = 81,
         **kwargs
     ) -> "CMC":
@@ -147,11 +166,12 @@ class CMC(BaseMC):
             xy_tol=xy_tol,
             support_xy_tol=support_xy_tol,
             vertical_offset=vertical_offset,
+            detach_tol=detach_tol,
             seed=seed,
             **kwargs
         )
 
-    def attempt_displacement(self) -> Optional[Atoms]:
+    def attempt_displacement(self, max_trials: int = 10) -> Optional[Atoms]:
         ads_indices = self.ads_indices
         if len(ads_indices) == 0:
             logger.warning("No adsorbates to displace.")
@@ -161,42 +181,67 @@ class CMC(BaseMC):
         pos = self.atoms.positions[idx].copy()
         cell = self.atoms.get_cell()
         pbc = self.atoms.get_pbc()
+        tol = self.xy_tol 
+        support_xy_tol = self.support_xy_tol
 
-        # Displacement in xy, wrap to PBC
-        delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
-        new_xy = pos[:2] + delta
-
-        if any(pbc[:2]):
-            xy_matrix = cell[:2, :2]
-            frac = np.linalg.solve(xy_matrix.T, new_xy)
-            frac = frac % 1.0
-            new_xy = np.dot(xy_matrix.T, frac)
-
-        # PBC-aware support check in xy, vectorized
         all_pos = self.atoms.get_positions()
         N = len(all_pos)
+        xy_matrix = cell[:2, :2]
 
-        # Pad positions to shape (N,3) with z=0 for xy-distances
-        new_xyz = np.zeros((1, 3))
-        new_xyz[0, :2] = new_xy[:2]
-        all_xyz = np.zeros((N, 3))
-        all_xyz[:, :2] = all_pos[:, :2]
+        for trial in range(max_trials):
+            # 1. Displace in xy and wrap PBC
+            delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
+            new_xy = pos[:2] + delta
+            if any(pbc[:2]):
+                frac = np.linalg.solve(xy_matrix.T, new_xy)
+                frac = frac % 1.0
+                new_xy = np.dot(xy_matrix.T, frac)
 
-        dxy = get_distances(new_xyz, all_xyz, cell=cell, pbc=pbc)[1].flatten()
-        dz = pos[2] - all_pos[:, 2]
-        mask = (dxy < self.support_xy_tol) & (dz > 0) & (dz < self.z_max_support)
-        # Exclude the atom itself
-        mask[idx] = False
+            # 2. Find local support: all atoms within support_xy_tol in xy
+            new_xyz = np.zeros((1, 3))
+            new_xyz[0, :2] = new_xy[:2]
 
-        if not np.any(mask):
-            logger.debug(f"Displacement rejected: no support at new position {new_xy}.")
-            return None
-        new_z = np.max(all_pos[:, 2][mask]) + self.vertical_offset
+            all_xyz = np.zeros_like(all_pos)
+            all_xyz[:, :2] = all_pos[:, :2]
+            dxy = get_distances(new_xyz, all_xyz, cell=cell, pbc=pbc)[1].flatten()
 
-        # Only now copy atoms and apply the move
-        atoms_new = self.atoms.copy()
-        atoms_new[idx].position = [new_xy[0], new_xy[1], new_z]
-        return atoms_new
+            support_indices = np.where(dxy < support_xy_tol)[0]
+            if len(support_indices) > 0:
+                z_max = np.max(all_pos[support_indices, 2])
+                new_z = z_max + self.vertical_offset
+                logger.debug(
+                    f"Trial {trial}: Attempted displacement to xy=({new_xy[0]:.3f},{new_xy[1]:.3f}), "
+                    f"z set to {new_z:.3f} above local support (found {len(support_indices)} supports)"
+                )
+            else:
+                # No support: keep the original z
+                new_z = pos[2]
+                logger.debug(
+                    f"Trial {trial}: Attempted displacement to xy=({new_xy[0]:.3f},{new_xy[1]:.3f}), "
+                    f"no support found, keeping z={new_z:.3f}"
+                )
+
+            # 3. Now check "too close" in 3D
+            trial_pos = np.array([[new_xy[0], new_xy[1], new_z]])
+            dists = get_distances(trial_pos, all_pos, cell=cell, pbc=pbc)[1].flatten()
+            dists[idx] = np.inf  # Exclude self
+
+            min_dist = np.min(dists)
+            if min_dist >= tol:
+                logger.debug(
+                    f"Trial {trial}: Proposed position accepted with min_dist={min_dist:.2f}"
+                )
+                atoms_new = self.atoms.copy()
+                atoms_new[idx].position = [new_xy[0], new_xy[1], new_z]
+                return atoms_new
+            else:
+                logger.debug(
+                    f"Trial {trial}: Rejected due to proximity; min_dist={min_dist:.2f} "
+                    f"(tol={tol:.2f}), retrying."
+                )
+
+        logger.debug(f"Displacement failed after {max_trials} trials for atom {idx}.")
+        return None
 
     def metropolis_accept(self, e_new: float, T: float = 300.0) -> float:
         """Return acceptance probability for Metropolis criterion at temperature T (default 300K)."""
@@ -229,9 +274,19 @@ class CMC(BaseMC):
         )
 
         traj = Trajectory(self.traj_file, "w")
-        traj_unique = Trajectory(self.unique_traj_file, "w")
+        traj_accepted = Trajectory(self.accepted_traj_file, "w")
+        traj_rejected = Trajectory(self.rejected_traj_file, "w")
+    
+        self.T = T
+        if self.resume and os.path.exists(self.checkpoint_atoms) and os.path.exists(self.checkpoint_data):
+            self._load_checkpoint(self.checkpoint_atoms, self.checkpoint_data)
+            if T is not None:
+                logger.debug(f"Overriding checkpoint with T = {T}")
+                self.T = T
+        else:
+            self.sweep = 0 # Ensure sweep starts from zero if not resuming
 
-        for sweep in range(nsweeps):
+        for sweep in range(self.sweep, nsweeps):
             # Dynamic moves per sweep
             if trials_per_sweep is None:
                 n_ads = len(self.ads_indices)
@@ -247,9 +302,11 @@ class CMC(BaseMC):
                     delta_e = 0.0
                 else:
                     if self.relax:
-                        atoms_new, converged = self.relax_structure(atoms_new)
+                        atoms_new, converged = self.relax_structure(atoms_new, [sweep, trial])
                         if not converged:
-                            logger.debug("Relaxation did not converge; rejecting move.")
+                            logger.debug(f"Relaxation did not converge after {self.relax_steps} steps")
+                        if self.has_detached_functional_groups(atoms_new, detach_tol=self.detach_tol):
+                            logger.debug("Functional group detached after relaxation; rejecting move.")
                             status = "REJECT"
                             delta_e = 0.0
                             continue
@@ -265,15 +322,17 @@ class CMC(BaseMC):
                         ):
                             logger.debug("Afloat adsorbate found; move rejected.")
                             status = "REJECT"
+                            traj_rejected.write(self.atoms)
                             continue
                         self.atoms = atoms_new
                         self.e_old = e_new
                         self._update_indices()
                         status = "ACCEPT"
                         self.accepted_moves += 1
-                        traj_unique.write(self.atoms)
+                        traj_accepted.write(self.atoms)
                     else:
                         status = "REJECT"
+                        traj_rejected.write(self.atoms)
 
                 acc_rate = (
                     self.accepted_moves / self.total_moves if self.total_moves else 0.0
@@ -285,6 +344,14 @@ class CMC(BaseMC):
                 )
                 traj.write(self.atoms)
 
+            # Save checkpoint
+            self.sweep = sweep + 1
+            if self.checkpoint_interval and (self.sweep % self.checkpoint_interval == 0):
+                self._save_checkpoint(self.checkpoint_atoms, self.checkpoint_data)
+
+        # Final checkpoint at end
+        self._save_checkpoint(self.checkpoint_atoms, self.checkpoint_data)
         traj.close()
-        traj_unique.close()
+        traj_accepted.close()
+        traj_rejected.close()
         logger.info("CMC simulation completed.")

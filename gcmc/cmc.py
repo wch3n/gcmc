@@ -60,7 +60,7 @@ class CMC(BaseMC):
         displacement_sigma: float = 1.5,
         xy_tol: float = 0.5,
         support_xy_tol: Optional[float] = 2.5,
-        z_max_support: float = 3.0,
+        z_max_support: float = 3.5,
         vertical_offset: float = 1.8,
         detach_tol: float = 3.0,
         relax: bool = False,
@@ -72,6 +72,7 @@ class CMC(BaseMC):
         traj_file: str = "cmc.traj",
         accepted_traj_file: str = "cmc_accepted.traj",
         rejected_traj_file: str = "cmc_rejected.traj",
+        attempted_traj_file: str = "cmc_attempted.traj",
         checkpoint_atoms: str = "checkpoint.traj",
         checkpoint_data: str = "checkpoint.pkl",
         checkpoint_interval: int = 100,  # Save every N sweeps
@@ -104,6 +105,7 @@ class CMC(BaseMC):
         self.traj_file = traj_file
         self.accepted_traj_file = accepted_traj_file
         self.rejected_traj_file = rejected_traj_file
+        self.attempted_traj_file = attempted_traj_file
         self.checkpoint_atoms = checkpoint_atoms
         self.checkpoint_data = checkpoint_data
         self.checkpoint_interval = checkpoint_interval
@@ -176,8 +178,11 @@ class CMC(BaseMC):
         if len(ads_indices) == 0:
             logger.warning("No adsorbates to displace.")
             return None
+        non_buried = self.get_non_buried_adsorbate_indices()
+        if not non_buried:
+            return None  # or whatever logic you want
+        idx = self.rng.choice(non_buried)
 
-        idx = self.rng.choice(ads_indices)
         pos = self.atoms.positions[idx].copy()
         cell = self.atoms.get_cell()
         pbc = self.atoms.get_pbc()
@@ -189,7 +194,7 @@ class CMC(BaseMC):
         xy_matrix = cell[:2, :2]
 
         for trial in range(max_trials):
-            # 1. Displace in xy and wrap PBC
+            # displace in xy and wrap PBC
             delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
             new_xy = pos[:2] + delta
             if any(pbc[:2]):
@@ -197,7 +202,7 @@ class CMC(BaseMC):
                 frac = frac % 1.0
                 new_xy = np.dot(xy_matrix.T, frac)
 
-            # 2. Find local support: all atoms within support_xy_tol in xy
+            # find local support: all atoms within support_xy_tol in xy
             new_xyz = np.zeros((1, 3))
             new_xyz[0, :2] = new_xy[:2]
 
@@ -210,8 +215,8 @@ class CMC(BaseMC):
                 z_max = np.max(all_pos[support_indices, 2])
                 new_z = z_max + self.vertical_offset
                 logger.debug(
-                    f"Trial {trial}: Attempted displacement to xy=({new_xy[0]:.3f},{new_xy[1]:.3f}), "
-                    f"z set to {new_z:.3f} above local support (found {len(support_indices)} supports)"
+                    f"Trial {trial}: Attempted displacement to xy = ( {new_xy[0]:.3f} {new_xy[1]:.3f} ), "
+                    f"z set to {new_z:.3f} above {len(support_indices)} local support"
                 )
             else:
                 # No support: keep the original z
@@ -221,7 +226,7 @@ class CMC(BaseMC):
                     f"no support found, keeping z={new_z:.3f}"
                 )
 
-            # 3. Now check "too close" in 3D
+            # check if they get too close with existing atoms
             trial_pos = np.array([[new_xy[0], new_xy[1], new_z]])
             dists = get_distances(trial_pos, all_pos, cell=cell, pbc=pbc)[1].flatten()
             dists[idx] = np.inf  # Exclude self
@@ -276,6 +281,7 @@ class CMC(BaseMC):
         traj = Trajectory(self.traj_file, "w")
         traj_accepted = Trajectory(self.accepted_traj_file, "w")
         traj_rejected = Trajectory(self.rejected_traj_file, "w")
+        traj_attempted = Trajectory(self.attempted_traj_file, "w")
     
         self.T = T
         if self.resume and os.path.exists(self.checkpoint_atoms) and os.path.exists(self.checkpoint_data):
@@ -301,6 +307,7 @@ class CMC(BaseMC):
                     status = "REJECT"
                     delta_e = 0.0
                 else:
+                    traj_attempted.write(atoms_new)
                     if self.relax:
                         atoms_new, converged = self.relax_structure(atoms_new, [sweep, trial])
                         if not converged:
@@ -322,7 +329,7 @@ class CMC(BaseMC):
                         ):
                             logger.debug("Afloat adsorbate found; move rejected.")
                             status = "REJECT"
-                            traj_rejected.write(self.atoms)
+                            traj_rejected.write(atoms_new)
                             continue
                         self.atoms = atoms_new
                         self.e_old = e_new
@@ -354,4 +361,5 @@ class CMC(BaseMC):
         traj.close()
         traj_accepted.close()
         traj_rejected.close()
+        traj_attempted.close()
         logger.info("CMC simulation completed.")

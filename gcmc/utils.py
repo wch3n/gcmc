@@ -11,6 +11,7 @@ All functions compatible with ASE Atoms objects.
 import numpy as np
 from typing import List, Tuple, Literal, Optional
 from ase import Atom, Atoms
+from ase.geometry import find_mic
 from scipy.spatial import Delaunay
 
 def get_toplayer_xy(
@@ -106,17 +107,27 @@ def classify_hollow_sites(
     """
     subs = [atom for atom in atoms if atom.symbol == element]
     zvals = np.array([atom.position[2] for atom in subs])
-    unique_layers = np.unique(np.round(zvals, 3))
+    unique_layers = np.unique(np.round(zvals, 0))
     z_layers = np.sort(unique_layers)[::-1]
     if len(z_layers) < 3:
         raise RuntimeError("Not enough substrate layers to classify hollows.")
     idx = 2 if stacking == 'fcc' else 1
     ref_z = z_layers[idx]
-    ref_atoms = [atom for atom in subs if abs(atom.position[2] - ref_z) < 0.15]
+    ref_atoms = [atom for atom in subs if abs(np.round(atom.position[2],0) - ref_z) < 1e-3]
+
+    # Prepare cell for PBC
+    cell = atoms.cell.array  # This is (3,3)
+    pbc = atoms.pbc
+
     selected_hollows = []
     for xy in hollow_xy:
         for atom in ref_atoms:
-            if np.linalg.norm(atom.position[:2] - xy) < xy_tol:
+            # Create a 3D displacement vector (z=0)
+            dxyz = np.zeros(3)
+            dxyz[:2] = atom.position[:2] - xy
+            # Use find_mic for proper PBC
+            dxyz_mic, _ = find_mic(dxyz.reshape(1,3), cell, pbc)
+            if np.linalg.norm(dxyz_mic[0][:2]) < xy_tol:
                 selected_hollows.append(xy)
                 break
     return np.array(selected_hollows)
@@ -164,8 +175,9 @@ def generate_adsorbate_configuration(
             atoms, hollows, element=substrate_element, xy_tol=xy_tol, stacking=site_type
         )
     n_sites = len(site_xy)
+    print(n_sites)
     if n_sites == 0:
-        return atoms_new
+        raise RuntimeError("*** NO REGISTRY SITES AVAILABLE ***")
     # Handle multilayer coverage
     n_layers = int(np.floor(coverage))
     frac_layer = coverage - n_layers

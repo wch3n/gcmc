@@ -180,7 +180,7 @@ class CMC(BaseMC):
             return None
         non_buried = self.get_non_buried_adsorbate_indices()
         if not non_buried:
-            return None  # or whatever logic you want
+            return None 
         idx = self.rng.choice(non_buried)
 
         pos = self.atoms.positions[idx].copy()
@@ -278,10 +278,10 @@ class CMC(BaseMC):
             )
         )
 
-        traj = Trajectory(self.traj_file, "w")
-        traj_accepted = Trajectory(self.accepted_traj_file, "w")
-        traj_rejected = Trajectory(self.rejected_traj_file, "w")
-        traj_attempted = Trajectory(self.attempted_traj_file, "w")
+        traj = Trajectory(self.traj_file, "a")
+        traj_accepted = Trajectory(self.accepted_traj_file, "a")
+        traj_rejected = Trajectory(self.rejected_traj_file, "a")
+        traj_attempted = Trajectory(self.attempted_traj_file, "a")
     
         self.T = T
         if self.resume and os.path.exists(self.checkpoint_atoms) and os.path.exists(self.checkpoint_data):

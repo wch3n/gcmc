@@ -145,7 +145,7 @@ class BaseMC:
         if support_xy_tol is None:
             support_xy_tol = getattr(self, "support_xy_tol", 2.0)
         if z_max_support is None:
-            z_max_support = getattr(self, "z_max_support", 0.1)
+            z_max_support = getattr(self, "z_max_support", 2.5)
         if atoms is None:
             atoms = self.atoms
 
@@ -160,8 +160,6 @@ class BaseMC:
             logger.debug("No adsorbates found for afloat check.")
             return False
 
-        afloat_found = False
-
         for ia in ads_indices:
             ads_pos = pos[ia]
             support_indices = [i for i in range(n_atoms) if i != ia]
@@ -169,22 +167,25 @@ class BaseMC:
             deltas, dists = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)      # In-plane
             dz = ads_pos[2] - support_pos[:, 2]              # Only atoms *below* the adsorbate
-            mask = (dxy < support_xy_tol) & (dz > 0) & (dz < z_max_support)
-            if not np.any(mask):
-                # No support found for this adsorbate
-                afloat_found = True
-                # Debug: Show all distances and closest candidates
-                min_dxy = dxy.min() if dxy.size > 0 else float("nan")
-                below_mask = dz > 0
-                min_dz = dz[below_mask].min() if np.any(below_mask) else float("nan")
-                logger.debug(
-                    f"[AFLOAT] Ads {ia} at (x={ads_pos[0]:.2f}, y={ads_pos[1]:.2f}, z={ads_pos[2]:.2f}): "
-                    f"min lateral to any support: {min_dxy:.2f} Å), "
-                    f"min dz below: {min_dz:.2f} Å"
-                )
-        if not afloat_found:
-            logger.debug("No afloat adsorbates detected.")
-        return afloat_found
+            # 
+            lateral_mask = dxy < support_xy_tol
+            dz_lateral = dz[lateral_mask]
+            support_mask = (dz_lateral > 0) & (dz_lateral < z_max_support)
+            if not np.any(support_mask):
+                if dz_lateral.size > 0 and np.any(dz_lateral > 0):
+                    min_dz = dz_lateral[dz_lateral > 0].min()
+                    logger.debug(
+                        f"[AFLOAT] Ads {ia} at (x={ads_pos[0]:.2f}, y={ads_pos[1]:.2f}, z={ads_pos[2]:.2f}): "
+                        f"no support found within xy_tol={support_xy_tol}. "
+                        f"Closest dz below (with lateral cutoff): {min_dz:.2f} Å"
+                    )
+                else:
+                    logger.debug(
+                        f"[AFLOAT] Ads {ia} at (x={ads_pos[0]:.2f}, y={ads_pos[1]:.2f}, z={ads_pos[2]:.2f}): "
+                        f"no atoms found within lateral cutoff xy_tol={support_xy_tol}."
+                    )
+                return True
+        return False 
 
     def has_detached_functional_groups(
         self,

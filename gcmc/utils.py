@@ -175,7 +175,6 @@ def generate_adsorbate_configuration(
             atoms, hollows, element=substrate_element, xy_tol=xy_tol, stacking=site_type
         )
     n_sites = len(site_xy)
-    print(n_sites)
     if n_sites == 0:
         raise RuntimeError("*** NO REGISTRY SITES AVAILABLE ***")
     # Handle multilayer coverage
@@ -210,3 +209,43 @@ def generate_adsorbate_configuration(
             pos = np.array([xy[0], xy[1], z_max + vertical_offset])
             atoms_new.append(Atom(element, pos))
     return atoms_new
+
+def initialize_alloy_sublattice(
+    atoms: Atoms, 
+    site_element: str, 
+    composition: dict, 
+    seed: int = 67
+) -> Atoms:
+    """
+    Replaces atoms of type `site_element` with a random mixture.
+    """
+    rng = np.random.default_rng(seed)
+    new_atoms = atoms.copy()
+    
+    site_indices = [i for i, s in enumerate(new_atoms.get_chemical_symbols()) if s == site_element]
+    n_sites = len(site_indices)
+    
+    if n_sites == 0:
+        raise ValueError(f"No atoms of type '{site_element}' found.")
+
+    counts = {}
+    current_count = 0
+    elements = list(composition.keys())
+    
+    for el in elements[:-1]:
+        n_el = int(round(composition[el] * n_sites))
+        counts[el] = n_el
+        current_count += n_el
+    counts[elements[-1]] = n_sites - current_count
+    
+    sublattice_symbols = []
+    for el, count in counts.items():
+        sublattice_symbols.extend([el] * count)
+        
+    rng.shuffle(sublattice_symbols)
+    
+    all_symbols = np.array(new_atoms.get_chemical_symbols())
+    all_symbols[site_indices] = sublattice_symbols
+    new_atoms.set_chemical_symbols(all_symbols)
+    
+    return new_atoms

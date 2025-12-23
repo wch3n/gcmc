@@ -6,17 +6,20 @@ Exports:
 - BaseMC: Common MC functionality (ensemble-neutral)
 - GCMC: Grand Canonical Monte Carlo
 - CMC: Canonical Monte Carlo
+- AlloyCMC: Canonical Monte Carlo for solids
 - utils: Adsorbate configuration generation, site registry, etc.
 """
 
 from .base import BaseMC
 from .gcmc import GCMC
 from .cmc import CMC
+from .alloy_cmc import AlloyCMC
 from . import utils
 
 __all__ = [
     "BaseMC",
     "GCMC",
     "CMC",
+    "AlloyCMC", 
     "utils",
 ]

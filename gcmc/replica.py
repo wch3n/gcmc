@@ -3,27 +3,28 @@ import logging
 import os
 import pickle
 import multiprocessing
-from typing import List, Any, Dict, Type
+import time
 from .process_replica import ReplicaWorker, ctx
 
 logger = logging.getLogger("mc")
 
+
 class ReplicaExchange:
     def __init__(
-        self, 
-        n_gpus, 
+        self,
+        n_gpus,
         workers_per_gpu,
-        replica_states, 
-        swap_interval=10, 
-        report_interval=10, 
-        sampling_interval=1, 
-        checkpoint_interval=10, 
+        replica_states,
+        swap_interval=10,
+        report_interval=10,
+        sampling_interval=1,
+        checkpoint_interval=10,
         swap_stride=1,
-        stats_file="replica_stats.csv", 
-        results_file="results.csv", 
-        checkpoint_file="pt_state.pkl", 
-        resume=False, 
-        worker_init_info=None
+        stats_file="replica_stats.csv",
+        results_file="results.csv",
+        checkpoint_file="pt_state.pkl",
+        resume=False,
+        worker_init_info=None,
     ):
         self.n_gpus = n_gpus
         self.workers_per_gpu = workers_per_gpu
@@ -34,171 +35,227 @@ class ReplicaExchange:
         self.checkpoint_interval = checkpoint_interval
         self.swap_stride = swap_stride
         self.worker_init_info = worker_init_info
-        
+
         self.stats_file = stats_file
         self.results_file = results_file
         self.checkpoint_file = checkpoint_file
-        
         self.cycle_start = 0
 
-        self.task_queue = ctx.Queue()
+        # Load Balancing: One Queue per GPU
+        self.gpu_queues = [ctx.Queue() for _ in range(n_gpus)]
         self.result_queue = ctx.Queue()
         self.workers = []
 
-        # Init Files
         if not os.path.exists(self.stats_file) and not resume:
             with open(self.stats_file, "w") as f:
                 f.write("Cycle,T_i,T_j,E_i,E_j,Accepted\n")
-        
+
         if not os.path.exists(self.results_file) and not resume:
             with open(self.results_file, "w") as f:
+                # CLEAN CSV: Only Cycle Stats
                 f.write("Cycle,Temperature,Avg_Potential_Energy,Cv,Acceptance_Rate\n")
-        
+
         if resume and os.path.exists(checkpoint_file):
             self._load_master_checkpoint()
 
     def _start_workers(self):
         total_workers = self.n_gpus * self.workers_per_gpu
-        logger.info(f"Spawning {total_workers} persistent workers ({self.workers_per_gpu} per GPU)...")
-        
+        logger.info(
+            f"Spawning {total_workers} persistent workers ({self.workers_per_gpu} per GPU)..."
+        )
+
         for i in range(total_workers):
-            # i = 0, 1, 2, 3...
-            # if n_gpus=4: 0->GPU0, 1->GPU1, 2->GPU2, 3->GPU3, 4->GPU0 ...
             assigned_gpu = i % self.n_gpus
-            
+            specific_queue = self.gpu_queues[assigned_gpu]
             w = ReplicaWorker(
-                rank=i, 
-                device_id=assigned_gpu, 
-                task_queue=self.task_queue, 
-                result_queue=self.result_queue, 
-                init_kwargs=self.worker_init_info
+                i,
+                assigned_gpu,
+                specific_queue,
+                self.result_queue,
+                self.worker_init_info,
             )
             w.start()
             self.workers.append(w)
 
     @classmethod
-    def from_auto_config(cls, atoms_template, T_start, T_end, T_step, 
-                         calculator_class, mc_class, calc_kwargs, mc_kwargs, 
-                         n_gpus=4, workers_per_gpu=2, # Default 2 workers/GPU
-                         swap_stride=1, resume=False, 
-                         results_file="results.csv", **pt_kwargs):
-        
-        # Clean Template (remove calc for safe init transfer)
+    def from_auto_config(
+        cls,
+        atoms_template,
+        T_start,
+        T_end,
+        T_step,
+        calculator_class,
+        mc_class,
+        calc_kwargs,
+        mc_kwargs,
+        n_gpus=4,
+        workers_per_gpu=2,
+        swap_stride=1,
+        resume=False,
+        results_file="results.csv",
+        **pt_kwargs,
+    ):
+
         atoms_clean = atoms_template.copy()
         atoms_clean.calc = None
 
-        # Generate Temps
         if T_start > T_end:
-            temps = np.arange(T_start, T_end - abs(T_step)/2, -abs(T_step)).tolist()
+            temps = np.arange(T_start, T_end - abs(T_step) / 2, -abs(T_step)).tolist()
         else:
-            temps = np.arange(T_start, T_end + abs(T_step)/2, abs(T_step)).tolist()
-            
-        logger.info(f"Configuration: {len(temps)} Replicas | {n_gpus} GPUs | {workers_per_gpu} Workers/GPU")
+            temps = np.arange(T_start, T_end + abs(T_step) / 2, abs(T_step)).tolist()
 
-        # Init Logical States
+        logger.info(
+            f"Configuration: {len(temps)} Replicas | {n_gpus} GPUs | {workers_per_gpu} Workers/GPU"
+        )
+
         replica_states = []
         for i, T in enumerate(temps):
             t_str = f"{T:.0f}"
             state = {
-                'id': i,
-                'T': T,
-                'atoms': atoms_clean.copy(),
-                'e_old': 0.0,
-                'sweep': 0,
-                'traj_file': f"replica_{t_str}K.traj",
-                'thermo_file': f"replica_{t_str}K.dat",
-                'checkpoint_file': f"checkpoint_{t_str}K.pkl",
-                'mc_kwargs': mc_kwargs
+                "id": i,
+                "T": T,
+                "atoms": atoms_clean.copy(),
+                "e_old": 0.0,
+                "sweep": 0,
+                # Cumulative counters (kept in memory for Logging)
+                "cum_sum_E": 0.0,
+                "cum_sum_E_sq": 0.0,
+                "cum_n_samples": 0,
+                "traj_file": f"replica_{t_str}K.traj",
+                "thermo_file": f"replica_{t_str}K.dat",
+                "checkpoint_file": f"checkpoint_{t_str}K.pkl",
+                "mc_kwargs": mc_kwargs,
             }
-            if resume and os.path.exists(state['checkpoint_file']):
-                 with open(state['checkpoint_file'], "rb") as f:
-                    chk = pickle.load(f)
-                    atoms_loaded = chk['atoms']
-                    atoms_loaded.calc = None
-                    state['atoms'] = atoms_loaded
-                    state['e_old'] = chk.get('e_old', 0.0)
-                    state['sweep'] = chk.get('sweep', 0)
-            
             replica_states.append(state)
 
         worker_init_info = {
-            'calculator_module': calculator_class.__module__,
-            'calculator_class_name': calculator_class.__name__,
-            'calc_kwargs': calc_kwargs,
-            'mc_kwargs': mc_kwargs, 
-            'atoms_template': atoms_clean # Passed so worker can init object once
+            "calculator_module": calculator_class.__module__,
+            "calculator_class_name": calculator_class.__name__,
+            "calc_kwargs": calc_kwargs,
+            "mc_kwargs": mc_kwargs,
+            "atoms_template": atoms_clean,
         }
 
-        return cls(n_gpus, workers_per_gpu, replica_states, 
-                   worker_init_info=worker_init_info, 
-                   swap_stride=swap_stride, resume=resume, 
-                   results_file=results_file, **pt_kwargs)
+        return cls(
+            n_gpus,
+            workers_per_gpu,
+            replica_states,
+            worker_init_info=worker_init_info,
+            swap_stride=swap_stride,
+            resume=resume,
+            results_file=results_file,
+            **pt_kwargs,
+        )
 
     def run(self, n_cycles, equilibration_cycles=0):
         self._start_workers()
         logger.info(f"Starting PT Loop: Cycles {self.cycle_start} -> {n_cycles}")
-        
+        kB = 8.617333e-5
+
         try:
             for cycle in range(self.cycle_start, n_cycles):
                 logger.info(f"--- PT Cycle {cycle+1}/{n_cycles} ---")
-                
-                is_equilibrating = (cycle < equilibration_cycles)
-                eq_steps = self.swap_interval if is_equilibrating else 0
-                
-                # A. SUBMIT TASKS (Arrays Only)
+
+                is_equilibrating = cycle < equilibration_cycles
+                nsweeps = self.swap_interval
+                cycle_start_sweep = cycle * self.swap_interval
+
+                # --- LOCAL EQUILIBRATION ---
+                # Discard first 20% of stats to remove "Swap Shock"
+                local_eq_steps = int(nsweeps * 0.2)
+                eq_steps = nsweeps if is_equilibrating else local_eq_steps
+
+                t_start = time.time()
+                total_atoms_in_cycle = 0
+
+                # A. SUBMIT TASKS
                 for state in self.replica_states:
-                    atoms = state['atoms']
-                    
+                    atoms = state["atoms"]
+                    total_atoms_in_cycle += len(atoms)
+
                     task_data = {
-                        'T': state['T'],
-                        'positions': atoms.get_positions(),
-                        'numbers': atoms.get_atomic_numbers(),
-                        'cell': atoms.get_cell(),
-                        'pbc': atoms.get_pbc(),
-                        'e_old': state['e_old'],
-                        'sweep': state['sweep'],
-                        'nsweeps': self.swap_interval,
-                        'traj_file': state['traj_file'],
-                        'thermo_file': state['thermo_file'],
-                        'checkpoint_file': state['checkpoint_file'],
-                        'report_interval': self.report_interval,
-                        'sample_interval': self.sampling_interval,
-                        'eq_steps': eq_steps
+                        "T": state["T"],
+                        "positions": atoms.get_positions(),
+                        "numbers": atoms.get_atomic_numbers(),
+                        "cell": atoms.get_cell(),
+                        "pbc": atoms.get_pbc(),
+                        "e_old": state["e_old"],
+                        "sweep": cycle_start_sweep,
+                        "nsweeps": nsweeps,
+                        "traj_file": state["traj_file"],
+                        "thermo_file": state["thermo_file"],
+                        "checkpoint_file": state["checkpoint_file"],
+                        "report_interval": self.report_interval,
+                        "sample_interval": self.sampling_interval,
+                        "eq_steps": eq_steps,
                     }
-                    self.task_queue.put((state['id'], task_data))
-                
+                    target_gpu = state["id"] % self.n_gpus
+                    self.gpu_queues[target_gpu].put((state["id"], task_data))
+
                 # B. COLLECT RESULTS
                 completed = 0
                 while completed < len(self.replica_states):
                     res = self.result_queue.get()
-                    if isinstance(res, tuple) and res[0] == 'ERROR':
+                    if isinstance(res, tuple) and res[0] == "ERROR":
                         raise RuntimeError(f"Worker Error: {res[1]}")
-                    
-                    rid = res['replica_id']
-                    
-                    # Update Memory using Arrays (Fast)
-                    self.replica_states[rid]['atoms'].set_positions(res['positions'])
-                    self.replica_states[rid]['atoms'].set_atomic_numbers(res['numbers'])
-                    
-                    self.replica_states[rid]['e_old'] = res['e_old']
-                    self.replica_states[rid]['sweep'] = res['sweep']
-                    
-                    # Write Results
-                    stats = res['stats']
+
+                    rid = res["replica_id"]
+                    state = self.replica_states[rid]
+
+                    # 1. Update State
+                    state["atoms"].set_positions(res["positions"])
+                    state["atoms"].set_atomic_numbers(res["numbers"])
+                    state["e_old"] = res["e_old"]
+                    state["sweep"] = res["sweep"]
+
+                    # 2. Cycle Stats (From Worker)
+                    cycle_stats = res["local_stats"]
+                    cycle_E = cycle_stats["energy"]
+                    cycle_Cv = cycle_stats["cv"]
+                    acc = cycle_stats["acceptance"]
+
+                    # 3. Update Cumulative (Memory Only)
+                    if not is_equilibrating:
+                        state["cum_sum_E"] += res["cycle_sum_E"]
+                        state["cum_sum_E_sq"] += res["cycle_sum_E_sq"]
+                        state["cum_n_samples"] += res["cycle_n_samples"]
+
+                    N = state["cum_n_samples"]
+                    if N > 1:
+                        cum_avg_E = state["cum_sum_E"] / N
+                        cum_var = (state["cum_sum_E_sq"] / N) - (cum_avg_E**2)
+                        cum_Cv = cum_var / (kB * state["T"] ** 2)
+                    else:
+                        cum_Cv = 0.0
+
+                    # 4. Write CSV (CLEAN: Cycle stats only)
                     with open(self.results_file, "a") as f:
-                         f.write(f"{cycle+1},{stats['T']},{stats['energy']:.6f},{stats['cv']:.6f},{stats['acceptance']:.2f}\n")
-                    
+                        f.write(
+                            f"{cycle+1},{state['T']},{cycle_E:.6f},{cycle_Cv:.6f},{acc:.2f}\n"
+                        )
+
+                    # 5. Log Output (RICH: Show both for monitoring)
+                    # We log every ~10th replica to avoid spamming 100 lines
+                    if rid % 10 == 0 or rid == len(self.replica_states) - 1:
+                        logger.info(
+                            f"  [R{rid}|{state['T']:.0f}K] Cv: {cycle_Cv:.3f} (Cum: {cum_Cv:.3f}) | Acc: {acc:.2f}"
+                        )
+
                     completed += 1
-                
-                # C. EXCHANGE
+
+                t_end = time.time()
+                duration = t_end - t_start
+                total_ops = total_atoms_in_cycle * nsweeps
+                speed = total_ops / duration if duration > 0 else 0
+                logger.info(f"[Timing] {duration:.2f}s | {speed:.2e} atom_sweeps/s")
+
                 self._attempt_swaps(cycle)
-                
-                # D. CHECKPOINT
-                if (cycle+1) % self.checkpoint_interval == 0:
-                    self._save_master_checkpoint(cycle+1)
+
+                if (cycle + 1) % self.checkpoint_interval == 0:
+                    self._save_master_checkpoint(cycle + 1)
 
             self._save_master_checkpoint(n_cycles)
-            
+
         finally:
             self.stop()
             logger.info("PT Completed.")
@@ -207,37 +264,70 @@ class ReplicaExchange:
         kB = 8.617333e-5
         stride = self.swap_stride
         n = len(self.replica_states)
-        
         phase = np.random.randint(0, stride)
-        is_odd_cycle = (cycle % 2 == 1)
+        is_odd_cycle = cycle % 2 == 1
         start_idx = phase + (stride if is_odd_cycle else 0)
-        
+
         for i in range(start_idx, n - stride, 2 * stride):
             j = i + stride
             s_i = self.replica_states[i]
             s_j = self.replica_states[j]
-            
-            delta = (1.0/(kB*s_i['T']) - 1.0/(kB*s_j['T'])) * (s_j['e_old'] - s_i['e_old'])
-            
+            delta = (1.0 / (kB * s_i["T"]) - 1.0 / (kB * s_j["T"])) * (
+                s_j["e_old"] - s_i["e_old"]
+            )
             accepted = False
             if delta > 0 or np.random.rand() < np.exp(delta):
                 accepted = True
-                s_i['atoms'], s_j['atoms'] = s_j['atoms'], s_i['atoms']
-                s_i['e_old'], s_j['e_old'] = s_j['e_old'], s_i['e_old']
+                s_i["atoms"], s_j["atoms"] = s_j["atoms"], s_i["atoms"]
+                s_i["e_old"], s_j["e_old"] = s_j["e_old"], s_i["e_old"]
                 logger.info(f"  [Swap] {s_i['T']:.0f}K <-> {s_j['T']:.0f}K | ACCEPTED")
-            
             with open(self.stats_file, "a") as f:
-                f.write(f"{cycle},{s_i['T']},{s_j['T']},{s_i['e_old']:.4f},{s_j['e_old']:.4f},{accepted}\n")
+                f.write(
+                    f"{cycle},{s_i['T']},{s_j['T']},{s_i['e_old']:.4f},{s_j['e_old']:.4f},{accepted}\n"
+                )
 
     def _save_master_checkpoint(self, cycle):
+        replica_snapshots = []
+        for state in self.replica_states:
+            snapshot = {
+                "id": state["id"],
+                "e_old": state["e_old"],
+                "cum_sum_E": state["cum_sum_E"],
+                "cum_sum_E_sq": state["cum_sum_E_sq"],
+                "cum_n_samples": state["cum_n_samples"],
+                "positions": state["atoms"].get_positions(),
+                "numbers": state["atoms"].get_atomic_numbers(),
+                "cell": state["atoms"].get_cell(),
+                "pbc": state["atoms"].get_pbc(),
+            }
+            replica_snapshots.append(snapshot)
+        data = {"cycle": cycle, "replica_snapshots": replica_snapshots}
         with open(self.checkpoint_file, "wb") as f:
-            pickle.dump({"cycle": cycle}, f)
+            pickle.dump(data, f)
         logger.info(f"Checkpoint cycle {cycle}")
 
     def _load_master_checkpoint(self):
         with open(self.checkpoint_file, "rb") as f:
-            self.cycle_start = pickle.load(f).get("cycle", 0)
+            data = pickle.load(f)
+            self.cycle_start = data.get("cycle", 0)
+            saved_snapshots = data.get("replica_snapshots", [])
+            logger.info(f"Resuming from Cycle {self.cycle_start}")
+            for s_data in saved_snapshots:
+                rid = s_data["id"]
+                if rid < len(self.replica_states):
+                    state = self.replica_states[rid]
+                    state["e_old"] = s_data["e_old"]
+                    state["cum_sum_E"] = s_data["cum_sum_E"]
+                    state["cum_sum_E_sq"] = s_data["cum_sum_E_sq"]
+                    state["cum_n_samples"] = s_data["cum_n_samples"]
+                    state["atoms"].set_positions(s_data["positions"])
+                    state["atoms"].set_atomic_numbers(s_data["numbers"])
+                    state["atoms"].set_cell(s_data["cell"])
+                    state["atoms"].pbc = s_data["pbc"]
 
     def stop(self):
-        for _ in self.workers: self.task_queue.put('STOP')
-        for w in self.workers: w.join()
+        for q in self.gpu_queues:
+            for _ in range(self.workers_per_gpu):
+                q.put("STOP")
+        for w in self.workers:
+            w.join()

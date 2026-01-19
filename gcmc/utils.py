@@ -14,10 +14,9 @@ from ase import Atom, Atoms
 from ase.geometry import find_mic
 from scipy.spatial import Delaunay
 
+
 def get_toplayer_xy(
-    atoms: Atoms,
-    element: str = "Ti",
-    z_tol: float = 0.3
+    atoms: Atoms, element: str = "Ti", z_tol: float = 0.3
 ) -> np.ndarray:
     """
     Get xy coordinates of top-layer substrate atoms.
@@ -34,17 +33,13 @@ def get_toplayer_xy(
     if not atoms_elem:
         raise ValueError(f"No atoms with symbol '{element}' in atoms object.")
     z_max = max(atom.position[2] for atom in atoms_elem)
-    xy = np.array([
-        atom.position[:2]
-        for atom in atoms_elem
-        if atom.position[2] > z_max - z_tol
-    ])
+    xy = np.array(
+        [atom.position[:2] for atom in atoms_elem if atom.position[2] > z_max - z_tol]
+    )
     return xy
 
-def get_hollow_xy(
-    toplayer_xy: np.ndarray,
-    cell: np.ndarray
-) -> np.ndarray:
+
+def get_hollow_xy(toplayer_xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
     """
     Find hollow sites for a periodic slab by padding the cell with image points.
 
@@ -85,12 +80,13 @@ def get_hollow_xy(
             hollow_xy_unique.append(xy)
     return np.array(hollow_xy_unique)
 
+
 def classify_hollow_sites(
     atoms: Atoms,
     hollow_xy: np.ndarray,
     element: str = "Ti",
     xy_tol: float = 0.5,
-    stacking: Literal["fcc", "hcp"] = "fcc"
+    stacking: Literal["fcc", "hcp"] = "fcc",
 ) -> np.ndarray:
     """
     Select hollow sites above a specific substrate layer (fcc = third, hcp = second).
@@ -111,9 +107,11 @@ def classify_hollow_sites(
     z_layers = np.sort(unique_layers)[::-1]
     if len(z_layers) < 3:
         raise RuntimeError("Not enough substrate layers to classify hollows.")
-    idx = 2 if stacking == 'fcc' else 1
+    idx = 2 if stacking == "fcc" else 1
     ref_z = z_layers[idx]
-    ref_atoms = [atom for atom in subs if abs(np.round(atom.position[2],0) - ref_z) < 1e-3]
+    ref_atoms = [
+        atom for atom in subs if abs(np.round(atom.position[2], 0) - ref_z) < 1e-3
+    ]
 
     # Prepare cell for PBC
     cell = atoms.cell.array  # This is (3,3)
@@ -126,11 +124,12 @@ def classify_hollow_sites(
             dxyz = np.zeros(3)
             dxyz[:2] = atom.position[:2] - xy
             # Use find_mic for proper PBC
-            dxyz_mic, _ = find_mic(dxyz.reshape(1,3), cell, pbc)
+            dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, pbc)
             if np.linalg.norm(dxyz_mic[0][:2]) < xy_tol:
                 selected_hollows.append(xy)
                 break
     return np.array(selected_hollows)
+
 
 def generate_adsorbate_configuration(
     atoms: Atoms,
@@ -189,7 +188,9 @@ def generate_adsorbate_configuration(
                 if np.linalg.norm(atom.position[:2] - xy) < support_xy_tol
             ]
             if not neighbors_z:
-                raise RuntimeError(f"No support found at site {xy} for adsorbate placement.")
+                raise RuntimeError(
+                    f"No support found at site {xy} for adsorbate placement."
+                )
             z_max = max(neighbors_z)
             pos = np.array([xy[0], xy[1], z_max + vertical_offset])
             atoms_new.append(Atom(element, pos))
@@ -204,48 +205,50 @@ def generate_adsorbate_configuration(
                 if np.linalg.norm(atom.position[:2] - xy) < support_xy_tol
             ]
             if not neighbors_z:
-                raise RuntimeError(f"No support found at site {xy} for adsorbate placement.")
+                raise RuntimeError(
+                    f"No support found at site {xy} for adsorbate placement."
+                )
             z_max = max(neighbors_z)
             pos = np.array([xy[0], xy[1], z_max + vertical_offset])
             atoms_new.append(Atom(element, pos))
     return atoms_new
 
+
 def initialize_alloy_sublattice(
-    atoms: Atoms, 
-    site_element: str, 
-    composition: dict, 
-    seed: int = 67
+    atoms: Atoms, site_element: str, composition: dict, seed: int = 67
 ) -> Atoms:
     """
     Replaces atoms of type `site_element` with a random mixture.
     """
     rng = np.random.default_rng(seed)
     new_atoms = atoms.copy()
-    
-    site_indices = [i for i, s in enumerate(new_atoms.get_chemical_symbols()) if s == site_element]
+
+    site_indices = [
+        i for i, s in enumerate(new_atoms.get_chemical_symbols()) if s == site_element
+    ]
     n_sites = len(site_indices)
-    
+
     if n_sites == 0:
         raise ValueError(f"No atoms of type '{site_element}' found.")
 
     counts = {}
     current_count = 0
     elements = list(composition.keys())
-    
+
     for el in elements[:-1]:
         n_el = int(round(composition[el] * n_sites))
         counts[el] = n_el
         current_count += n_el
     counts[elements[-1]] = n_sites - current_count
-    
+
     sublattice_symbols = []
     for el, count in counts.items():
         sublattice_symbols.extend([el] * count)
-        
+
     rng.shuffle(sublattice_symbols)
-    
+
     all_symbols = np.array(new_atoms.get_chemical_symbols())
     all_symbols[site_indices] = sublattice_symbols
     new_atoms.set_chemical_symbols(all_symbols)
-    
+
     return new_atoms

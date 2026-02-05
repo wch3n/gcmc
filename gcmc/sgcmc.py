@@ -81,6 +81,7 @@ class SemiGrandAlloyMC(AlloyCMC):
             self.sum_phi = 0.0
             self.sum_phi_sq = 0.0
             self.sum_E = 0.0
+            self.sum_E_sq = 0.0
             self.n_samples = 0
             self.accepted_moves = 0
             self.total_moves = 0
@@ -154,6 +155,7 @@ class SemiGrandAlloyMC(AlloyCMC):
                 self.sum_phi += self.e_old
                 self.sum_phi_sq += self.e_old**2
                 self.sum_E += self.raw_potential_energy
+                self.sum_E_sq += self.raw_potential_energy**2
 
                 for el in self.swap_elements:
                     cnt = current_counts[el]

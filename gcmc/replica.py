@@ -29,6 +29,7 @@ class ReplicaExchange:
         worker_init_info=None,
         track_composition=None,
         seed: int = 67,
+        seed_nonce: int = 0,
     ):
         self.n_gpus = n_gpus
         self.workers_per_gpu = workers_per_gpu
@@ -40,6 +41,7 @@ class ReplicaExchange:
         self.swap_stride = swap_stride
         self.worker_init_info = worker_init_info
         self.seed = seed
+        self.seed_nonce = seed_nonce
         self.rng = np.random.default_rng(seed)
 
         # Store elements to track (e.g., ['Ti', 'Mo'])
@@ -60,7 +62,9 @@ class ReplicaExchange:
         for state in self.replica_states:
             if "rng_state" not in state or state["rng_state"] is None:
                 rid = state.get("id", 0)
-                state["rng_state"] = np.random.default_rng(self.seed + rid).bit_generator.state
+                state["rng_state"] = np.random.default_rng(
+                    self.seed + self.seed_nonce + rid
+                ).bit_generator.state
 
         if not os.path.exists(self.stats_file) and not resume:
             with open(self.stats_file, "w") as f:
@@ -113,6 +117,7 @@ class ReplicaExchange:
         resume=False,
         results_file="results.csv",
         track_composition=None,
+        seed_nonce: int = 0,
         **pt_kwargs,
     ):
 
@@ -167,6 +172,7 @@ class ReplicaExchange:
             resume=resume,
             results_file=results_file,
             track_composition=track_composition,
+            seed_nonce=seed_nonce,
             **pt_kwargs,
         )
 
@@ -341,6 +347,7 @@ class ReplicaExchange:
         data = {
             "cycle": cycle,
             "rng_state": self.rng.bit_generator.state,
+            "seed_nonce": self.seed_nonce,
             "replica_snapshots": replica_snapshots,
         }
         with open(self.checkpoint_file, "wb") as f:
@@ -354,6 +361,7 @@ class ReplicaExchange:
             rng_state = data.get("rng_state")
             if rng_state is not None:
                 self.rng.bit_generator.state = rng_state
+            self.seed_nonce = data.get("seed_nonce", self.seed_nonce)
             saved_snapshots = data.get("replica_snapshots", [])
             logger.info(f"Resuming from Cycle {self.cycle_start}")
             for s_data in saved_snapshots:
@@ -368,7 +376,7 @@ class ReplicaExchange:
                     if state["rng_state"] is None:
                         # Backfill deterministic per-replica stream if loading an older checkpoint.
                         state["rng_state"] = np.random.default_rng(
-                            self.seed + rid
+                            self.seed + self.seed_nonce + rid
                         ).bit_generator.state
                     state["atoms"].set_positions(s_data["positions"])
                     state["atoms"].set_atomic_numbers(s_data["numbers"])

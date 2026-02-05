@@ -1,7 +1,6 @@
 import os
 import pickle
 import numpy as np
-import random
 import logging
 from typing import List, Optional, Tuple, Any
 from ase import Atom, Atoms
@@ -111,7 +110,7 @@ class GCMC:
         self.w_delete: float = w_delete
         self.w_displace: float = w_displace
         self.max_trials: int = max_trials
-        self.rng: random.Random = random.Random(seed)
+        self.rng = np.random.default_rng(seed)
         self.seed: int = seed
 
         # Move counters
@@ -351,7 +350,7 @@ class GCMC:
             'accepted_deletions': self.accepted_deletions,
             'attempted_displacements': self.attempted_displacements,
             'accepted_displacements': self.accepted_displacements,
-            'rng_state': self.rng.getstate(),
+            'rng_state': self.rng.bit_generator.state,
             'T': self.T,
         }
         with open(self.checkpoint_data, 'wb') as f:
@@ -373,7 +372,7 @@ class GCMC:
         self.attempted_displacements = state.get('attempted_displacements', 0)
         self.accepted_displacements = state.get('accepted_displacements', 0)
         if 'rng_state' in state:
-            self.rng.setstate(state['rng_state'])
+            self.rng.bit_generator.state = state['rng_state']
         self.T = state.get('T', self.T_prod)
 
     def _acceptance_rate(self, attempted: int, accepted: int) -> float:
@@ -419,10 +418,14 @@ class GCMC:
                     if N_ads == 0:
                         move_type = 'insert'
                     else:
-                        move_type = self.rng.choices(
+                        weights = np.array(
+                            [self.w_insert, self.w_delete, self.w_displace], dtype=float
+                        )
+                        weights = weights / weights.sum()
+                        move_type = self.rng.choice(
                             ['insert', 'delete', 'displace'],
-                            weights=[self.w_insert, self.w_delete, self.w_displace]
-                        )[0]
+                            p=weights,
+                        )
 
                     atoms_new: Optional[Atoms] = None
                     move_type_log: str = move_type

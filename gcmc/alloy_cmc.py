@@ -156,9 +156,7 @@ class AlloyCMC(BaseMC):
         self.n_samples = state.get("n_samples", 0)
         logger.info(f"[{self.T:.0f}K] Resumed from checkpoint.")
 
-    def propose_swap_indices(
-        self, neighbor_map: Optional[dict[int, np.ndarray]] = None
-    ) -> Optional[Tuple[int, int]]:
+    def propose_swap_indices(self) -> Optional[Tuple[int, int]]:
         if len(self.swap_indices) < 2:
             return None
 
@@ -170,16 +168,13 @@ class AlloyCMC(BaseMC):
             idx1, idx2 = self.rng.choice(self.swap_indices, size=2, replace=False)
         elif mode == "neighbor":
             idx1 = self.rng.choice(self.swap_indices)
-            if neighbor_map is None:
-                i_idx, j_idx = neighbor_list(
-                    "ij",
-                    self.atoms,
-                    cutoff=self.neighbor_cutoff,
-                    self_interaction=False,
-                )
-                neighbors = j_idx[i_idx == idx1]
-            else:
-                neighbors = neighbor_map.get(idx1, np.array([], dtype=int))
+            i_idx, j_idx = neighbor_list(
+                "ij",
+                self.atoms,
+                cutoff=self.neighbor_cutoff,
+                self_interaction=False,
+            )
+            neighbors = j_idx[i_idx == idx1]
             valid = [n for n in neighbors if n != idx1 and n in self.swap_index_set]
             if not valid:
                 return None
@@ -191,10 +186,12 @@ class AlloyCMC(BaseMC):
             return None
         return idx1, idx2
 
-    def _metropolis_accept(self, delta_e: float) -> bool:
+    def _metropolis_accept(self, delta_e: float, beta: Optional[float] = None) -> bool:
         if delta_e < 0:
             return True
-        return self.rng.random() < np.exp(-delta_e / (8.617e-5 * self.T))
+        if beta is None:
+            beta = 1.0 / (8.617e-5 * self.T)
+        return self.rng.random() < np.exp(-delta_e * beta)
 
     def _propose_md_move(self) -> Tuple[Optional[Atoms], float]:
         atoms_trial = self.atoms.copy()
@@ -279,20 +276,7 @@ class AlloyCMC(BaseMC):
         # logger.info(f"T={self.T:4.0f}K | Start Run | {nsweeps} sweeps")
 
         for sweep in range(nsweeps):
-            neighbor_map = None
-            if self.swap_mode in ["neighbor", "hybrid"]:
-                i_idx, j_idx = neighbor_list(
-                    "ij",
-                    self.atoms,
-                    cutoff=self.neighbor_cutoff,
-                    self_interaction=False,
-                )
-                neighbor_map = {}
-                for ii, jj in zip(i_idx, j_idx):
-                    neighbor_map.setdefault(ii, []).append(jj)
-                for key, vals in neighbor_map.items():
-                    neighbor_map[key] = np.array(vals, dtype=int)
-
+            beta = 1.0 / (8.617e-5 * self.T)
             for i in range(moves_per_sweep):
                 self.total_moves += 1
                 do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
@@ -300,15 +284,14 @@ class AlloyCMC(BaseMC):
                     atoms_trial, delta_e = self._propose_md_move()
                     if atoms_trial is None:
                         continue
-                    if self._metropolis_accept(delta_e):
+                    if self._metropolis_accept(delta_e, beta=beta):
                         self.e_old += delta_e
                         self.accepted_moves += 1
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
-                        neighbor_map = None
                     continue
 
-                indices = self.propose_swap_indices(neighbor_map=neighbor_map)
+                indices = self.propose_swap_indices()
                 if indices is None:
                     continue
                 idx1, idx2 = indices
@@ -336,13 +319,12 @@ class AlloyCMC(BaseMC):
 
                 delta_e = e_new - self.e_old
 
-                if self._metropolis_accept(delta_e):
+                if self._metropolis_accept(delta_e, beta=beta):
                     self.e_old = e_new
                     self.accepted_moves += 1
                     if self.relax:
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
-                        neighbor_map = None
                 else:
                     self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym1, sym2
 

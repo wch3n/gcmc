@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gcmc"
-version = "0.5.0"
+version = "0.6.0"
 description = "MC simulations for solid and adsorbate systems"
 authors = [
     { name="Wei Chen", email="wei.chen@uclouvain.be" }

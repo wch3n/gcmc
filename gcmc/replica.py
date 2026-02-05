@@ -1,3 +1,5 @@
+# gcmc/replica.py
+
 import numpy as np
 import logging
 import os
@@ -25,6 +27,8 @@ class ReplicaExchange:
         checkpoint_file="pt_state.pkl",
         resume=False,
         worker_init_info=None,
+        track_composition=None,
+        seed: int = 67,
     ):
         self.n_gpus = n_gpus
         self.workers_per_gpu = workers_per_gpu
@@ -35,6 +39,11 @@ class ReplicaExchange:
         self.checkpoint_interval = checkpoint_interval
         self.swap_stride = swap_stride
         self.worker_init_info = worker_init_info
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+
+        # Store elements to track (e.g., ['Ti', 'Mo'])
+        self.track_composition = track_composition if track_composition else []
 
         self.stats_file = stats_file
         self.results_file = results_file
@@ -52,8 +61,11 @@ class ReplicaExchange:
 
         if not os.path.exists(self.results_file) and not resume:
             with open(self.results_file, "w") as f:
-                # CLEAN CSV: Only Cycle Stats
-                f.write("Cycle,Temperature,Avg_Potential_Energy,Cv,Acceptance_Rate\n")
+
+                header = "Cycle,Temperature,Avg_Potential_Energy,Cv,Acceptance_Rate"
+                for el in self.track_composition:
+                    header += f",Comp_{el},Susc_{el}"
+                f.write(header + "\n")
 
         if resume and os.path.exists(checkpoint_file):
             self._load_master_checkpoint()
@@ -93,6 +105,7 @@ class ReplicaExchange:
         swap_stride=1,
         resume=False,
         results_file="results.csv",
+        track_composition=None,
         **pt_kwargs,
     ):
 
@@ -131,6 +144,8 @@ class ReplicaExchange:
         worker_init_info = {
             "calculator_module": calculator_class.__module__,
             "calculator_class_name": calculator_class.__name__,
+            "mc_module": mc_class.__module__,
+            "mc_class": mc_class.__name__,
             "calc_kwargs": calc_kwargs,
             "mc_kwargs": mc_kwargs,
             "atoms_template": atoms_clean,
@@ -144,6 +159,7 @@ class ReplicaExchange:
             swap_stride=swap_stride,
             resume=resume,
             results_file=results_file,
+            track_composition=track_composition,
             **pt_kwargs,
         )
 
@@ -205,6 +221,8 @@ class ReplicaExchange:
                     # 1. Update State
                     state["atoms"].set_positions(res["positions"])
                     state["atoms"].set_atomic_numbers(res["numbers"])
+                    state["atoms"].set_cell(res["cell"])
+                    state["atoms"].pbc = res["pbc"]
                     state["e_old"] = res["e_old"]
                     state["sweep"] = res["sweep"]
 
@@ -229,10 +247,19 @@ class ReplicaExchange:
                         cum_Cv = 0.0
 
                     # 4. Write CSV (CLEAN: Cycle stats only)
+
+                    line = (
+                        f"{cycle+1},{state['T']},{cycle_E:.6f},{cycle_Cv:.6f},{acc:.2f}"
+                    )
+
+                    if self.track_composition and "composition" in cycle_stats:
+                        for el in self.track_composition:
+                            comp = cycle_stats["composition"].get(el, 0.0)
+                            susc = cycle_stats["susceptibility"].get(el, 0.0)
+                            line += f",{comp:.4f},{susc:.4f}"
+
                     with open(self.results_file, "a") as f:
-                        f.write(
-                            f"{cycle+1},{state['T']},{cycle_E:.6f},{cycle_Cv:.6f},{acc:.2f}\n"
-                        )
+                        f.write(line + "\n")
 
                     # 5. Log Output (RICH: Show both for monitoring)
                     # We log every ~10th replica to avoid spamming 100 lines
@@ -264,7 +291,7 @@ class ReplicaExchange:
         kB = 8.617333e-5
         stride = self.swap_stride
         n = len(self.replica_states)
-        phase = np.random.randint(0, stride)
+        phase = self.rng.integers(0, stride)
         is_odd_cycle = cycle % 2 == 1
         start_idx = phase + (stride if is_odd_cycle else 0)
 
@@ -276,7 +303,7 @@ class ReplicaExchange:
                 s_j["e_old"] - s_i["e_old"]
             )
             accepted = False
-            if delta > 0 or np.random.rand() < np.exp(delta):
+            if delta > 0 or self.rng.random() < np.exp(delta):
                 accepted = True
                 s_i["atoms"], s_j["atoms"] = s_j["atoms"], s_i["atoms"]
                 s_i["e_old"], s_j["e_old"] = s_j["e_old"], s_i["e_old"]
@@ -301,7 +328,11 @@ class ReplicaExchange:
                 "pbc": state["atoms"].get_pbc(),
             }
             replica_snapshots.append(snapshot)
-        data = {"cycle": cycle, "replica_snapshots": replica_snapshots}
+        data = {
+            "cycle": cycle,
+            "rng_state": self.rng.bit_generator.state,
+            "replica_snapshots": replica_snapshots,
+        }
         with open(self.checkpoint_file, "wb") as f:
             pickle.dump(data, f)
         logger.info(f"Checkpoint cycle {cycle}")
@@ -310,6 +341,9 @@ class ReplicaExchange:
         with open(self.checkpoint_file, "rb") as f:
             data = pickle.load(f)
             self.cycle_start = data.get("cycle", 0)
+            rng_state = data.get("rng_state")
+            if rng_state is not None:
+                self.rng.bit_generator.state = rng_state
             saved_snapshots = data.get("replica_snapshots", [])
             logger.info(f"Resuming from Cycle {self.cycle_start}")
             for s_data in saved_snapshots:

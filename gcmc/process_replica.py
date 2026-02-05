@@ -80,6 +80,8 @@ class ReplicaWorker(ctx.Process):
                 sim.atoms.pbc = data["pbc"]
 
                 sim.e_old = data["e_old"]
+                if "rng_state" in data and data["rng_state"] is not None:
+                    sim.rng.bit_generator.state = data["rng_state"]
                 sim.sweep = data["sweep"]
 
                 # --- FIX: UPDATE FILE PATHS ---
@@ -108,6 +110,7 @@ class ReplicaWorker(ctx.Process):
                     "cell": sim.atoms.get_cell(),
                     "pbc": sim.atoms.get_pbc(),
                     "e_old": sim.e_old,
+                    "rng_state": sim.rng.bit_generator.state,
                     "sweep": sim.sweep,
                     "cycle_sum_E": sim.sum_E,
                     "cycle_sum_E_sq": sim.sum_E_sq,

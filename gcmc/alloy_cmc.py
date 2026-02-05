@@ -5,6 +5,10 @@ import pickle
 from typing import Any, Optional, List, Union, Dict, Tuple
 from ase import Atoms
 from ase.io import read, Trajectory
+from ase import units
+from ase.md.verlet import VelocityVerlet
+from ase.md.langevin import Langevin
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 from scipy.spatial import cKDTree
 
 from .base import BaseMC
@@ -38,6 +42,14 @@ class AlloyCMC(BaseMC):
         checkpoint_interval: int = 100,
         seed: int = 67,
         resume: bool = False,
+        enable_hybrid_md: bool = False,
+        md_move_prob: float = 0.1,
+        md_steps: int = 50,
+        md_timestep_fs: float = 1.0,
+        md_ensemble: str = "nve",
+        md_friction: float = 0.01,
+        md_init_momenta: bool = True,
+        md_remove_drift: bool = True,
         **kwargs,
     ):
         if isinstance(atoms, str):
@@ -67,6 +79,18 @@ class AlloyCMC(BaseMC):
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
+        self.enable_hybrid_md = enable_hybrid_md
+        self.md_move_prob = md_move_prob
+        self.md_steps = md_steps
+        self.md_timestep_fs = md_timestep_fs
+        self.md_ensemble = md_ensemble.lower()
+        self.md_friction = md_friction
+        self.md_init_momenta = md_init_momenta
+        self.md_remove_drift = md_remove_drift
+        if not (0.0 <= self.md_move_prob <= 1.0):
+            raise ValueError("md_move_prob must be in [0, 1].")
+        if self.md_ensemble not in ("nve", "langevin"):
+            raise ValueError("md_ensemble must be 'nve' or 'langevin'.")
 
         self.sum_E = 0.0
         self.sum_E_sq = 0.0
@@ -168,6 +192,43 @@ class AlloyCMC(BaseMC):
             return None
         return idx1, idx2
 
+    def _metropolis_accept(self, delta_e: float) -> bool:
+        if delta_e < 0:
+            return True
+        return self.rng.random() < np.exp(-delta_e / (8.617e-5 * self.T))
+
+    def _propose_md_move(self) -> Tuple[Optional[Atoms], float]:
+        atoms_trial = self.atoms.copy()
+        atoms_trial.calc = self.calculator
+
+        if self.md_init_momenta:
+            MaxwellBoltzmannDistribution(
+                atoms_trial, temperature_K=self.T, rng=self.rng
+            )
+            if self.md_remove_drift:
+                Stationary(atoms_trial)
+
+        dt = self.md_timestep_fs * units.fs
+        if self.md_ensemble == "langevin":
+            dyn = Langevin(
+                atoms_trial,
+                timestep=dt,
+                temperature_K=self.T,
+                friction=self.md_friction,
+                rng=self.rng,
+            )
+        else:
+            dyn = VelocityVerlet(atoms_trial, timestep=dt)
+
+        try:
+            dyn.run(self.md_steps)
+            e_new = self.get_potential_energy(atoms_trial)
+        except Exception as exc:
+            logger.warning(f"MD trial move failed: {exc}")
+            return None, 0.0
+
+        return atoms_trial, e_new - self.e_old
+
     def relax_structure(
         self, atoms: Atoms, move_ind: Optional[list]
     ) -> tuple[Atoms, bool]:
@@ -221,6 +282,20 @@ class AlloyCMC(BaseMC):
         for sweep in range(nsweeps):
             for i in range(moves_per_sweep):
                 self.total_moves += 1
+                do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
+                if do_md:
+                    atoms_trial, delta_e = self._propose_md_move()
+                    if atoms_trial is None:
+                        continue
+                    if self._metropolis_accept(delta_e):
+                        self.e_old += delta_e
+                        self.accepted_moves += 1
+                        self.atoms.positions = atoms_trial.positions
+                        self.atoms.cell = atoms_trial.cell
+                        if self.swap_mode in ["neighbor", "hybrid"]:
+                            self.tree = cKDTree(self.atoms.get_positions())
+                    continue
+
                 indices = self.propose_swap_indices()
                 if indices is None:
                     continue
@@ -249,9 +324,7 @@ class AlloyCMC(BaseMC):
 
                 delta_e = e_new - self.e_old
 
-                if delta_e < 0 or (
-                    self.rng.random() < np.exp(-delta_e / (8.617e-5 * self.T))
-                ):
+                if self._metropolis_accept(delta_e):
                     self.e_old = e_new
                     self.accepted_moves += 1
                     if self.relax:

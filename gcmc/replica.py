@@ -55,6 +55,13 @@ class ReplicaExchange:
         self.result_queue = ctx.Queue()
         self.workers = []
 
+        # Keep RNG streams deterministic and isolated per replica, independent of
+        # worker scheduling/order.
+        for state in self.replica_states:
+            if "rng_state" not in state or state["rng_state"] is None:
+                rid = state.get("id", 0)
+                state["rng_state"] = np.random.default_rng(self.seed + rid).bit_generator.state
+
         if not os.path.exists(self.stats_file) and not resume:
             with open(self.stats_file, "w") as f:
                 f.write("Cycle,T_i,T_j,E_i,E_j,Accepted\n")
@@ -196,6 +203,7 @@ class ReplicaExchange:
                         "cell": atoms.get_cell(),
                         "pbc": atoms.get_pbc(),
                         "e_old": state["e_old"],
+                        "rng_state": state["rng_state"],
                         "sweep": cycle_start_sweep,
                         "nsweeps": nsweeps,
                         "traj_file": state["traj_file"],
@@ -224,6 +232,7 @@ class ReplicaExchange:
                     state["atoms"].set_cell(res["cell"])
                     state["atoms"].pbc = res["pbc"]
                     state["e_old"] = res["e_old"]
+                    state["rng_state"] = res["rng_state"]
                     state["sweep"] = res["sweep"]
 
                     # 2. Cycle Stats (From Worker)
@@ -322,6 +331,7 @@ class ReplicaExchange:
                 "cum_sum_E": state["cum_sum_E"],
                 "cum_sum_E_sq": state["cum_sum_E_sq"],
                 "cum_n_samples": state["cum_n_samples"],
+                "rng_state": state["rng_state"],
                 "positions": state["atoms"].get_positions(),
                 "numbers": state["atoms"].get_atomic_numbers(),
                 "cell": state["atoms"].get_cell(),
@@ -354,6 +364,12 @@ class ReplicaExchange:
                     state["cum_sum_E"] = s_data["cum_sum_E"]
                     state["cum_sum_E_sq"] = s_data["cum_sum_E_sq"]
                     state["cum_n_samples"] = s_data["cum_n_samples"]
+                    state["rng_state"] = s_data.get("rng_state")
+                    if state["rng_state"] is None:
+                        # Backfill deterministic per-replica stream if loading an older checkpoint.
+                        state["rng_state"] = np.random.default_rng(
+                            self.seed + rid
+                        ).bit_generator.state
                     state["atoms"].set_positions(s_data["positions"])
                     state["atoms"].set_atomic_numbers(s_data["numbers"])
                     state["atoms"].set_cell(s_data["cell"])

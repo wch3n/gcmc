@@ -2,17 +2,30 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from ase.io import read
+from ase.geometry import get_distances
 
-def find_cu_clusters(atoms, cutoff=3.0, element='Cu'):
+def find_cu_clusters(atoms, cutoff=3.0, element="Cu"):
     cu_indices = [i for i, atom in enumerate(atoms) if atom.symbol == element]
-    positions = np.array([atoms[i].position for i in cu_indices])
+    if not cu_indices:
+        return []
+
+    positions = atoms.get_positions()
+    cell = atoms.get_cell()
+    pbc = atoms.get_pbc()
     G = nx.Graph()
-    for i, idx1 in enumerate(cu_indices):
-        for j, idx2 in enumerate(cu_indices):
-            if j <= i:
-                continue
-            if np.linalg.norm(positions[i] - positions[j]) < cutoff:
+    G.add_nodes_from(cu_indices)
+
+    for ii, idx1 in enumerate(cu_indices):
+        for idx2 in cu_indices[ii + 1 :]:
+            _, dist = get_distances(
+                positions[idx1],
+                positions[idx2],
+                cell=cell,
+                pbc=pbc,
+            )
+            if dist < cutoff:
                 G.add_edge(idx1, idx2)
+
     clusters = list(nx.connected_components(G))
     sizes = [len(c) for c in clusters]
     return sizes

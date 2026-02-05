@@ -8,7 +8,8 @@ from ase import Atom, Atoms
 from ase.optimize import LBFGS
 from ase.io import write, read
 from ase.io.trajectory import Trajectory
-from scipy.spatial import cKDTree
+from ase.geometry import find_mic, get_distances
+from ase.neighborlist import neighbor_list
 
 logger = logging.getLogger("gcmc")
 logger.setLevel(logging.INFO)
@@ -147,14 +148,20 @@ class GCMC:
         """
         ads_indices = [i for i, atom in enumerate(self.atoms) if atom.symbol == self.element]
         positions = np.array([self.atoms[i].position for i in ads_indices])
+        cell = self.atoms.get_cell()
+        pbc = self.atoms.get_pbc()
         exposed = []
         for idx, pos in zip(ads_indices, positions):
             # Check for any adsorbate above within xy_tol in-plane
-            above = [
-                True for other_pos in positions
-                if (other_pos[2] > pos[2]) and
-                   (np.linalg.norm(other_pos[:2] - pos[:2]) < self.xy_tol)
-            ]
+            above = []
+            for other_pos in positions:
+                if other_pos[2] <= pos[2]:
+                    continue
+                dxyz = np.zeros(3)
+                dxyz[:2] = other_pos[:2] - pos[:2]
+                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, pbc)
+                if np.linalg.norm(dxyz_mic[0][:2]) < self.xy_tol:
+                    above.append(True)
             if not any(above):
                 exposed.append(idx)
         return exposed
@@ -167,9 +174,16 @@ class GCMC:
         """
         for trial in range(self.max_trials):
             cell = self.atoms.get_cell()
+            pbc = self.atoms.get_pbc()
             rx, ry = self.rng.random(), self.rng.random()
             xy = rx * cell[0, :2] + ry * cell[1, :2]
-            supports = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
+            supports = []
+            for atom in self.atoms:
+                dxyz = np.zeros(3)
+                dxyz[:2] = atom.position[:2] - xy
+                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, pbc)
+                if np.linalg.norm(dxyz_mic[0][:2]) < self.xy_tol:
+                    supports.append(atom)
             if not supports:
                 logger.debug(
                     f"Insertion trial {trial}: No support found beneath xy=({xy[0]:.2f}, {xy[1]:.2f})"
@@ -183,7 +197,7 @@ class GCMC:
                 continue
             site = np.array([xy[0], xy[1], z_insert])
             too_close = any(
-                np.linalg.norm(atom.position - site) < self.tol
+                get_distances(atom.position, site, cell=cell, pbc=pbc)[1] < self.tol
                 for atom in self.atoms
             )
             if too_close:
@@ -229,9 +243,16 @@ class GCMC:
             return None
         for trial in range(self.max_trials):
             cell = self.atoms.get_cell()
+            pbc = self.atoms.get_pbc()
             rx, ry = self.rng.random(), self.rng.random()
             xy = rx * cell[0, :2] + ry * cell[1, :2]
-            supports = [atom for atom in self.atoms if np.linalg.norm(atom.position[:2] - xy) < self.xy_tol]
+            supports = []
+            for atom in self.atoms:
+                dxyz = np.zeros(3)
+                dxyz[:2] = atom.position[:2] - xy
+                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, pbc)
+                if np.linalg.norm(dxyz_mic[0][:2]) < self.xy_tol:
+                    supports.append(atom)
             if not supports:
                 logger.debug(
                     f"Displacement trial {trial}: No support found beneath xy=({xy[0]:.2f}, {xy[1]:.2f})"
@@ -245,7 +266,7 @@ class GCMC:
                 continue
             new_pos = np.array([xy[0], xy[1], z_new])
             too_close = any(
-                np.linalg.norm(atom.position - new_pos) < self.tol
+                get_distances(atom.position, new_pos, cell=cell, pbc=pbc)[1] < self.tol
                 for atom in self.atoms
             )
             if too_close:
@@ -277,12 +298,15 @@ class GCMC:
         if not ads_indices:
             return True
 
-        tree = cKDTree(pos_all)
         for idx in ads_indices:
-            # Find all neighbors within cutoff (excluding self)
-            neighbor_indices = tree.query_ball_point(pos_all[idx], cutoff)
-            neighbor_indices = [j for j in neighbor_indices if j != idx]
-            if not neighbor_indices:
+            i_idx, j_idx = neighbor_list(
+                "ij",
+                atoms,
+                cutoff=cutoff,
+                self_interaction=False,
+            )
+            neighbors = j_idx[i_idx == idx]
+            if neighbors.size == 0:
                 return False  # Found an orphan/desorbed atom
         return True
 
@@ -428,7 +452,11 @@ class GCMC:
                     if self.relax:
                         atoms_relaxed, converged = self.relax_structure(atoms_new)
                         # Check for excessive movement
-                        disp = np.linalg.norm(atoms_new.get_positions() - atoms_relaxed.get_positions(), axis=1).max()
+                        disp_vec = atoms_new.get_positions() - atoms_relaxed.get_positions()
+                        disp_mic, _ = find_mic(
+                            disp_vec, atoms_new.get_cell(), atoms_new.get_pbc()
+                        )
+                        disp = np.linalg.norm(disp_mic, axis=1).max()
                         if not converged:
                             logger.debug("Rejected: relaxation did not converge.")
                             continue

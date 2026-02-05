@@ -9,7 +9,7 @@ from ase import units
 from ase.md.verlet import VelocityVerlet
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
-from scipy.spatial import cKDTree
+from ase.neighborlist import neighbor_list
 
 from .base import BaseMC
 
@@ -110,9 +110,7 @@ class AlloyCMC(BaseMC):
                 if s in self.swap_elements
             ]
         )
-
-        if self.swap_mode in ["neighbor", "hybrid"]:
-            self.tree = cKDTree(self.atoms.get_positions())
+        self.swap_index_set = set(self.swap_indices.tolist())
 
         self.atoms.calc = self.calculator
         self.e_old = self.atoms.get_potential_energy()
@@ -148,8 +146,6 @@ class AlloyCMC(BaseMC):
         if "atoms" in state:
             self.atoms = state["atoms"]
             self.atoms.calc = self.calculator
-            if self.swap_mode in ["neighbor", "hybrid"]:
-                self.tree = cKDTree(self.atoms.get_positions())
         self.T = state.get("T", self.T)
         self.e_old = state.get("e_old", 0.0)
         self.sweep = state.get("sweep", 0)
@@ -172,16 +168,14 @@ class AlloyCMC(BaseMC):
             idx1, idx2 = self.rng.choice(self.swap_indices, size=2, replace=False)
         elif mode == "neighbor":
             idx1 = self.rng.choice(self.swap_indices)
-            dists, neighbors = self.tree.query(
-                self.atoms.positions[idx1],
-                k=50,
-                distance_upper_bound=self.neighbor_cutoff,
+            i_idx, j_idx = neighbor_list(
+                "ij",
+                self.atoms,
+                cutoff=self.neighbor_cutoff,
+                self_interaction=False,
             )
-            valid = [
-                n
-                for n in neighbors
-                if n < len(self.atoms) and n != idx1 and n in self.swap_indices
-            ]
+            neighbors = j_idx[i_idx == idx1]
+            valid = [n for n in neighbors if n != idx1 and n in self.swap_index_set]
             if not valid:
                 return None
             idx2 = self.rng.choice(valid)
@@ -292,8 +286,6 @@ class AlloyCMC(BaseMC):
                         self.accepted_moves += 1
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
-                        if self.swap_mode in ["neighbor", "hybrid"]:
-                            self.tree = cKDTree(self.atoms.get_positions())
                     continue
 
                 indices = self.propose_swap_indices()
@@ -330,8 +322,6 @@ class AlloyCMC(BaseMC):
                     if self.relax:
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
-                        if self.swap_mode in ["neighbor", "hybrid"]:
-                            self.tree = cKDTree(self.atoms.get_positions())
                 else:
                     self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym1, sym2
 

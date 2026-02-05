@@ -182,11 +182,13 @@ def generate_adsorbate_configuration(
     # Add integer number of layers
     for ilayer in range(n_layers):
         for xy in site_xy:
-            neighbors_z = [
-                atom.position[2]
-                for atom in atoms_new
-                if np.linalg.norm(atom.position[:2] - xy) < support_xy_tol
-            ]
+            neighbors_z = []
+            for atom in atoms_new:
+                dxyz = np.zeros(3)
+                dxyz[:2] = atom.position[:2] - xy
+                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, atoms_new.pbc)
+                if np.linalg.norm(dxyz_mic[0][:2]) < support_xy_tol:
+                    neighbors_z.append(atom.position[2])
             if not neighbors_z:
                 raise RuntimeError(
                     f"No support found at site {xy} for adsorbate placement."
@@ -199,11 +201,13 @@ def generate_adsorbate_configuration(
         n_partial = int(round(frac_layer * n_sites))
         chosen = rng.choice(n_sites, n_partial, replace=False)
         for xy in site_xy[chosen]:
-            neighbors_z = [
-                atom.position[2]
-                for atom in atoms_new
-                if np.linalg.norm(atom.position[:2] - xy) < support_xy_tol
-            ]
+            neighbors_z = []
+            for atom in atoms_new:
+                dxyz = np.zeros(3)
+                dxyz[:2] = atom.position[:2] - xy
+                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, atoms_new.pbc)
+                if np.linalg.norm(dxyz_mic[0][:2]) < support_xy_tol:
+                    neighbors_z.append(atom.position[2])
             if not neighbors_z:
                 raise RuntimeError(
                     f"No support found at site {xy} for adsorbate placement."

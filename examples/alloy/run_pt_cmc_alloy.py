@@ -6,7 +6,10 @@ from ase.build import make_supercell
 # from mace.calculators import MACECalculator
 from symmetrix import Symmetrix
 from gcmc.alloy_cmc import AlloyCMC
-from gcmc.utils import initialize_alloy_sublattice
+from gcmc.utils import (
+    initialize_alloy_sublattice,
+    generate_nonuniform_temperature_grid,
+)
 from gcmc.replica import ReplicaExchange
 import numpy as np
 
@@ -51,6 +54,10 @@ def main(sc_matrix):
         "neighbor_cutoff": 5.0,
     }
 
+    # Temperature-grid setup for replica exchange.
+    # Switch to False to use a uniform grid controlled by T_step.
+    use_nonuniform_grid = True
+
     """
     # initialize MC
     mc = AlloyCMC(
@@ -77,11 +84,11 @@ def main(sc_matrix):
     )"""
 
     # replica exchange
-    pt = ReplicaExchange.from_auto_config(
+    pt_kwargs = dict(
         atoms_template=atoms,
         T_start=800,
         T_end=50,
-        T_step=50,
+        T_step=50,  # Used for uniform grid; ignored when n_replicas is set.
         swap_stride=1,
         calculator_class=Symmetrix,
         calc_kwargs=calc_kwargs,
@@ -95,6 +102,32 @@ def main(sc_matrix):
         n_gpus=4,
         workers_per_gpu=4,
     )
+
+    if use_nonuniform_grid:
+        pt_kwargs.update(
+            {
+                "n_replicas": 16,
+                "fine_grid_temps": [650.0, 300.0],
+                "fine_grid_weights": [1.0, 1.5],
+                "fine_grid_strength": 5.0,
+                "fine_grid_width": 80.0,
+            }
+        )
+        preview_temps = generate_nonuniform_temperature_grid(
+            T_start=pt_kwargs["T_start"],
+            T_end=pt_kwargs["T_end"],
+            n_replicas=pt_kwargs["n_replicas"],
+            focus_temps=pt_kwargs["fine_grid_temps"],
+            focus_weights=pt_kwargs["fine_grid_weights"],
+            focus_strength=pt_kwargs["fine_grid_strength"],
+            focus_width=pt_kwargs["fine_grid_width"],
+        )
+        print(
+            "Nonuniform PT temperatures [K]:",
+            np.array2string(np.array(preview_temps), precision=1),
+        )
+
+    pt = ReplicaExchange.from_auto_config(**pt_kwargs)
 
     pt.run(n_cycles=2, equilibration_cycles=0)
 

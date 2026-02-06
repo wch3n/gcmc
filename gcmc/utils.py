@@ -9,10 +9,102 @@ All functions compatible with ASE Atoms objects.
 """
 
 import numpy as np
-from typing import List, Tuple, Literal, Optional
+from typing import List, Tuple, Literal, Optional, Sequence
 from ase import Atom, Atoms
 from ase.geometry import find_mic
 from scipy.spatial import Delaunay
+
+
+def generate_nonuniform_temperature_grid(
+    T_start: float,
+    T_end: float,
+    n_replicas: int,
+    focus_temps: Optional[Sequence[float]] = None,
+    focus_weights: Optional[Sequence[float]] = None,
+    focus_strength: float = 4.0,
+    focus_width: Optional[float] = None,
+) -> List[float]:
+    """
+    Generate a monotonic nonuniform temperature grid with optional dense regions.
+
+    The grid always spans [T_start, T_end] and contains exactly `n_replicas` points.
+    Density is increased around one or more focus temperatures using Gaussian bumps.
+
+    Args:
+        T_start: First temperature in the grid.
+        T_end: Last temperature in the grid.
+        n_replicas: Number of replicas (grid points).
+        focus_temps: One or more target temperatures where spacing should be finer.
+        focus_weights: Relative strength per focus temperature (same length as focus_temps).
+        focus_strength: Global amplification for all focus temperatures.
+        focus_width: Width (in K) of local refinement around each focus temperature.
+
+    Returns:
+        List of temperatures ordered from T_start to T_end.
+    """
+    n_replicas = int(n_replicas)
+    if n_replicas < 2:
+        raise ValueError("n_replicas must be >= 2.")
+
+    t0 = float(T_start)
+    t1 = float(T_end)
+    if np.isclose(t0, t1):
+        return [t0 for _ in range(n_replicas)]
+
+    lo, hi = (t0, t1) if t0 < t1 else (t1, t0)
+    span = hi - lo
+
+    if focus_temps is None:
+        focus_list: List[float] = []
+    elif np.isscalar(focus_temps):
+        focus_list = [float(focus_temps)]
+    else:
+        focus_list = [float(t) for t in focus_temps]
+
+    if focus_weights is None:
+        weight_list = [1.0] * len(focus_list)
+    elif np.isscalar(focus_weights):
+        weight_list = [float(focus_weights)]
+    else:
+        weight_list = [float(w) for w in focus_weights]
+
+    if len(weight_list) != len(focus_list):
+        raise ValueError("focus_weights must have the same length as focus_temps.")
+    if any(w < 0 for w in weight_list):
+        raise ValueError("focus_weights must be non-negative.")
+    if focus_strength < 0:
+        raise ValueError("focus_strength must be non-negative.")
+
+    sigma = float(focus_width) if focus_width is not None else 0.08 * span
+    if sigma <= 0:
+        raise ValueError("focus_width must be > 0.")
+
+    dense_n = max(4000, n_replicas * 250)
+    dense_t = np.linspace(lo, hi, dense_n)
+    density = np.ones_like(dense_t)
+
+    for t_focus, weight in zip(focus_list, weight_list):
+        if weight == 0.0:
+            continue
+        if t_focus < lo or t_focus > hi:
+            continue
+        z = (dense_t - t_focus) / sigma
+        density += focus_strength * weight * np.exp(-0.5 * z * z)
+
+    cdf = np.cumsum(density)
+    cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
+
+    quantiles = np.linspace(0.0, 1.0, n_replicas)
+    temps = np.interp(quantiles, cdf, dense_t)
+
+    # Preserve exact endpoints for robust comparisons and logging.
+    temps[0] = lo
+    temps[-1] = hi
+
+    if t0 > t1:
+        temps = temps[::-1]
+
+    return [float(t) for t in temps]
 
 
 def get_toplayer_xy(

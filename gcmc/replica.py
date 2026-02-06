@@ -7,6 +7,7 @@ import pickle
 import multiprocessing
 import time
 from .process_replica import ReplicaWorker, ctx
+from .utils import generate_nonuniform_temperature_grid
 
 logger = logging.getLogger("mc")
 
@@ -105,11 +106,11 @@ class ReplicaExchange:
         atoms_template,
         T_start,
         T_end,
-        T_step,
-        calculator_class,
-        mc_class,
-        calc_kwargs,
-        mc_kwargs,
+        T_step=None,
+        calculator_class=None,
+        mc_class=None,
+        calc_kwargs=None,
+        mc_kwargs=None,
         n_gpus=4,
         workers_per_gpu=2,
         swap_stride=1,
@@ -117,16 +118,46 @@ class ReplicaExchange:
         results_file="results.csv",
         track_composition=None,
         seed_nonce: int = 0,
+        n_replicas: int = None,
+        fine_grid_temps=None,
+        fine_grid_weights=None,
+        fine_grid_strength: float = 4.0,
+        fine_grid_width: float = None,
         **pt_kwargs,
     ):
 
         atoms_clean = atoms_template.copy()
         atoms_clean.calc = None
+        if calculator_class is None:
+            raise ValueError("calculator_class must be provided.")
+        if mc_class is None:
+            raise ValueError("mc_class must be provided.")
+        if calc_kwargs is None:
+            calc_kwargs = {}
+        if mc_kwargs is None:
+            mc_kwargs = {}
 
-        if T_start > T_end:
-            temps = np.arange(T_start, T_end - abs(T_step) / 2, -abs(T_step)).tolist()
+        if n_replicas is not None:
+            temps = generate_nonuniform_temperature_grid(
+                T_start=T_start,
+                T_end=T_end,
+                n_replicas=n_replicas,
+                focus_temps=fine_grid_temps,
+                focus_weights=fine_grid_weights,
+                focus_strength=fine_grid_strength,
+                focus_width=fine_grid_width,
+            )
         else:
-            temps = np.arange(T_start, T_end + abs(T_step) / 2, abs(T_step)).tolist()
+            if T_step is None or np.isclose(T_step, 0.0):
+                raise ValueError("T_step must be non-zero when n_replicas is not set.")
+            if T_start > T_end:
+                temps = np.arange(
+                    T_start, T_end - abs(T_step) / 2, -abs(T_step)
+                ).tolist()
+            else:
+                temps = np.arange(
+                    T_start, T_end + abs(T_step) / 2, abs(T_step)
+                ).tolist()
 
         logger.info(
             f"Configuration: {len(temps)} Replicas | {n_gpus} GPUs | {workers_per_gpu} Workers/GPU"

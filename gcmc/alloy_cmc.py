@@ -30,6 +30,8 @@ class AlloyCMC(BaseMC):
         swap_elements: Optional[List[str]] = None,
         swap_mode: str = "hybrid",
         neighbor_cutoff: float = 3.5,
+        neighbor_backend: str = "ase",
+        neighbor_cache: bool = True,
         relax: bool = False,
         relax_steps: int = 10,
         local_relax: bool = False,
@@ -71,6 +73,9 @@ class AlloyCMC(BaseMC):
         self.T = T
         self.swap_mode = swap_mode
         self.neighbor_cutoff = neighbor_cutoff
+        self._matscipy_neighbor_list = None
+        self.neighbor_backend = self._resolve_neighbor_backend(neighbor_backend)
+        self.neighbor_cache = bool(neighbor_cache)
         self.relax = relax
         self.local_relax = local_relax
         self.relax_radius = relax_radius
@@ -111,6 +116,8 @@ class AlloyCMC(BaseMC):
             ]
         )
         self.swap_index_set = set(self.swap_indices.tolist())
+        self._swap_neighbors: Optional[list[np.ndarray]] = None
+        self._neighbor_cache_ready = False
 
         self.atoms.calc = self.calculator
         self.e_old = self.atoms.get_potential_energy()
@@ -120,6 +127,98 @@ class AlloyCMC(BaseMC):
 
         if resume:
             self._load_checkpoint()
+
+    def _resolve_neighbor_backend(self, backend: str) -> str:
+        backend_norm = backend.lower()
+        if backend_norm not in ("ase", "matscipy", "auto"):
+            raise ValueError("neighbor_backend must be 'ase', 'matscipy', or 'auto'.")
+
+        if backend_norm in ("matscipy", "auto"):
+            try:
+                from matscipy.neighbours import neighbour_list as matscipy_neighbor_list
+
+                self._matscipy_neighbor_list = matscipy_neighbor_list
+                if backend_norm == "auto":
+                    logger.info("Neighbor backend auto-selected: matscipy")
+                return "matscipy"
+            except ImportError:
+                if backend_norm == "matscipy":
+                    raise ImportError(
+                        "neighbor_backend='matscipy' requires matscipy to be installed."
+                    ) from None
+                logger.info("Neighbor backend auto-selected: ase")
+
+        self._matscipy_neighbor_list = None
+        return "ase"
+
+    def _neighbor_pairs(self) -> Tuple[np.ndarray, np.ndarray]:
+        if self.neighbor_backend == "matscipy":
+            i_idx, j_idx = self._matscipy_neighbor_list(
+                "ij",
+                self.atoms,
+                self.neighbor_cutoff,
+            )
+        else:
+            i_idx, j_idx = neighbor_list(
+                "ij",
+                self.atoms,
+                cutoff=self.neighbor_cutoff,
+                self_interaction=False,
+            )
+        return np.asarray(i_idx, dtype=int), np.asarray(j_idx, dtype=int)
+
+    def _compute_swap_neighbor_lists(self) -> list[np.ndarray]:
+        n_atoms = len(self.atoms)
+        neighbors_by_atom = [np.empty(0, dtype=int) for _ in range(n_atoms)]
+
+        if len(self.swap_indices) < 2:
+            return neighbors_by_atom
+
+        i_idx, j_idx = self._neighbor_pairs()
+        if i_idx.size == 0:
+            return neighbors_by_atom
+
+        is_swap = np.zeros(n_atoms, dtype=bool)
+        is_swap[self.swap_indices] = True
+        mask = is_swap[i_idx] & is_swap[j_idx] & (i_idx != j_idx)
+        if not np.any(mask):
+            return neighbors_by_atom
+
+        filtered_i = i_idx[mask]
+        filtered_j = j_idx[mask]
+
+        buckets = [[] for _ in range(n_atoms)]
+        for i, j in zip(filtered_i, filtered_j):
+            buckets[int(i)].append(int(j))
+
+        for i, neigh in enumerate(buckets):
+            if neigh:
+                neighbors_by_atom[i] = np.unique(np.asarray(neigh, dtype=int))
+
+        return neighbors_by_atom
+
+    def _invalidate_neighbor_cache(self) -> None:
+        self._swap_neighbors = None
+        self._neighbor_cache_ready = False
+
+    def _build_neighbor_cache(self) -> None:
+        self._swap_neighbors = self._compute_swap_neighbor_lists()
+        self._neighbor_cache_ready = True
+
+    def _ensure_neighbor_cache(self) -> None:
+        if self.neighbor_cache and not self._neighbor_cache_ready:
+            self._build_neighbor_cache()
+
+    def _get_neighbor_candidates(self, idx1: int) -> np.ndarray:
+        if self.neighbor_cache:
+            self._ensure_neighbor_cache()
+            if self._swap_neighbors is None:
+                return np.empty(0, dtype=int)
+            return self._swap_neighbors[idx1]
+
+        # Recompute with the exact same builder used by the cached path.
+        neighbors_by_atom = self._compute_swap_neighbor_lists()
+        return neighbors_by_atom[idx1]
 
     def _save_checkpoint(self):
         atoms_copy = self.atoms.copy()
@@ -154,6 +253,7 @@ class AlloyCMC(BaseMC):
         self.sum_E = state.get("sum_E", 0.0)
         self.sum_E_sq = state.get("sum_E_sq", 0.0)
         self.n_samples = state.get("n_samples", 0)
+        self._invalidate_neighbor_cache()
         logger.info(f"[{self.T:.0f}K] Resumed from checkpoint.")
 
     def propose_swap_indices(self) -> Optional[Tuple[int, int]]:
@@ -168,15 +268,8 @@ class AlloyCMC(BaseMC):
             idx1, idx2 = self.rng.choice(self.swap_indices, size=2, replace=False)
         elif mode == "neighbor":
             idx1 = self.rng.choice(self.swap_indices)
-            i_idx, j_idx = neighbor_list(
-                "ij",
-                self.atoms,
-                cutoff=self.neighbor_cutoff,
-                self_interaction=False,
-            )
-            neighbors = j_idx[i_idx == idx1]
-            valid = [n for n in neighbors if n != idx1 and n in self.swap_index_set]
-            if not valid:
+            valid = self._get_neighbor_candidates(idx1)
+            if valid.size == 0:
                 return None
             idx2 = self.rng.choice(valid)
         else:
@@ -268,6 +361,8 @@ class AlloyCMC(BaseMC):
         self.n_samples = 0
         self.accepted_moves = 0
         self.total_moves = 0
+        if self.neighbor_cache:
+            self._invalidate_neighbor_cache()
 
         moves_per_sweep = len(self.swap_indices)
 
@@ -277,6 +372,8 @@ class AlloyCMC(BaseMC):
 
         for sweep in range(nsweeps):
             beta = 1.0 / (8.617e-5 * self.T)
+            if self.neighbor_cache and self.swap_mode in ("neighbor", "hybrid"):
+                self._ensure_neighbor_cache()
             for i in range(moves_per_sweep):
                 self.total_moves += 1
                 do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
@@ -289,6 +386,8 @@ class AlloyCMC(BaseMC):
                         self.accepted_moves += 1
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
+                        if self.neighbor_cache:
+                            self._invalidate_neighbor_cache()
                     continue
 
                 indices = self.propose_swap_indices()
@@ -325,6 +424,8 @@ class AlloyCMC(BaseMC):
                     if self.relax:
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
+                        if self.neighbor_cache:
+                            self._invalidate_neighbor_cache()
                 else:
                     self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym1, sym2
 

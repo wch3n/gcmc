@@ -49,6 +49,7 @@ class AlloyCMC(BaseMC):
         md_steps: int = 50,
         md_timestep_fs: float = 1.0,
         md_ensemble: str = "nve",
+        md_accept_mode: str = "potential",
         md_friction: float = 0.01,
         md_init_momenta: bool = True,
         md_remove_drift: bool = True,
@@ -89,6 +90,7 @@ class AlloyCMC(BaseMC):
         self.md_steps = md_steps
         self.md_timestep_fs = md_timestep_fs
         self.md_ensemble = md_ensemble.lower()
+        self.md_accept_mode = md_accept_mode.lower()
         self.md_friction = md_friction
         self.md_init_momenta = md_init_momenta
         self.md_remove_drift = md_remove_drift
@@ -96,6 +98,17 @@ class AlloyCMC(BaseMC):
             raise ValueError("md_move_prob must be in [0, 1].")
         if self.md_ensemble not in ("nve", "langevin"):
             raise ValueError("md_ensemble must be 'nve' or 'langevin'.")
+        if self.md_accept_mode not in ("potential", "hamiltonian"):
+            raise ValueError("md_accept_mode must be 'potential' or 'hamiltonian'.")
+        if self.md_accept_mode == "hamiltonian":
+            if self.md_ensemble != "nve":
+                raise ValueError(
+                    "md_accept_mode='hamiltonian' requires md_ensemble='nve'."
+                )
+            if not self.md_init_momenta:
+                raise ValueError(
+                    "md_accept_mode='hamiltonian' requires md_init_momenta=True."
+                )
 
         self.sum_E = 0.0
         self.sum_E_sq = 0.0
@@ -124,6 +137,8 @@ class AlloyCMC(BaseMC):
         self.sweep = 0
         self.accepted_moves = 0
         self.total_moves = 0
+        self.md_attempted_moves = 0
+        self.md_accepted_moves = 0
 
         if resume:
             self._load_checkpoint()
@@ -286,7 +301,7 @@ class AlloyCMC(BaseMC):
             beta = 1.0 / (8.617e-5 * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
 
-    def _propose_md_move(self) -> Tuple[Optional[Atoms], float]:
+    def _propose_md_move(self) -> Tuple[Optional[Atoms], float, float]:
         atoms_trial = self.atoms.copy()
         atoms_trial.calc = self.calculator
 
@@ -297,6 +312,8 @@ class AlloyCMC(BaseMC):
             if self.md_remove_drift:
                 Stationary(atoms_trial)
 
+        e_old = self.e_old
+        k_old = atoms_trial.get_kinetic_energy()
         dt = self.md_timestep_fs * units.fs
         if self.md_ensemble == "langevin":
             dyn = Langevin(
@@ -314,9 +331,12 @@ class AlloyCMC(BaseMC):
             e_new = self.get_potential_energy(atoms_trial)
         except Exception as exc:
             logger.warning(f"MD trial move failed: {exc}")
-            return None, 0.0
+            return None, 0.0, 0.0
 
-        return atoms_trial, e_new - self.e_old
+        delta_e = e_new - e_old
+        k_new = atoms_trial.get_kinetic_energy()
+        delta_h = (e_new + k_new) - (e_old + k_old)
+        return atoms_trial, delta_e, delta_h
 
     def relax_structure(
         self, atoms: Atoms, move_ind: Optional[list]
@@ -358,6 +378,8 @@ class AlloyCMC(BaseMC):
         self.n_samples = 0
         self.accepted_moves = 0
         self.total_moves = 0
+        self.md_attempted_moves = 0
+        self.md_accepted_moves = 0
         if self.neighbor_cache:
             self._invalidate_neighbor_cache()
 
@@ -373,12 +395,17 @@ class AlloyCMC(BaseMC):
                 self.total_moves += 1
                 do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
                 if do_md:
-                    atoms_trial, delta_e = self._propose_md_move()
+                    self.md_attempted_moves += 1
+                    atoms_trial, delta_e, delta_h = self._propose_md_move()
                     if atoms_trial is None:
                         continue
-                    if self._metropolis_accept(delta_e, beta=beta):
+                    md_delta = (
+                        delta_h if self.md_accept_mode == "hamiltonian" else delta_e
+                    )
+                    if self._metropolis_accept(md_delta, beta=beta):
                         self.e_old += delta_e
                         self.accepted_moves += 1
+                        self.md_accepted_moves += 1
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
                         if self.neighbor_cache:
@@ -448,9 +475,27 @@ class AlloyCMC(BaseMC):
                     var = (self.sum_E_sq / self.n_samples) - (avg**2)
                     Cv = var / (8.617e-5 * self.T**2)
 
-                logger.info(
-                    f"T={self.T:4.0f}K | {self.sweep:6d} | E: {self.e_old:10.4f} | Avg: {avg:10.4f} | Cv: {Cv:8.4f} | Acc: {acc:4.1f}%"
+                log_msg = (
+                    f"T={self.T:4.0f}K | {self.sweep:6d} | E: {self.e_old:10.4f} | "
+                    f"Avg: {avg:10.4f} | Cv: {Cv:8.4f} | Acc: {acc:4.1f}%"
                 )
+                if self.enable_hybrid_md:
+                    md_acc = (
+                        (self.md_accepted_moves / self.md_attempted_moves * 100)
+                        if self.md_attempted_moves
+                        else 0.0
+                    )
+                    md_frac = (
+                        (self.md_attempted_moves / self.total_moves * 100)
+                        if self.total_moves
+                        else 0.0
+                    )
+                    log_msg += (
+                        f" | MD: {self.md_accepted_moves}/{self.md_attempted_moves}"
+                        f" ({md_acc:4.1f}%) | MD_frac: {md_frac:4.1f}%"
+                        f" | MD_accept: {self.md_accept_mode}"
+                    )
+                logger.info(log_msg)
 
             # 3. Checkpointing.
             if (
@@ -476,4 +521,7 @@ class AlloyCMC(BaseMC):
                 if self.total_moves
                 else 0.0
             ),
+            "md_attempted": self.md_attempted_moves,
+            "md_accepted": self.md_accepted_moves,
+            "md_accept_mode": self.md_accept_mode,
         }

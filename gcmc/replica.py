@@ -72,10 +72,9 @@ class ReplicaExchange:
 
         if not os.path.exists(self.results_file) and not resume:
             with open(self.results_file, "w") as f:
-
-                header = "Cycle,Temperature,Avg_Potential_Energy,Cv,Acceptance_Rate"
+                header = "cycle,T_K,n_atoms,E_eV,E_eV_per_atom,Cv_eV_per_K,acc_pct"
                 for el in self.track_composition:
-                    header += f",Comp_{el},Susc_{el}"
+                    header += f",N_{el}_avg,chi_{el}"
                 f.write(header + "\n")
 
         if resume and os.path.exists(checkpoint_file):
@@ -244,7 +243,6 @@ class ReplicaExchange:
                     # 2. Cycle Stats (From Worker)
                     cycle_stats = res["local_stats"]
                     cycle_E = cycle_stats["energy"]
-                    cycle_Cv = cycle_stats["cv"]
                     acc = cycle_stats["acceptance"]
 
                     # 3. Update Cumulative (Memory Only)
@@ -261,10 +259,17 @@ class ReplicaExchange:
                     else:
                         cum_Cv = 0.0
 
-                    # 4. Write CSV (CLEAN: Cycle stats only)
-
+                    # 4. Write CSV (use cumulative Cv estimator)
+                    n_atoms = len(state["atoms"])
+                    e_per_atom = cycle_E / n_atoms if n_atoms > 0 else 0.0
                     line = (
-                        f"{cycle+1},{state['T']},{cycle_E:.6f},{cycle_Cv:.6f},{acc:.2f}"
+                        f"{cycle+1},"
+                        f"{state['T']:.6f},"
+                        f"{n_atoms},"
+                        f"{cycle_E:.6f},"
+                        f"{e_per_atom:.8f},"
+                        f"{cum_Cv:.6f},"
+                        f"{acc:.2f}"
                     )
 
                     if self.track_composition and "composition" in cycle_stats:
@@ -275,13 +280,6 @@ class ReplicaExchange:
 
                     with open(self.results_file, "a") as f:
                         f.write(line + "\n")
-
-                    # 5. Log Output (RICH: Show both for monitoring)
-                    # We log every ~10th replica to avoid spamming 100 lines
-                    if rid % 10 == 0 or rid == len(self.replica_states) - 1:
-                        logger.info(
-                            f"  [R{rid}|{state['T']:.0f}K] Cv: {cycle_Cv:.3f} (Cum: {cum_Cv:.3f}) | Acc: {acc:.2f}"
-                        )
 
                     completed += 1
 

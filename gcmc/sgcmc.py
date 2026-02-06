@@ -66,12 +66,20 @@ class SemiGrandAlloyMC(AlloyCMC):
 
         # Trajectory setup.
         self.traj_file = traj_file
+        (
+            self.traj_file,
+            self.thermo_file,
+            self.checkpoint_file,
+            self.accepted_traj_file,
+        ) = self._temperature_layout(
+            traj_file, self.thermo_file, self.checkpoint_file, self.accepted_traj_file
+        )
 
-        if os.path.exists(traj_file) and os.path.getsize(traj_file) > 0:
+        if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0:
             mode = "a"
         else:
             mode = "w"
-        traj_writer = Trajectory(traj_file, mode)
+        traj_writer = Trajectory(self.traj_file, mode)
 
         # Initialize statistics.
         # Only reset when starting fresh (sweep 0).

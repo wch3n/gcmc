@@ -15,6 +15,75 @@ from ase.geometry import find_mic
 from scipy.spatial import Delaunay
 
 
+def _inclusive_linear_grid(start: float, end: float, step: float) -> np.ndarray:
+    """Return an inclusive linear grid from start to end with the given step."""
+    if step <= 0:
+        raise ValueError("step must be > 0.")
+    if start >= end:
+        return np.arange(start, end - step / 2.0, -step)
+    return np.arange(start, end + step / 2.0, step)
+
+
+def generate_temperature_grid(
+    T_start: float,
+    T_end: float,
+    n_replicas: int,
+    base: Literal["beta", "linear"] = "beta",
+    windows: Optional[List[Tuple[float, float, float]]] = None,
+    round_digits: int = 8,
+) -> List[float]:
+    """
+    Build a temperature ladder with optional local refinement windows.
+
+    Args:
+        T_start: Start temperature (K).
+        T_end: End temperature (K).
+        n_replicas: Number of base temperatures.
+        base: Base spacing mode ("beta" or "linear").
+        windows: Optional refinement windows [(T_hi, T_lo, step), ...].
+        round_digits: Rounding precision for deduplication.
+
+    Returns:
+        Monotonic list of temperatures from T_start to T_end.
+    """
+    T_start = float(T_start)
+    T_end = float(T_end)
+
+    if T_start <= 0 or T_end <= 0:
+        raise ValueError("Temperatures must be > 0 K.")
+    if n_replicas < 2:
+        raise ValueError("n_replicas must be >= 2.")
+    if base not in ("beta", "linear"):
+        raise ValueError("base must be 'beta' or 'linear'.")
+
+    if base == "beta":
+        betas = np.linspace(1.0 / T_start, 1.0 / T_end, n_replicas)
+        temps = 1.0 / betas
+    else:
+        temps = np.linspace(T_start, T_end, n_replicas)
+
+    all_temps = [temps]
+    if windows:
+        g_lo = min(T_start, T_end)
+        g_hi = max(T_start, T_end)
+        for T_hi, T_lo, step in windows:
+            w_hi = float(max(T_hi, T_lo))
+            w_lo = float(min(T_hi, T_lo))
+            w_hi = min(w_hi, g_hi)
+            w_lo = max(w_lo, g_lo)
+            if w_hi <= w_lo:
+                continue
+            all_temps.append(_inclusive_linear_grid(w_hi, w_lo, float(step)))
+
+    merged = np.concatenate(all_temps)
+    merged = np.unique(np.round(merged, round_digits))
+
+    descending = T_start > T_end
+    merged = np.sort(merged)[::-1] if descending else np.sort(merged)
+
+    return [float(t) for t in merged.tolist()]
+
+
 def generate_nonuniform_temperature_grid(
     T_start: float,
     T_end: float,

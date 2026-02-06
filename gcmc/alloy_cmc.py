@@ -22,6 +22,33 @@ class AlloyCMC(BaseMC):
     Optimized for Parallel Tempering.
     """
 
+    def _temperature_tag(self) -> str:
+        t_str = f"{float(self.T):.6f}".rstrip("0").rstrip(".")
+        return t_str.replace(".", "p").replace("-", "m")
+
+    def _temperature_layout(
+        self,
+        traj_file: str,
+        thermo_file: str,
+        checkpoint_file: str,
+        accepted_traj_file: Optional[str] = None,
+    ) -> Tuple[str, str, str, Optional[str]]:
+        root = os.path.normpath(os.path.dirname(traj_file) or ".")
+        t_name = f"T_{self._temperature_tag()}K"
+        if os.path.basename(root) == t_name:
+            t_dir = root
+        else:
+            t_dir = os.path.join(root, t_name)
+        os.makedirs(t_dir, exist_ok=True)
+
+        traj_path = os.path.join(t_dir, os.path.basename(traj_file))
+        thermo_path = os.path.join(t_dir, os.path.basename(thermo_file))
+        checkpoint_path = os.path.join(t_dir, os.path.basename(checkpoint_file))
+        accepted_path = None
+        if accepted_traj_file is not None:
+            accepted_path = os.path.join(t_dir, os.path.basename(accepted_traj_file))
+        return traj_path, thermo_path, checkpoint_path, accepted_path
+
     def __init__(
         self,
         atoms: Union[Atoms, str],
@@ -74,10 +101,14 @@ class AlloyCMC(BaseMC):
         self.relax = relax
         self.local_relax = local_relax
         self.relax_radius = relax_radius
-        self.traj_file = traj_file
-        self.accepted_traj_file = accepted_traj_file
-        self.thermo_file = thermo_file
-        self.checkpoint_file = checkpoint_file
+        (
+            self.traj_file,
+            self.thermo_file,
+            self.checkpoint_file,
+            self.accepted_traj_file,
+        ) = self._temperature_layout(
+            traj_file, thermo_file, checkpoint_file, accepted_traj_file
+        )
         self.checkpoint_interval = checkpoint_interval
         self.enable_hybrid_md = enable_hybrid_md
         self.md_move_prob = md_move_prob
@@ -253,14 +284,22 @@ class AlloyCMC(BaseMC):
         sample_interval: int = 1,
         equilibration: int = 0,
     ) -> Dict[str, float]:
+        (
+            self.traj_file,
+            self.thermo_file,
+            self.checkpoint_file,
+            self.accepted_traj_file,
+        ) = self._temperature_layout(
+            traj_file, self.thermo_file, self.checkpoint_file, self.accepted_traj_file
+        )
 
         # Determine mode safely
-        if os.path.exists(traj_file) and os.path.getsize(traj_file) > 0:
+        if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0:
             mode = "a"
         else:
             mode = "w"
 
-        self.traj_writer = Trajectory(traj_file, mode)
+        self.traj_writer = Trajectory(self.traj_file, mode)
 
         # Reset accumulations for this block
         self.sum_E = 0.0

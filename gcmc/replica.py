@@ -75,7 +75,7 @@ class ReplicaExchange:
                     header += f",N_{el}_avg,chi_{el}"
                 f.write(header + "\n")
 
-        if resume and os.path.exists(checkpoint_file):
+        if resume and os.path.exists(self.checkpoint_file):
             self._load_master_checkpoint()
 
     def _start_workers(self):
@@ -101,11 +101,10 @@ class ReplicaExchange:
     def from_auto_config(
         cls,
         atoms_template,
-        T_start=None,
-        T_end=None,
+        T_start,
+        T_end,
         T_step=None,
         *,
-        temps=None,
         calculator_class=None,
         mc_class=None,
         calc_kwargs=None,
@@ -115,7 +114,6 @@ class ReplicaExchange:
         swap_stride=1,
         resume=False,
         results_file="results.csv",
-        replica_output_dir="replicas",
         track_composition=None,
         seed_nonce: int = 0,
         n_replicas: int = None,
@@ -137,50 +135,35 @@ class ReplicaExchange:
         if mc_kwargs is None:
             mc_kwargs = {}
 
-        if temps is not None:
-            temps = sorted(set(float(t) for t in temps), reverse=True)
-            if len(temps) < 2:
-                raise ValueError("`temps` must contain at least two temperatures.")
+        if n_replicas is not None:
+            temps = generate_nonuniform_temperature_grid(
+                T_start=T_start,
+                T_end=T_end,
+                n_replicas=n_replicas,
+                focus_temps=fine_grid_temps,
+                focus_weights=fine_grid_weights,
+                focus_strength=fine_grid_strength,
+                focus_width=fine_grid_width,
+            )
         else:
-            if T_start is None or T_end is None:
-                raise ValueError(
-                    "Provide either `temps` or both `T_start` and `T_end`."
-                )
-            if n_replicas is not None:
-                temps = generate_nonuniform_temperature_grid(
-                    T_start=T_start,
-                    T_end=T_end,
-                    n_replicas=n_replicas,
-                    focus_temps=fine_grid_temps,
-                    focus_weights=fine_grid_weights,
-                    focus_strength=fine_grid_strength,
-                    focus_width=fine_grid_width,
-                )
+            if T_step is None or np.isclose(T_step, 0.0):
+                raise ValueError("T_step must be non-zero when n_replicas is not set.")
+            if T_start > T_end:
+                temps = np.arange(
+                    T_start, T_end - abs(T_step) / 2, -abs(T_step)
+                ).tolist()
             else:
-                if T_step is None or np.isclose(T_step, 0.0):
-                    raise ValueError(
-                        "T_step must be non-zero when n_replicas is not set."
-                    )
-                if T_start > T_end:
-                    temps = np.arange(
-                        T_start, T_end - abs(T_step) / 2, -abs(T_step)
-                    ).tolist()
-                else:
-                    temps = np.arange(
-                        T_start, T_end + abs(T_step) / 2, abs(T_step)
-                    ).tolist()
+                temps = np.arange(
+                    T_start, T_end + abs(T_step) / 2, abs(T_step)
+                ).tolist()
 
         logger.info(
             f"Configuration: {len(temps)} Replicas | {n_gpus} GPUs | {workers_per_gpu} Workers/GPU"
         )
 
-        os.makedirs(replica_output_dir, exist_ok=True)
         replica_states = []
         for i, T in enumerate(temps):
-            t_str = f"{float(T):.6f}".rstrip("0").rstrip(".")
-            t_tag = t_str.replace(".", "p").replace("-", "m")
-            rep_dir = os.path.join(replica_output_dir, f"T_{t_tag}K")
-            os.makedirs(rep_dir, exist_ok=True)
+            t_str = f"{T:.0f}"
             state = {
                 "id": i,
                 "T": T,
@@ -191,9 +174,9 @@ class ReplicaExchange:
                 "cum_sum_E": 0.0,
                 "cum_sum_E_sq": 0.0,
                 "cum_n_samples": 0,
-                "traj_file": os.path.join(rep_dir, "replica.traj"),
-                "thermo_file": os.path.join(rep_dir, "replica.dat"),
-                "checkpoint_file": os.path.join(rep_dir, "checkpoint.pkl"),
+                "traj_file": f"replica_{t_str}K.traj",
+                "thermo_file": f"replica_{t_str}K.dat",
+                "checkpoint_file": f"checkpoint_{t_str}K.pkl",
                 "mc_kwargs": mc_kwargs,
             }
             replica_states.append(state)

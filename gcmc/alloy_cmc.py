@@ -6,6 +6,7 @@ from typing import Any, Optional, List, Union, Dict, Tuple
 from ase import Atoms
 from ase.io import read, Trajectory
 from ase import units
+from ase.constraints import FixCartesian
 from ase.md.verlet import VelocityVerlet
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -51,6 +52,8 @@ class AlloyCMC(BaseMC):
         md_ensemble: str = "nve",
         md_accept_mode: str = "potential",
         md_friction: float = 0.01,
+        md_planar: bool = False,
+        md_planar_axis: int = 2,
         md_init_momenta: bool = True,
         md_remove_drift: bool = True,
         **kwargs,
@@ -92,12 +95,16 @@ class AlloyCMC(BaseMC):
         self.md_ensemble = md_ensemble.lower()
         self.md_accept_mode = md_accept_mode.lower()
         self.md_friction = md_friction
+        self.md_planar = bool(md_planar)
+        self.md_planar_axis = int(md_planar_axis)
         self.md_init_momenta = md_init_momenta
         self.md_remove_drift = md_remove_drift
         if not (0.0 <= self.md_move_prob <= 1.0):
             raise ValueError("md_move_prob must be in [0, 1].")
         if self.md_ensemble not in ("nve", "langevin"):
             raise ValueError("md_ensemble must be 'nve' or 'langevin'.")
+        if self.md_planar_axis not in (0, 1, 2):
+            raise ValueError("md_planar_axis must be 0, 1, or 2.")
         if self.md_accept_mode not in ("potential", "hamiltonian"):
             raise ValueError("md_accept_mode must be 'potential' or 'hamiltonian'.")
         if self.md_accept_mode == "hamiltonian":
@@ -301,9 +308,35 @@ class AlloyCMC(BaseMC):
             beta = 1.0 / (8.617e-5 * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
 
+    def _apply_planar_constraint(self, atoms_obj: Atoms) -> None:
+        if not self.md_planar:
+            return
+
+        mask = [False, False, False]
+        mask[self.md_planar_axis] = True
+        planar_fix = FixCartesian(np.arange(len(atoms_obj)), mask=mask)
+
+        existing = atoms_obj.constraints
+        if existing is None:
+            atoms_obj.set_constraint(planar_fix)
+            return
+        if isinstance(existing, (list, tuple)):
+            atoms_obj.set_constraint(list(existing) + [planar_fix])
+            return
+        atoms_obj.set_constraint([existing, planar_fix])
+
+    def _project_momenta_to_plane(self, atoms_obj: Atoms) -> None:
+        if not self.md_planar:
+            return
+
+        p = atoms_obj.get_momenta()
+        p[:, self.md_planar_axis] = 0.0
+        atoms_obj.set_momenta(p)
+
     def _propose_md_move(self) -> Tuple[Optional[Atoms], float, float]:
         atoms_trial = self.atoms.copy()
         atoms_trial.calc = self.calculator
+        self._apply_planar_constraint(atoms_trial)
 
         if self.md_init_momenta:
             MaxwellBoltzmannDistribution(
@@ -311,6 +344,7 @@ class AlloyCMC(BaseMC):
             )
             if self.md_remove_drift:
                 Stationary(atoms_trial)
+            self._project_momenta_to_plane(atoms_trial)
 
         e_old = self.e_old
         k_old = atoms_trial.get_kinetic_energy()
@@ -494,6 +528,7 @@ class AlloyCMC(BaseMC):
                         f" | MD: {self.md_accepted_moves}/{self.md_attempted_moves}"
                         f" ({md_acc:4.1f}%) | MD_frac: {md_frac:4.1f}%"
                         f" | MD_accept: {self.md_accept_mode}"
+                        f" | planar: {self.md_planar}"
                     )
                 logger.info(log_msg)
 

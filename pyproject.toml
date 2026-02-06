@@ -21,5 +21,10 @@ dependencies = [
     "mace-torch"
 ]
 
+[project.optional-dependencies]
+speedups = [
+    "matscipy"
+]
+
 [project.urls]
 Homepage = "https://github.com/wch3n/gcmc"

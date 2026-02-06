@@ -114,10 +114,8 @@ class SemiGrandAlloyMC(AlloyCMC):
 
                 # 2. Relax & Calc Energy
                 if self.relax:
-                    # Log debug only for first few steps to verify cell relaxation
-                    debug_log = sweep < 2 and i == 0
                     atoms_trial, conv = self.relax_structure(
-                        self.atoms.copy(), move_ind=[self.sweep, i], log_relax=debug_log
+                        self.atoms.copy(), move_ind=[self.sweep, i]
                     )
                     e_new_raw = self.get_potential_energy(atoms_trial) if conv else 1e9
                 else:

@@ -4,7 +4,7 @@ from gcmc.alloy_cmc import AlloyCMC
 from gcmc.utils import initialize_alloy_sublattice
 
 # setup initial system
-pristine = read("Ti2CO2_pristine.POSCAR")
+pristine = read("POSCAR.Ti2CO2")
 atoms = initialize_alloy_sublattice(
     pristine,
     "Ti",
@@ -13,6 +13,7 @@ atoms = initialize_alloy_sublattice(
 
 # setup calculator
 calc = MACECalculator(model_paths=["mxene.model"], device="cuda")
+neighbor_backend = "auto"  # Use matscipy if installed, otherwise ASE.
 
 # Baseline CMC (swap moves only)
 mc = AlloyCMC(
@@ -21,6 +22,7 @@ mc = AlloyCMC(
     T=600,
     swap_elements=["Ti", "Mo", "Zr"],
     swap_mode="neighbor",
+    neighbor_backend=neighbor_backend,
     relax=True,
     traj_file="cmc_only.traj",
     thermo_file="cmc_only.dat",
@@ -35,9 +37,10 @@ mc_hybrid_nve = AlloyCMC(
     T=600,
     swap_elements=["Ti", "Mo", "Zr"],
     swap_mode="neighbor",
+    neighbor_backend=neighbor_backend,
     relax=True,
     enable_hybrid_md=True,
-    md_move_prob=0.2,      # 20% MD proposals, 80% swap proposals
+    md_move_prob=0.2,  # 20% MD proposals, 80% swap proposals
     md_ensemble="nve",
     md_steps=50,
     md_timestep_fs=1.0,
@@ -56,6 +59,7 @@ mc_hybrid_langevin = AlloyCMC(
     T=600,
     swap_elements=["Ti", "Mo", "Zr"],
     swap_mode="neighbor",
+    neighbor_backend=neighbor_backend,
     relax=True,
     enable_hybrid_md=True,
     md_move_prob=0.2,

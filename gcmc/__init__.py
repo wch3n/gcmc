@@ -17,6 +17,7 @@ from .cmc import CMC
 from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
+from .cluster_analysis import analyze_and_plot, find_cu_clusters
 from . import utils
 
 __all__ = [
@@ -26,5 +27,7 @@ __all__ = [
     "AlloyCMC",
     "SemiGrandAlloyMC",
     "ReplicaExchange",
+    "analyze_and_plot",
+    "find_cu_clusters",
     "utils",
 ]

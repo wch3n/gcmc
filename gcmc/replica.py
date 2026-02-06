@@ -1,5 +1,3 @@
-# gcmc/replica.py
-
 import numpy as np
 import logging
 import os
@@ -45,7 +43,7 @@ class ReplicaExchange:
         self.seed_nonce = seed_nonce
         self.rng = np.random.default_rng(seed)
 
-        # Store elements to track (e.g., ['Ti', 'Mo'])
+        # Store elements to track (for example, ['Ti', 'Mo']).
         self.track_composition = track_composition if track_composition else []
 
         self.stats_file = stats_file
@@ -53,13 +51,12 @@ class ReplicaExchange:
         self.checkpoint_file = checkpoint_file
         self.cycle_start = 0
 
-        # Load Balancing: One Queue per GPU
+        # Load balancing: one queue per GPU.
         self.gpu_queues = [ctx.Queue() for _ in range(n_gpus)]
         self.result_queue = ctx.Queue()
         self.workers = []
 
-        # Keep RNG streams deterministic and isolated per replica, independent of
-        # worker scheduling/order.
+        # Keep RNG streams deterministic and isolated per replica, independent of worker scheduling and ordering.
         for state in self.replica_states:
             if "rng_state" not in state or state["rng_state"] is None:
                 rid = state.get("id", 0)
@@ -172,7 +169,7 @@ class ReplicaExchange:
                 "atoms": atoms_clean.copy(),
                 "e_old": 0.0,
                 "sweep": 0,
-                # Cumulative counters (kept in memory for Logging)
+                # Cumulative counters kept in memory for logging.
                 "cum_sum_E": 0.0,
                 "cum_sum_E_sq": 0.0,
                 "cum_n_samples": 0,
@@ -219,15 +216,15 @@ class ReplicaExchange:
                 nsweeps = self.swap_interval
                 cycle_start_sweep = cycle * self.swap_interval
 
-                # --- LOCAL EQUILIBRATION ---
-                # Discard first 20% of stats to remove "Swap Shock"
+                # Local equilibration.
+                # Discard the first 20% of stats to remove swap shock.
                 local_eq_steps = int(nsweeps * 0.2)
                 eq_steps = nsweeps if is_equilibrating else local_eq_steps
 
                 t_start = time.time()
                 total_atoms_in_cycle = 0
 
-                # A. SUBMIT TASKS
+                # A. Submit tasks.
                 for state in self.replica_states:
                     atoms = state["atoms"]
                     total_atoms_in_cycle += len(atoms)
@@ -252,7 +249,7 @@ class ReplicaExchange:
                     target_gpu = state["id"] % self.n_gpus
                     self.gpu_queues[target_gpu].put((state["id"], task_data))
 
-                # B. COLLECT RESULTS
+                # B. Collect results.
                 completed = 0
                 while completed < len(self.replica_states):
                     res = self.result_queue.get()
@@ -262,7 +259,7 @@ class ReplicaExchange:
                     rid = res["replica_id"]
                     state = self.replica_states[rid]
 
-                    # 1. Update State
+                    # 1. Update state.
                     state["atoms"].set_positions(res["positions"])
                     state["atoms"].set_atomic_numbers(res["numbers"])
                     state["atoms"].set_cell(res["cell"])
@@ -271,12 +268,12 @@ class ReplicaExchange:
                     state["rng_state"] = res["rng_state"]
                     state["sweep"] = res["sweep"]
 
-                    # 2. Cycle Stats (From Worker)
+                    # 2. Cycle stats from worker.
                     cycle_stats = res["local_stats"]
                     cycle_E = cycle_stats["energy"]
                     acc = cycle_stats["acceptance"]
 
-                    # 3. Update Cumulative (Memory Only)
+                    # 3. Update cumulative stats in memory.
                     if not is_equilibrating:
                         state["cum_sum_E"] += res["cycle_sum_E"]
                         state["cum_sum_E_sq"] += res["cycle_sum_E_sq"]
@@ -290,7 +287,7 @@ class ReplicaExchange:
                     else:
                         cum_Cv = 0.0
 
-                    # 4. Write CSV (use cumulative Cv estimator)
+                    # 4. Write CSV using cumulative Cv estimator.
                     n_atoms = len(state["atoms"])
                     e_per_atom = cycle_E / n_atoms if n_atoms > 0 else 0.0
                     line = (
@@ -403,7 +400,7 @@ class ReplicaExchange:
                     state["cum_n_samples"] = s_data["cum_n_samples"]
                     state["rng_state"] = s_data.get("rng_state")
                     if state["rng_state"] is None:
-                        # Backfill deterministic per-replica stream if loading an older checkpoint.
+                        # Backfill a deterministic per-replica stream for older checkpoints.
                         state["rng_state"] = np.random.default_rng(
                             self.seed + self.seed_nonce + rid
                         ).bit_generator.state

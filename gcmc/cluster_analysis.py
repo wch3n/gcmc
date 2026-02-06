@@ -1,3 +1,5 @@
+"""Cluster analysis helpers for adsorbate trajectories."""
+
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
@@ -5,6 +7,7 @@ from ase.io import read
 from ase.geometry import get_distances
 
 def find_cu_clusters(atoms, cutoff=3.0, element="Cu"):
+    """Return connected-cluster sizes for the selected element."""
     cu_indices = [i for i, atom in enumerate(atoms) if atom.symbol == element]
     if not cu_indices:
         return []
@@ -31,6 +34,7 @@ def find_cu_clusters(atoms, cutoff=3.0, element="Cu"):
     return sizes
 
 def analyze_and_plot(traj_file, cutoff=3.0, element='Cu'):
+    """Analyze cluster evolution across a trajectory and plot summary metrics."""
     traj = list(read(traj_file, index=':'))
     largest_cluster = []
     n_clusters = []

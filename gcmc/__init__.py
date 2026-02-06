@@ -1,13 +1,13 @@
 """
-gcmc package: Monte Carlo simulation tools for surface/adsorbate systems and conventional solid systems
+gcmc package: Monte Carlo simulation tools for surface/adsorbate and solid systems.
 
 Exports:
-- BaseMC: Common MC functionality (ensemble neutral)
-- GCMC: Grand Canonical Monte Carlo
-- CMC: Canonical Monte Carlo
-- AlloyCMC: Canonical Monte Carlo for solids
-- SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids
-- ReplicaExchange: Replica exchange module (ensemble and system neutral)
+- BaseMC: Common MC functionality (ensemble-neutral).
+- GCMC: Grand Canonical Monte Carlo.
+- CMC: Canonical Monte Carlo.
+- AlloyCMC: Canonical Monte Carlo for solids.
+- SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids.
+- ReplicaExchange: Replica exchange module (ensemble- and system-neutral).
 - utils: Adsorbate configuration generation, site registry, alloy lattice initialization, etc.
 """
 

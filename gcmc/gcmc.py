@@ -113,7 +113,7 @@ class GCMC:
         self.rng = np.random.default_rng(seed)
         self.seed: int = seed
 
-        # Move counters
+        # Move counters.
         self.attempted_insertions: int = 0
         self.accepted_insertions: int = 0
         self.attempted_deletions: int = 0
@@ -122,14 +122,14 @@ class GCMC:
         self.accepted_displacements: int = 0
         self.step: int = 0
 
-        # Layer capping, if used
+        # Layer capping, if used.
         self.init_z_max: float = max(atom.position[2] for atom in self.atoms)
         if self.max_layers is not None:
             self.max_z = self.init_z_max + self.max_layers * self.layer_spacing
         else:
             self.max_z = None
 
-        # Restart logic
+        # Restart logic.
         if os.path.exists(self.checkpoint_traj) and os.path.exists(self.checkpoint_data):
             self._load_checkpoint()
             logger.info(f"Resuming from checkpoint at step {self.step}")
@@ -151,7 +151,7 @@ class GCMC:
         pbc = self.atoms.get_pbc()
         exposed = []
         for idx, pos in zip(ads_indices, positions):
-            # Check for any adsorbate above within xy_tol in-plane
+            # Check for any adsorbate above within xy_tol in plane.
             above = []
             for other_pos in positions:
                 if other_pos[2] <= pos[2]:
@@ -187,7 +187,7 @@ class GCMC:
                 logger.debug(
                     f"Insertion trial {trial}: No support found beneath xy=({xy[0]:.2f}, {xy[1]:.2f})"
                 )
-                continue  # No support beneath
+                continue  # No support beneath.
             z_insert = max(atom.position[2] for atom in supports) + self.vertical_offset
             if self.max_z is not None and z_insert > self.max_z:
                 logger.debug(
@@ -204,7 +204,7 @@ class GCMC:
                     f"Insertion trial {trial}: Position ({site[0]:.2f}, {site[1]:.2f}, {site[2]:.2f}) too close to another atom."
                 )
                 continue
-            # Successful trial
+            # Successful trial.
             atoms_new = self.atoms.copy()
             atoms_new.append(Atom(self.element, site))
             return atoms_new
@@ -306,7 +306,7 @@ class GCMC:
             )
             neighbors = j_idx[i_idx == idx]
             if neighbors.size == 0:
-                return False  # Found an orphan/desorbed atom
+                return False  # Found an orphan or desorbed atom.
         return True
 
     def relax_structure(self, atoms: Atoms) -> Tuple[Atoms, bool]:
@@ -396,7 +396,7 @@ class GCMC:
         with Trajectory(self.unique_traj_file, accepted_traj_mode) as traj_acc:
             for sweep in range(self.step, self.nsteps):
 
-                # Simulated Annealing if enabled
+                # Use simulated annealing if enabled.
                 if self.T_anneal is not None and self.nsteps_anneal is not None and sweep < self.nsteps_anneal:
                     if not temp_was_logged:
                         logger.info(f"Simulated annealing: T={self.T_anneal} K for first {self.nsteps_anneal} sweeps")
@@ -414,7 +414,7 @@ class GCMC:
                     n_moves = min(n_moves, max_moves)
 
                 for m in range(n_moves):
-                    # At low coverage, only insertion possible
+                    # At low coverage, only insertion is possible.
                     if N_ads == 0:
                         move_type = 'insert'
                     else:
@@ -454,7 +454,7 @@ class GCMC:
 
                     if self.relax:
                         atoms_relaxed, converged = self.relax_structure(atoms_new)
-                        # Check for excessive movement
+                        # Check for excessive movement.
                         disp_vec = atoms_new.get_positions() - atoms_relaxed.get_positions()
                         disp_mic, _ = find_mic(
                             disp_vec, atoms_new.get_cell(), atoms_new.get_pbc()
@@ -463,11 +463,11 @@ class GCMC:
                         if not converged:
                             logger.debug("Rejected: relaxation did not converge.")
                             continue
-                        if disp > 3.0:  # adjust as appropriate
+                        if disp > 3.0:  # Tune as needed.
                             logger.debug(f"Rejected: atoms moved too much during relaxation (max disp {disp:.2f} Å).")
                             continue
-                        atoms_new = atoms_relaxed  # Accept the relaxed geometry
-                        # filter out desorbed configurations
+                        atoms_new = atoms_relaxed  # Accept the relaxed geometry.
+                        # Filter out desorbed configurations.
                         if not self.all_adsorbates_supported(atoms_new):
                             logger.debug("Rejected: found desorbed adsorbates after relaxation.")
                             continue  
@@ -475,7 +475,7 @@ class GCMC:
                     prob, tau = self.metropolis_accept(e_new, move_type)
                     status: str
                     if self.rng.random() < prob:
-                        # Move accepted
+                        # Move accepted.
                         self.atoms = atoms_new
                         self.e_old = e_new
                         if move_type == 'insert':

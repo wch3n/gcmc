@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-cmc.py - Canonical Monte Carlo for surface adsorbate systems, with from_clean_surface classmethod
+Canonical Monte Carlo for surface adsorbate systems.
 """
 
 import logging
@@ -75,7 +75,7 @@ class CMC(BaseMC):
         attempted_traj_file: str = "cmc_attempted.traj",
         checkpoint_atoms: str = "checkpoint.traj",
         checkpoint_data: str = "checkpoint.pkl",
-        checkpoint_interval: int = 100,  # Save every N sweeps
+        checkpoint_interval: int = 100,  # Save every N sweeps.
         resume: bool = False,
     ):
         if support_xy_tol is None:
@@ -124,7 +124,7 @@ class CMC(BaseMC):
         calculator: Any,
         adsorbate_element: str = "Cu",
         substrate_elements: Tuple[str, ...] = ("Ti", "C"),
-        top_layer_element: str = "Ti",  # New explicit argument!
+        top_layer_element: str = "Ti",  # Explicit top-layer element.
         functional_elements: Optional[Tuple[str, ...]] = None,
         coverage: float = 1.0,
         site_type: str = "fcc",
@@ -194,7 +194,7 @@ class CMC(BaseMC):
         xy_matrix = cell[:2, :2]
 
         for trial in range(max_trials):
-            # displace in xy and wrap PBC
+            # Displace in xy and wrap under PBC.
             delta = self.rng.normal(loc=0.0, scale=self.displacement_sigma, size=2)
             new_xy = pos[:2] + delta
             if any(pbc[:2]):
@@ -202,7 +202,7 @@ class CMC(BaseMC):
                 frac = frac % 1.0
                 new_xy = np.dot(xy_matrix.T, frac)
 
-            # find local support: all atoms within support_xy_tol in xy
+            # Find local support: atoms within support_xy_tol in xy.
             new_xyz = np.zeros((1, 3))
             new_xyz[0, :2] = new_xy[:2]
 
@@ -219,17 +219,17 @@ class CMC(BaseMC):
                     f"z set to {new_z:.3f} above {len(support_indices)} local support"
                 )
             else:
-                # No support: keep the original z
+                # No support found; keep the original z.
                 new_z = pos[2]
                 logger.debug(
                     f"Trial {trial}: Attempted displacement to xy=({new_xy[0]:.3f},{new_xy[1]:.3f}), "
                     f"no support found, keeping z={new_z:.3f}"
                 )
 
-            # check if they get too close with existing atoms
+            # Check proximity to existing atoms.
             trial_pos = np.array([[new_xy[0], new_xy[1], new_z]])
             dists = get_distances(trial_pos, all_pos, cell=cell, pbc=pbc)[1].flatten()
-            dists[idx] = np.inf  # Exclude self
+            dists[idx] = np.inf  # Exclude self.
 
             min_dist = np.min(dists)
             if min_dist >= tol:
@@ -290,10 +290,10 @@ class CMC(BaseMC):
                 logger.debug(f"Overriding checkpoint with T = {T}")
                 self.T = T
         else:
-            self.sweep = 0 # Ensure sweep starts from zero if not resuming
+            self.sweep = 0  # Ensure sweep starts from zero when not resuming.
 
         for sweep in range(self.sweep, nsweeps):
-            # Dynamic moves per sweep
+            # Dynamic moves per sweep.
             if trials_per_sweep is None:
                 n_ads = len(self.ads_indices)
                 moves_this_sweep = max(n_ads, 5)
@@ -351,12 +351,12 @@ class CMC(BaseMC):
                 )
                 traj.write(self.atoms)
 
-            # Save checkpoint
+            # Save checkpoint.
             self.sweep = sweep + 1
             if self.checkpoint_interval and (self.sweep % self.checkpoint_interval == 0):
                 self._save_checkpoint(self.checkpoint_atoms, self.checkpoint_data)
 
-        # Final checkpoint at end
+        # Save a final checkpoint at the end.
         self._save_checkpoint(self.checkpoint_atoms, self.checkpoint_data)
         traj.close()
         traj_accepted.close()

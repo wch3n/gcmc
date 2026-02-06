@@ -3,17 +3,17 @@ from ase.constraints import FixAtoms
 from mace.calculators import MACECalculator
 from gcmc import GCMC, analyze_and_plot
 
-# Read MXene structure 
+# Read MXene structure.
 atoms = read('./POSCAR')
-z_cut = 13.0  # fix bottom layers
+z_cut = 13.0  # Fix bottom layers.
 fixed_indices = [atom.index for atom in atoms if atom.position[2] < z_cut]
 atoms.set_constraint(FixAtoms(indices=fixed_indices))
 
-# Setup calculator
+# Set up calculator.
 mace_models = './ft-omat_0-00_stagetwo.model'
 mace_calc = MACECalculator(model_paths=[mace_models], device='cuda')
 
-# Run GCMC
+# Run GCMC.
 print("Starting GCMC...")
 gcmc = GCMC(
     atoms=atoms,
@@ -31,5 +31,5 @@ gcmc = GCMC(
 gcmc.run()
 
 
-# Analyze clusters
-#analyze_and_plot('gcmc_full.traj', cutoff=3.0, element='Cu')
+# Analyze clusters.
+# Optional: analyze_and_plot('gcmc_full.traj', cutoff=3.0, element='Cu')

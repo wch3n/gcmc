@@ -1,5 +1,3 @@
-# gcmc/process_replica.py
-
 import multiprocessing
 import os
 import logging
@@ -29,14 +27,14 @@ class ReplicaWorker(ctx.Process):
         )
 
         try:
-            # Dynamic Import
+            # Dynamic import.
             mc_module_name = self.init_kwargs.get("mc_module", "gcmc.alloy_cmc")
             mc_class_name = self.init_kwargs.get("mc_class", "AlloyCMC")
 
             mc_module = importlib.import_module(mc_module_name)
             MCClass = getattr(mc_module, mc_class_name)
 
-            # Import Calculator
+            # Import calculator.
             calc_module_name = self.init_kwargs["calculator_module"]
             calc_class_name = self.init_kwargs["calculator_class_name"]
             calc_module = importlib.import_module(calc_module_name)
@@ -49,7 +47,7 @@ class ReplicaWorker(ctx.Process):
             calc = CalcClass(**calc_args)
             atoms_template = self.init_kwargs["atoms_template"].copy()
 
-            # Initialize Engine with PLACEHOLDERS
+            # Initialize engine with placeholder file paths.
             sim = MCClass(
                 atoms=atoms_template,
                 calculator=calc,
@@ -67,10 +65,10 @@ class ReplicaWorker(ctx.Process):
 
                 replica_id, data = task
 
-                # --- UPDATE STATE ---
+                # Update state.
                 sim.T = data["T"]
 
-                # Safe atoms update
+                # Safely refresh atom container when atom count changes.
                 if len(sim.atoms) != len(data["positions"]):
                     sim.atoms = atoms_template.copy()
 
@@ -84,8 +82,7 @@ class ReplicaWorker(ctx.Process):
                     sim.rng.bit_generator.state = data["rng_state"]
                 sim.sweep = data["sweep"]
 
-                # --- FIX: UPDATE FILE PATHS ---
-                # This was missing! The worker must update these for every chunk.
+                # Update file paths for this task chunk.
                 sim.traj_file = data["traj_file"]
                 sim.thermo_file = data["thermo_file"]
                 sim.checkpoint_file = data["checkpoint_file"]
@@ -93,7 +90,7 @@ class ReplicaWorker(ctx.Process):
                 if hasattr(sim, "tree"):
                     sim.tree = cKDTree(data["positions"])
 
-                # Run
+                # Run simulation chunk.
                 stats = sim.run(
                     nsweeps=data["nsweeps"],
                     traj_file=data["traj_file"],
@@ -102,7 +99,7 @@ class ReplicaWorker(ctx.Process):
                     equilibration=data["eq_steps"],
                 )
 
-                # Return Results
+                # Return results.
                 result_package = {
                     "replica_id": replica_id,
                     "positions": sim.atoms.get_positions(),

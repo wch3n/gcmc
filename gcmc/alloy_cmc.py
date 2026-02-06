@@ -216,7 +216,7 @@ class AlloyCMC(BaseMC):
                 return np.empty(0, dtype=int)
             return self._swap_neighbors[idx1]
 
-        # Recompute with the exact same builder used by the cached path.
+        # Recompute with the same builder used by the cached path.
         neighbors_by_atom = self._compute_swap_neighbor_lists()
         return neighbors_by_atom[idx1]
 
@@ -324,18 +324,14 @@ class AlloyCMC(BaseMC):
         if not self.local_relax:
             return super().relax_structure(atoms, move_ind)
 
-        # Local Relax Logic
+        # Local relaxation logic.
         atoms_relax = atoms.copy()
 
-        # Identify active region (swapped atoms + neighbors)
-        # Note: move_ind is [sweep, step], not atom indices. We rely on logic in run()
-        # BUT run() doesn't pass indices here. To fix robustly, we need indices.
-        # However, for brevity/speed in this context, we usually just fix far away atoms.
-        # Since we don't have indices passed explicitly in the standard signature,
-        # we can't easily do it unless we stored them in self.current_swap_indices
-        # Assuming we just call standard optimize if indices missing, OR relies on BaseMC.
+        # Identify active region (swapped atoms plus neighbors).
+        # Note: move_ind is [sweep, step], not atom indices.
+        # Run() does not pass swapped indices directly, so robust local relaxation would require storing those indices in self.current_swap_indices.
 
-        # Simplified: Just return super() if we don't have robust index tracking here.
+        # Fall back to BaseMC relaxation when robust index tracking is unavailable.
         return super().relax_structure(atoms, move_ind)
 
     def run(
@@ -347,7 +343,7 @@ class AlloyCMC(BaseMC):
         equilibration: int = 0,
     ) -> Dict[str, float]:
 
-        # Determine mode safely
+        # Determine trajectory write mode safely.
         if os.path.exists(traj_file) and os.path.getsize(traj_file) > 0:
             mode = "a"
         else:
@@ -355,7 +351,7 @@ class AlloyCMC(BaseMC):
 
         self.traj_writer = Trajectory(traj_file, mode)
 
-        # Reset accumulations for this block
+        # Reset accumulators for this run block.
         self.sum_E = 0.0
         self.sum_E_sq = 0.0
         self.n_samples = 0
@@ -366,9 +362,7 @@ class AlloyCMC(BaseMC):
 
         moves_per_sweep = len(self.swap_indices)
 
-        # Initial Header (Only if starting fresh or cycle start)
-        # We can disable this to reduce clutter, or keep it.
-        # logger.info(f"T={self.T:4.0f}K | Start Run | {nsweeps} sweeps")
+        # Optional start-of-run header can be added here if needed.
 
         for sweep in range(nsweeps):
             beta = 1.0 / (8.617e-5 * self.T)
@@ -395,15 +389,14 @@ class AlloyCMC(BaseMC):
                     continue
                 idx1, idx2 = indices
 
-                # Store for potential local relaxation if implemented
+                # Store swap indices for potential local relaxation.
                 self.current_swap_indices = [idx1, idx2]
 
                 sym1, sym2 = self.atoms.symbols[idx1], self.atoms.symbols[idx2]
                 self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym2, sym1
 
                 if self.relax:
-                    # In this simplified version, standard BaseMC relaxation is called
-                    # or local relaxation if implemented.
+                    # Use BaseMC relaxation (or local relaxation, if available).
                     atoms_trial = self.atoms.copy()
                     atoms_trial, conv = self.relax_structure(
                         atoms_trial, move_ind=[self.sweep, i]
@@ -431,13 +424,13 @@ class AlloyCMC(BaseMC):
 
             self.sweep += 1
 
-            # 1. Sampling
+            # 1. Sampling.
             if sweep >= equilibration and (sweep + 1) % sample_interval == 0:
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
                 self.n_samples += 1
 
-            # 2. Reporting (with temperature tag)
+            # 2. Reporting with temperature tag.
             if (sweep + 1) % interval == 0:
                 self.traj_writer.write(self.atoms)
                 with open(self.thermo_file, "a") as f:
@@ -458,7 +451,7 @@ class AlloyCMC(BaseMC):
                     f"T={self.T:4.0f}K | {self.sweep:6d} | E: {self.e_old:10.4f} | Avg: {avg:10.4f} | Cv: {Cv:8.4f} | Acc: {acc:4.1f}%"
                 )
 
-            # 3. Checkpointing
+            # 3. Checkpointing.
             if (
                 self.checkpoint_interval > 0
                 and self.sweep % self.checkpoint_interval == 0

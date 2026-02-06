@@ -143,7 +143,7 @@ def get_hollow_xy(toplayer_xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
         (M,2) array of unique hollow xy positions within the center cell.
     """
     a1, a2 = cell[0, :2], cell[1, :2]
-    # Tile ±1 in x and y (total 9 images)
+    # Tile ±1 in x and y (total 9 images).
     image_points = []
     for i in [-1, 0, 1]:
         for j in [-1, 0, 1]:
@@ -156,7 +156,7 @@ def get_hollow_xy(toplayer_xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
     for simplex in tri.simplices:
         pts = image_points[simplex]
         center = pts.mean(axis=0)
-        # Check if center is inside the original cell (using fractional coordinates)
+        # Check whether the center is inside the original cell (fractional coordinates).
         cell_2d = np.array([a1, a2]).T
         try:
             frac = np.linalg.solve(cell_2d, center)
@@ -164,7 +164,7 @@ def get_hollow_xy(toplayer_xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
             continue
         if np.all((frac >= -1e-8) & (frac < 1 - 1e-8)):
             hollow_xy.append(center)
-    # Remove duplicates
+    # Remove duplicates.
     hollow_xy_unique = []
     tol = 1e-5
     for xy in hollow_xy:
@@ -205,17 +205,17 @@ def classify_hollow_sites(
         atom for atom in subs if abs(np.round(atom.position[2], 0) - ref_z) < 1e-3
     ]
 
-    # Prepare cell for PBC
-    cell = atoms.cell.array  # This is (3,3)
+    # Prepare the cell for PBC operations.
+    cell = atoms.cell.array  # Shape (3, 3).
     pbc = atoms.pbc
 
     selected_hollows = []
     for xy in hollow_xy:
         for atom in ref_atoms:
-            # Create a 3D displacement vector (z=0)
+            # Create a 3D displacement vector (z = 0).
             dxyz = np.zeros(3)
             dxyz[:2] = atom.position[:2] - xy
-            # Use find_mic for proper PBC
+            # Use find_mic for proper PBC handling.
             dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, pbc)
             if np.linalg.norm(dxyz_mic[0][:2]) < xy_tol:
                 selected_hollows.append(xy)
@@ -256,7 +256,7 @@ def generate_adsorbate_configuration(
     rng = np.random.default_rng(seed)
     atoms_new = atoms.copy()
     cell = atoms.get_cell()
-    # Site registry
+    # Site registry.
     if site_type == "atop":
         site_xy = get_toplayer_xy(atoms, element=substrate_element)
     else:
@@ -268,10 +268,10 @@ def generate_adsorbate_configuration(
     n_sites = len(site_xy)
     if n_sites == 0:
         raise RuntimeError("*** NO REGISTRY SITES AVAILABLE ***")
-    # Handle multilayer coverage
+    # Handle multilayer coverage.
     n_layers = int(np.floor(coverage))
     frac_layer = coverage - n_layers
-    # Add integer number of layers
+    # Add an integer number of layers.
     for ilayer in range(n_layers):
         for xy in site_xy:
             neighbors_z = []
@@ -288,7 +288,7 @@ def generate_adsorbate_configuration(
             z_max = max(neighbors_z)
             pos = np.array([xy[0], xy[1], z_max + vertical_offset])
             atoms_new.append(Atom(element, pos))
-    # Add partial layer if needed
+    # Add a partial layer if needed.
     if frac_layer > 1e-8:
         n_partial = int(round(frac_layer * n_sites))
         chosen = rng.choice(n_sites, n_partial, replace=False)

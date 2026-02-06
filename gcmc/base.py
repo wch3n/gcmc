@@ -18,7 +18,7 @@ from ase import Atoms
 from ase.optimize import LBFGS
 from ase.constraints import FixCartesian
 
-# Safe import for ExpCellFilter (Moved in ASE 3.23.0)
+# Safe import for ExpCellFilter (moved in ASE 3.23.0).
 try:
     from ase.filters import ExpCellFilter
 except ImportError:
@@ -26,7 +26,7 @@ except ImportError:
 from ase.io import write, read
 from ase.geometry import get_distances
 
-# --- LOGGING SETUP ---
+# Logging setup.
 logger = logging.getLogger("mc")
 logger.setLevel(logging.INFO)
 if not logger.hasHandlers():
@@ -47,7 +47,7 @@ class LoggerStream:
         self.level = level
 
     def write(self, message):
-        # ASE writes newlines that we don't want in logs, so we strip them
+        # ASE writes newlines that we do not want in logs, so strip them.
         if message.strip():
             self.logger.log(self.level, message.strip())
 
@@ -90,7 +90,7 @@ class BaseMC:
         self.adsorbate_element = adsorbate_element
         self.substrate_elements = substrate_elements
 
-        # Auto-detect functional elements if not provided
+        # Auto-detect functional elements when not provided.
         all_elements = set(atom.symbol for atom in self.atoms)
         if functional_elements is None:
             self.functional_elements = tuple(
@@ -101,7 +101,7 @@ class BaseMC:
         else:
             self.functional_elements = functional_elements
 
-        # Relaxation parameters
+        # Relaxation parameters.
         self.detach_tol = detach_tol
         self.relax_steps = relax_steps
         self.relax_z_only = relax_z_only
@@ -109,20 +109,20 @@ class BaseMC:
         self.fmax = fmax
         self.verbose_relax = verbose_relax
 
-        # RNG & IO
+        # RNG and I/O.
         self.rng = np.random.default_rng(seed)
         self.traj_file = traj_file
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
 
-        # Cache indices for performance
+        # Cache indices for performance.
         self._update_indices()
 
-        # Attach calculator immediately
+        # Attach the calculator immediately.
         self.atoms.calc = self.calculator
 
-        # Log configuration
+        # Log relaxation configuration.
         if self.relax_z_only:
             logger.debug("Relaxation: Z-coordinates only.")
         elif self.relax_cell:
@@ -159,36 +159,36 @@ class BaseMC:
         atoms_relax = atoms.copy()
         atoms_relax.calc = self.calculator
 
-        # --- MODE 1: Z-Only Relaxation (Fixed Cell) ---
+        # Mode 1: Z-only relaxation (fixed cell).
         if self.relax_z_only:
             constraints = []
-            # Only constrain adsorbate atoms to move in z
+            # Only allow adsorbate atoms to move in z.
             for i in getattr(self, "ads_indices", []):
                 constraints.append(FixCartesian(i, mask=[True, True, False]))
             atoms_relax.set_constraint(constraints)
             target = atoms_relax
 
-        # --- MODE 2: Variable Cell Relaxation (Crucial for Alloys) ---
+        # Mode 2: Variable-cell relaxation (important for alloys).
         elif self.relax_cell:
             cell = atoms_relax.get_cell()
-            # Heuristic: If Z-vector > 20.0 A, assume it's a slab/2D material with vacuum
+            # Heuristic: if the z vector is >20.0 A, treat as a slab with vacuum.
             is_slab = cell[2, 2] > 20.0
 
             if is_slab:
-                # Relax in-plane (xx, yy, xy). Fix out-of-plane (zz, xz, yz).
-                # Mask: 1=Relax, 0=Fix. Order: [xx, yy, zz, yz, xz, xy]
+                # Relax in-plane (xx, yy, xy) and fix out-of-plane (zz, xz, yz).
+                # Mask uses 1 for relax and 0 for fix in order [xx, yy, zz, yz, xz, xy].
                 mask = [1, 1, 0, 0, 0, 1]
                 target = ExpCellFilter(atoms_relax, mask=mask)
             else:
-                # Full 3D relaxation for bulk
+                # Use full 3D relaxation for bulk systems.
                 target = ExpCellFilter(atoms_relax)
 
-        # --- MODE 3: Full Coordinate Relaxation (Fixed Cell) ---
+        # Mode 3: Full-coordinate relaxation (fixed cell).
         else:
             target = atoms_relax
 
-        # --- OPTIMIZATION WITH LOGGING ---
-        # Route output to logger.debug
+        # Optimization with logging.
+        # Route output to logger.debug.
         log_stream = LoggerStream(logger, logging.DEBUG)
 
         dyn = LBFGS(target, logfile=log_stream)
@@ -227,7 +227,7 @@ class BaseMC:
         cell = atoms.get_cell()
         pbc = atoms.get_pbc()
         n_atoms = len(atoms)
-        adsorbate_element = getattr(self, "adsorbate_element", "Cu")  # fallback default
+        adsorbate_element = getattr(self, "adsorbate_element", "Cu")  # Fallback default.
         ads_indices = [i for i, a in enumerate(atoms) if a.symbol == adsorbate_element]
 
         if len(ads_indices) == 0:
@@ -239,8 +239,8 @@ class BaseMC:
             support_indices = [i for i in range(n_atoms) if i != ia]
             support_pos = pos[support_indices]
             deltas, dists = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
-            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)  # In-plane
-            dz = ads_pos[2] - support_pos[:, 2]  # Only atoms *below* the adsorbate
+            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)  # In-plane distance.
+            dz = ads_pos[2] - support_pos[:, 2]  # Only atoms below the adsorbate.
 
             lateral_mask = dxy < support_xy_tol
             dz_lateral = dz[lateral_mask]
@@ -334,15 +334,15 @@ class BaseMC:
         Save checkpoint: atoms object and MC state to files.
         Uses unique filename based on trajectory to allow parallel replicas.
         """
-        # Save atomic structure
-        # e.g., 'replica_300K.traj' -> 'replica_300K_checkpoint.traj'
+        # Save atomic structure.
+        # Example: 'replica_300K.traj' -> 'replica_300K_checkpoint.traj'.
         chk_traj = self.traj_file.replace(".traj", "_checkpoint.traj")
 
         atoms_copy = self.atoms.copy()
         atoms_copy.calc = None
         write(chk_traj, atoms_copy)
 
-        # Save MC state
+        # Save MC state.
         state = {
             "sweep": getattr(self, "sweep", 0),
             "e_old": getattr(self, "e_old", None),
@@ -350,7 +350,7 @@ class BaseMC:
             "total_moves": getattr(self, "total_moves", 0),
             "rng_state": self.rng.bit_generator.state if hasattr(self, "rng") else None,
             "T": getattr(self, "T", None),
-            # SGCMC Stats preservation (if present)
+            # Preserve SGCMC stats when present.
             "sum_E": getattr(self, "sum_E", 0.0),
             "sum_E_sq": getattr(self, "sum_E_sq", 0.0),
             "n_samples": getattr(self, "n_samples", 0),
@@ -366,14 +366,14 @@ class BaseMC:
         if not os.path.exists(self.checkpoint_file):
             return
 
-        # 1. Restore Atoms
+        # 1. Restore atoms.
         chk_traj = self.traj_file.replace(".traj", "_checkpoint.traj")
         if os.path.exists(chk_traj):
             self.atoms = read(chk_traj)
 
         self.atoms.calc = self.calculator
 
-        # 2. Restore State
+        # 2. Restore state.
         with open(self.checkpoint_file, "rb") as f:
             state = pickle.load(f)
 
@@ -386,7 +386,7 @@ class BaseMC:
         if "rng_state" in state and hasattr(self, "rng"):
             self.rng.bit_generator.state = state["rng_state"]
 
-        # Restore SGCMC stats if they exist
+        # Restore SGCMC stats if they exist.
         if "sum_E" in state:
             self.sum_E = state["sum_E"]
             self.sum_E_sq = state["sum_E_sq"]

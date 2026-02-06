@@ -1,5 +1,3 @@
-# gcmc/sgcmc.py
-
 import numpy as np
 import logging
 import os
@@ -39,12 +37,12 @@ class SemiGrandAlloyMC(AlloyCMC):
         super().__init__(atoms, calculator, T=T, **kwargs)
         self.chem_pots = chem_pots
 
-        # Validation
+        # Validate chemical potentials.
         for el in self.swap_elements:
             if el not in self.chem_pots:
                 raise ValueError(f"Missing chemical potential for element '{el}'")
 
-        # Initialize Energies
+        # Initialize energies.
         self.raw_potential_energy = self.atoms.get_potential_energy()
         self.e_old = self._calculate_grand_potential()
 
@@ -66,7 +64,7 @@ class SemiGrandAlloyMC(AlloyCMC):
         equilibration: int = 0,
     ) -> Dict[str, Any]:
 
-        # --- TRAJECTORY SETUP ---
+        # Trajectory setup.
         self.traj_file = traj_file
 
         if os.path.exists(traj_file) and os.path.getsize(traj_file) > 0:
@@ -75,8 +73,8 @@ class SemiGrandAlloyMC(AlloyCMC):
             mode = "w"
         traj_writer = Trajectory(traj_file, mode)
 
-        # --- INITIALIZE STATS ---
-        # Only reset if we are starting fresh (sweep 0).
+        # Initialize statistics.
+        # Only reset when starting fresh (sweep 0).
         if self.sweep == 0:
             self.sum_phi = 0.0
             self.sum_phi_sq = 0.0
@@ -88,12 +86,12 @@ class SemiGrandAlloyMC(AlloyCMC):
             self.sum_N = {el: 0.0 for el in self.swap_elements}
             self.sum_N_sq = {el: 0.0 for el in self.swap_elements}
 
-        # Pre-calculate current counts
+        # Pre-calculate current counts.
         current_symbols = self.atoms.get_chemical_symbols()
         current_counts = {el: current_symbols.count(el) for el in self.swap_elements}
         moves_per_sweep = len(self.swap_indices)
 
-        # --- MAIN LOOP ---
+        # Main loop.
         start_sweep = self.sweep
         end_sweep = start_sweep + nsweeps
 
@@ -101,7 +99,7 @@ class SemiGrandAlloyMC(AlloyCMC):
             for i in range(moves_per_sweep):
                 self.total_moves += 1
 
-                # 1. Propose Move
+                # 1. Propose move.
                 idx = self.rng.choice(self.swap_indices)
                 old_sym = self.atoms.symbols[idx]
 
@@ -112,7 +110,7 @@ class SemiGrandAlloyMC(AlloyCMC):
 
                 self.atoms.symbols[idx] = new_sym
 
-                # 2. Relax & Calc Energy
+                # 2. Relax and calculate energy.
                 if self.relax:
                     atoms_trial, conv = self.relax_structure(
                         self.atoms.copy(), move_ind=[self.sweep, i]
@@ -125,11 +123,11 @@ class SemiGrandAlloyMC(AlloyCMC):
                 delta_E = e_new_raw - self.raw_potential_energy
                 delta_phi = delta_E - delta_mu
 
-                # 3. Acceptance
+                # 3. Acceptance.
                 if delta_phi < 0 or (
                     self.rng.random() < np.exp(-delta_phi / (8.617e-5 * self.T))
                 ):
-                    # ACCEPT
+                    # Accept move.
                     self.raw_potential_energy = e_new_raw
                     self.e_old += delta_phi
                     current_counts[old_sym] -= 1
@@ -138,16 +136,16 @@ class SemiGrandAlloyMC(AlloyCMC):
 
                     if self.relax:
                         self.atoms.positions = atoms_trial.positions
-                        self.atoms.cell = atoms_trial.cell  # Update Cell
+                        self.atoms.cell = atoms_trial.cell  # Update cell.
                         if self.swap_mode in ["neighbor", "hybrid"]:
                             self.tree = cKDTree(self.atoms.get_positions())
                 else:
-                    # REJECT
+                    # Reject move.
                     self.atoms.symbols[idx] = old_sym
 
             self.sweep += 1
 
-            # --- SAMPLING ---
+            # Sampling.
             if sweep >= equilibration and (sweep + 1) % sample_interval == 0:
                 self.n_samples += 1
                 self.sum_phi += self.e_old
@@ -160,21 +158,21 @@ class SemiGrandAlloyMC(AlloyCMC):
                     self.sum_N[el] += cnt
                     self.sum_N_sq[el] += cnt**2
 
-            # --- OUTPUT & CHECKPOINTING ---
+            # Output and checkpointing.
             if (sweep + 1) % interval == 0:
                 traj_writer.write(self.atoms)
 
                 with open(self.thermo_file, "a") as f:
                     f.write(f"{self.sweep} {self.e_old:.6f}\n")
 
-                # Save Checkpoint
+                # Save checkpoint.
                 if (
                     self.checkpoint_interval > 0
                     and self.sweep % self.checkpoint_interval == 0
                 ):
                     self._save_checkpoint()
 
-                # --- NEW CONSOLE LOGGING WITH CONCENTRATION ---
+                # Console logging with concentration.
                 acc = (
                     (self.accepted_moves / self.total_moves * 100)
                     if self.total_moves
@@ -185,7 +183,7 @@ class SemiGrandAlloyMC(AlloyCMC):
                 else:
                     avg_phi = self.e_old
 
-                # Format Concentration String (e.g. "Ti: 0.50 | Mo: 0.50")
+                # Format concentration string (e.g., "Ti: 0.50 | Mo: 0.50").
                 total_sites = moves_per_sweep
                 conc_str = " | ".join(
                     [
@@ -202,7 +200,7 @@ class SemiGrandAlloyMC(AlloyCMC):
 
         traj_writer.close()
 
-        # --- FINAL RESULTS ---
+        # Final results.
         results = self._compute_final_stats(current_counts)
         return results
 
@@ -252,32 +250,32 @@ class SemiGrandAlloyMC(AlloyCMC):
             )
         return results
 
-    # --- CUSTOM CHECKPOINT METHODS ---
+    # Custom checkpoint methods.
     def _save_checkpoint(self):
         """
         Saves SGCMC-specific state (Composition/Grand Potential stats)
         in addition to standard MC state.
         """
-        # 1. Save Atoms
+        # 1. Save atoms.
         chk_traj = self.traj_file.replace(".traj", "_checkpoint.traj")
         atoms_copy = self.atoms.copy()
         atoms_copy.calc = None
         write(chk_traj, atoms_copy)
 
-        # 2. Save Full State
+        # 2. Save full state.
         state = {
             "sweep": self.sweep,
             "e_old": self.e_old,
             "raw_potential_energy": self.raw_potential_energy,
             "rng_state": self.rng.bit_generator.state,
             "T": self.T,
-            # General Stats
+            # General stats.
             "sum_E": self.sum_E,
             "sum_E_sq": self.sum_E_sq,
             "n_samples": self.n_samples,
             "total_moves": self.total_moves,
             "accepted_moves": self.accepted_moves,
-            # SGCMC Specific Stats
+            # SGCMC-specific stats.
             "sum_phi": self.sum_phi,
             "sum_phi_sq": self.sum_phi_sq,
             "sum_N": self.sum_N,
@@ -294,13 +292,13 @@ class SemiGrandAlloyMC(AlloyCMC):
         if not os.path.exists(self.checkpoint_file):
             return
 
-        # 1. Restore Atoms
+        # 1. Restore atoms.
         chk_traj = self.traj_file.replace(".traj", "_checkpoint.traj")
         if os.path.exists(chk_traj):
             self.atoms = read(chk_traj)
         self.atoms.calc = self.calculator
 
-        # 2. Restore State
+        # 2. Restore state.
         with open(self.checkpoint_file, "rb") as f:
             state = pickle.load(f)
 

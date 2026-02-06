@@ -3,7 +3,7 @@
 from ase.io import read
 from ase.build import make_supercell
 
-# from mace.calculators import MACECalculator
+# Optional alternative: from mace.calculators import MACECalculator.
 from symmetrix import Symmetrix
 from gcmc.alloy_cmc import AlloyCMC
 from gcmc.utils import (
@@ -16,7 +16,7 @@ import numpy as np
 
 def main(sc_matrix):
 
-    # setup initial system
+    # Set up initial system.
     pristine = read("POSCAR.Ti2CO2")
     sc = make_supercell(pristine, sc_matrix)
     atoms = initialize_alloy_sublattice(
@@ -59,7 +59,7 @@ def main(sc_matrix):
     use_nonuniform_grid = True
 
     """
-    # initialize MC
+    # Initialize MC.
     mc = AlloyCMC(
         atoms=atoms.repeat([3,3,1]),
         calculator=calc,
@@ -71,7 +71,7 @@ def main(sc_matrix):
         checkpoint_file="restart.pkl"
     )
 
-    # Run cooling
+    # Run cooling.
     mc.run_temperature_scan(
         T_start=2000,
         T_end=100,
@@ -83,12 +83,12 @@ def main(sc_matrix):
         traj_prefix='run'
     )"""
 
-    # replica exchange
+    # Run replica exchange.
     pt_kwargs = dict(
         atoms_template=atoms,
         T_start=800,
         T_end=50,
-        T_step=50,  # Used for uniform grid; ignored when n_replicas is set.
+        T_step=50,  # Used for uniform grid and ignored when n_replicas is set.
         swap_stride=1,
         calculator_class=Symmetrix,
         calc_kwargs=calc_kwargs,

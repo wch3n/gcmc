@@ -134,6 +134,12 @@ class ReplicaExchange:
             calc_kwargs = {}
         if mc_kwargs is None:
             mc_kwargs = {}
+        pt_mc_kwargs = dict(mc_kwargs)
+        if "checkpoint_interval" not in pt_mc_kwargs:
+            pt_mc_kwargs["checkpoint_interval"] = 0
+            logger.info(
+                "Replica workers: checkpoint_interval not set in mc_kwargs; defaulting worker checkpointing to 0 (master PT checkpoint remains active)."
+            )
 
         if n_replicas is not None:
             temps = generate_nonuniform_temperature_grid(
@@ -177,7 +183,7 @@ class ReplicaExchange:
                 "traj_file": f"replica_{t_str}K.traj",
                 "thermo_file": f"replica_{t_str}K.dat",
                 "checkpoint_file": f"checkpoint_{t_str}K.pkl",
-                "mc_kwargs": mc_kwargs,
+                "mc_kwargs": pt_mc_kwargs,
             }
             replica_states.append(state)
 
@@ -187,7 +193,7 @@ class ReplicaExchange:
             "mc_module": mc_class.__module__,
             "mc_class": mc_class.__name__,
             "calc_kwargs": calc_kwargs,
-            "mc_kwargs": mc_kwargs,
+            "mc_kwargs": pt_mc_kwargs,
             "atoms_template": atoms_clean,
         }
 

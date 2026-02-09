@@ -45,6 +45,7 @@ def main(sc_matrix):
     mc_kwargs = {
         "swap_elements": ["Ti", "Mo"],
         "swap_mode": "hybrid",
+        "hybrid_neighbor_prob": 0.8,
         "neighbor_backend": neighbor_backend,
         "neighbor_cache": neighbor_cache,
         "relax": False,
@@ -97,6 +98,7 @@ def main(sc_matrix):
         swap_interval=20,
         report_interval=5,
         sampling_interval=5,
+        local_eq_fraction=0.0,
         checkpoint_interval=5,
         resume=True,
         n_gpus=4,

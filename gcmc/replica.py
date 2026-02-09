@@ -21,6 +21,7 @@ class ReplicaExchange:
         sampling_interval=1,
         checkpoint_interval=10,
         swap_stride=1,
+        local_eq_fraction: float = 0.2,
         stats_file="replica_stats.csv",
         results_file="results.csv",
         checkpoint_file="pt_state.pkl",
@@ -38,6 +39,9 @@ class ReplicaExchange:
         self.sampling_interval = sampling_interval
         self.checkpoint_interval = checkpoint_interval
         self.swap_stride = swap_stride
+        self.local_eq_fraction = float(local_eq_fraction)
+        if not (0.0 <= self.local_eq_fraction <= 1.0):
+            raise ValueError("local_eq_fraction must be in [0, 1].")
         self.worker_init_info = worker_init_info
         self.seed = seed
         self.seed_nonce = seed_nonce
@@ -223,9 +227,8 @@ class ReplicaExchange:
                 nsweeps = self.swap_interval
                 cycle_start_sweep = cycle * self.swap_interval
 
-                # Local equilibration.
-                # Discard the first 20% of stats to remove swap shock.
-                local_eq_steps = int(nsweeps * 0.2)
+                # Local equilibration after swaps.
+                local_eq_steps = int(nsweeps * self.local_eq_fraction)
                 eq_steps = nsweeps if is_equilibrating else local_eq_steps
 
                 t_start = time.time()

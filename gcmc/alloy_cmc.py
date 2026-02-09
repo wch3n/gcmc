@@ -30,6 +30,7 @@ class AlloyCMC(BaseMC):
         T: float = 300,
         swap_elements: Optional[List[str]] = None,
         swap_mode: str = "hybrid",
+        hybrid_neighbor_prob: float = 0.5,
         neighbor_cutoff: float = 3.5,
         neighbor_backend: str = "ase",
         neighbor_cache: bool = True,
@@ -76,6 +77,7 @@ class AlloyCMC(BaseMC):
 
         self.T = T
         self.swap_mode = swap_mode
+        self.hybrid_neighbor_prob = float(hybrid_neighbor_prob)
         self.neighbor_cutoff = neighbor_cutoff
         self._matscipy_neighbor_list = None
         self.neighbor_backend = self._resolve_neighbor_backend(neighbor_backend)
@@ -101,6 +103,8 @@ class AlloyCMC(BaseMC):
         self.md_remove_drift = md_remove_drift
         if not (0.0 <= self.md_move_prob <= 1.0):
             raise ValueError("md_move_prob must be in [0, 1].")
+        if not (0.0 <= self.hybrid_neighbor_prob <= 1.0):
+            raise ValueError("hybrid_neighbor_prob must be in [0, 1].")
         if self.md_ensemble not in ("nve", "langevin"):
             raise ValueError("md_ensemble must be 'nve' or 'langevin'.")
         if self.md_planar_axis not in (0, 1, 2):
@@ -284,7 +288,11 @@ class AlloyCMC(BaseMC):
 
         mode = self.swap_mode
         if mode == "hybrid":
-            mode = "neighbor" if self.rng.random() < 0.5 else "global"
+            mode = (
+                "neighbor"
+                if self.rng.random() < self.hybrid_neighbor_prob
+                else "global"
+            )
 
         if mode == "global":
             idx1, idx2 = self.rng.choice(self.swap_indices, size=2, replace=False)
@@ -418,6 +426,12 @@ class AlloyCMC(BaseMC):
             self._invalidate_neighbor_cache()
 
         moves_per_sweep = len(self.swap_indices)
+        if self.swap_mode == "hybrid":
+            logger.info(
+                f"[{self.T:.0f}K] Hybrid swap mix: "
+                f"neighbor={self.hybrid_neighbor_prob:.2f}, "
+                f"global={1.0 - self.hybrid_neighbor_prob:.2f}"
+            )
 
         # Optional start-of-run header can be added here if needed.
 

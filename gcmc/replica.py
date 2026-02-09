@@ -74,7 +74,10 @@ class ReplicaExchange:
 
         if not os.path.exists(self.results_file) and not resume:
             with open(self.results_file, "w") as f:
-                header = "cycle,T_K,n_atoms,E_eV,E_eV_per_atom,Cv_eV_per_K,acc_pct"
+                header = (
+                    "cycle,T_K,n_atoms,E_eV,E_eV_per_atom,"
+                    "Cv_cycle_eV_per_K,Cv_cum_eV_per_K,acc_pct"
+                )
                 for el in self.track_composition:
                     header += f",N_{el}_avg,chi_{el}"
                 f.write(header + "\n")
@@ -281,6 +284,7 @@ class ReplicaExchange:
                     # 2. Cycle stats from worker.
                     cycle_stats = res["local_stats"]
                     cycle_E = cycle_stats["energy"]
+                    cycle_Cv = cycle_stats.get("cv", 0.0)
                     acc = cycle_stats["acceptance"]
 
                     # 3. Update cumulative stats in memory.
@@ -297,7 +301,7 @@ class ReplicaExchange:
                     else:
                         cum_Cv = 0.0
 
-                    # 4. Write CSV using cumulative Cv estimator.
+                    # 4. Write CSV with both local-cycle and cumulative Cv estimators.
                     n_atoms = len(state["atoms"])
                     e_per_atom = cycle_E / n_atoms if n_atoms > 0 else 0.0
                     line = (
@@ -306,6 +310,7 @@ class ReplicaExchange:
                         f"{n_atoms},"
                         f"{cycle_E:.6f},"
                         f"{e_per_atom:.8f},"
+                        f"{cycle_Cv:.6f},"
                         f"{cum_Cv:.6f},"
                         f"{acc:.2f}"
                     )

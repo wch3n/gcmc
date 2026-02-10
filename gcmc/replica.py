@@ -355,8 +355,10 @@ class ReplicaExchange:
             j = i + stride
             s_i = self.replica_states[i]
             s_j = self.replica_states[j]
+            e_i_before = s_i["e_old"]
+            e_j_before = s_j["e_old"]
             delta = (1.0 / (kB * s_i["T"]) - 1.0 / (kB * s_j["T"])) * (
-                s_j["e_old"] - s_i["e_old"]
+                e_i_before - e_j_before
             )
             accepted = False
             if delta > 0 or self.rng.random() < np.exp(delta):
@@ -366,7 +368,7 @@ class ReplicaExchange:
                 logger.info(f"  [Swap] {s_i['T']:.0f}K <-> {s_j['T']:.0f}K | ACCEPTED")
             with open(self.stats_file, "a") as f:
                 f.write(
-                    f"{cycle},{s_i['T']},{s_j['T']},{s_i['e_old']:.4f},{s_j['e_old']:.4f},{accepted}\n"
+                    f"{cycle},{s_i['T']},{s_j['T']},{e_i_before:.4f},{e_j_before:.4f},{accepted}\n"
                 )
 
     def _save_master_checkpoint(self, cycle):

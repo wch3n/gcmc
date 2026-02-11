@@ -113,7 +113,7 @@ def main(sc_matrix):
                 "fine_grid_weights": [1.0, 1.5],
                 "fine_grid_strength": 5.0,
                 "fine_grid_width": 80.0,
-                "fine_grid_space": "beta",
+                "grid_space": "beta",
             }
         )
         preview_temps = generate_nonuniform_temperature_grid(
@@ -124,7 +124,7 @@ def main(sc_matrix):
             focus_weights=pt_kwargs["fine_grid_weights"],
             focus_strength=pt_kwargs["fine_grid_strength"],
             focus_width=pt_kwargs["fine_grid_width"],
-            grid_space=pt_kwargs["fine_grid_space"],
+            grid_space=pt_kwargs["grid_space"],
         )
         print(
             "Nonuniform PT temperatures [K]:",

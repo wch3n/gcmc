@@ -23,12 +23,14 @@ def generate_nonuniform_temperature_grid(
     focus_weights: Optional[Sequence[float]] = None,
     focus_strength: float = 4.0,
     focus_width: Optional[float] = None,
+    grid_space: Literal["temperature", "beta"] = "temperature",
 ) -> List[float]:
     """
     Generate a monotonic nonuniform temperature grid with optional dense regions.
 
     The grid always spans [T_start, T_end] and contains exactly `n_replicas` points.
     Density is increased around one or more focus temperatures using Gaussian bumps.
+    Baseline spacing can be uniform in temperature or inverse temperature beta=1/T.
 
     Args:
         T_start: First temperature in the grid.
@@ -38,6 +40,7 @@ def generate_nonuniform_temperature_grid(
         focus_weights: Relative strength per focus temperature (same length as focus_temps).
         focus_strength: Global amplification for all focus temperatures.
         focus_width: Width (in K) of local refinement around each focus temperature.
+        grid_space: Baseline coordinate for spacing, either "temperature" or "beta".
 
     Returns:
         List of temperatures ordered from T_start to T_end.
@@ -74,13 +77,24 @@ def generate_nonuniform_temperature_grid(
         raise ValueError("focus_weights must be non-negative.")
     if focus_strength < 0:
         raise ValueError("focus_strength must be non-negative.")
+    if grid_space not in {"temperature", "beta"}:
+        raise ValueError("grid_space must be either 'temperature' or 'beta'.")
+    if grid_space == "beta" and lo <= 0:
+        raise ValueError("T_start and T_end must be > 0 when grid_space='beta'.")
 
     sigma = float(focus_width) if focus_width is not None else 0.08 * span
     if sigma <= 0:
         raise ValueError("focus_width must be > 0.")
 
     dense_n = max(4000, n_replicas * 250)
-    dense_t = np.linspace(lo, hi, dense_n)
+    if grid_space == "temperature":
+        dense_t = np.linspace(lo, hi, dense_n)
+    else:
+        # Uniform indexing in beta yields geometric-like spacing in temperature.
+        beta_lo = 1.0 / lo
+        beta_hi = 1.0 / hi
+        dense_beta = np.linspace(beta_lo, beta_hi, dense_n)
+        dense_t = 1.0 / dense_beta
     density = np.ones_like(dense_t)
 
     for t_focus, weight in zip(focus_list, weight_list):

@@ -128,6 +128,7 @@ class ReplicaExchange:
         fine_grid_weights=None,
         fine_grid_strength: float = 4.0,
         fine_grid_width: float = None,
+        fine_grid_space: str = "temperature",
         **pt_kwargs,
     ):
 
@@ -157,6 +158,7 @@ class ReplicaExchange:
                 focus_weights=fine_grid_weights,
                 focus_strength=fine_grid_strength,
                 focus_width=fine_grid_width,
+                grid_space=fine_grid_space,
             )
         else:
             if T_step is None or np.isclose(T_step, 0.0):

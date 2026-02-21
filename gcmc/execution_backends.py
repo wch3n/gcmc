@@ -284,12 +284,20 @@ class RayReplicaBackend(ReplicaExecutionBackend):
                     "placement_group_bundles must have at least n_gpus * workers_per_gpu bundles."
                 )
 
-            pg = placement_group(
-                bundles=bundles,
-                strategy=self.backend_kwargs.get("placement_group_strategy", "SPREAD"),
-                name=self.backend_kwargs.get("placement_group_name"),
-                lifetime=self.backend_kwargs.get("placement_group_lifetime"),
-            )
+            pg_kwargs = {
+                "bundles": bundles,
+                "strategy": self.backend_kwargs.get("placement_group_strategy", "SPREAD"),
+            }
+            if "placement_group_name" in self.backend_kwargs:
+                pg_name = self.backend_kwargs.get("placement_group_name")
+                if pg_name is not None:
+                    pg_kwargs["name"] = pg_name
+            if "placement_group_lifetime" in self.backend_kwargs:
+                pg_lifetime = self.backend_kwargs.get("placement_group_lifetime")
+                if pg_lifetime is not None:
+                    pg_kwargs["lifetime"] = pg_lifetime
+
+            pg = placement_group(**pg_kwargs)
             ray.get(pg.ready())
             self._placement_group = pg
             self._owns_placement_group = True

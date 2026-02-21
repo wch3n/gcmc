@@ -264,6 +264,7 @@ class ReplicaExchange:
 
                 # B. Collect results.
                 completed = 0
+                cycle_log_rows = []
                 while completed < len(self.replica_states):
                     res = self.backend.get_result()
                     if isinstance(res, tuple) and res[0] == "ERROR":
@@ -324,7 +325,39 @@ class ReplicaExchange:
                     with open(self.results_file, "a") as f:
                         f.write(line + "\n")
 
+                    cycle_log_rows.append(
+                        {
+                            "rid": rid,
+                            "T": state["T"],
+                            "E": cycle_E,
+                            "e_per_atom": e_per_atom,
+                            "cv_cycle": cycle_Cv,
+                            "cv_cum": cum_Cv,
+                            "acc": acc,
+                        }
+                    )
+
                     completed += 1
+
+                # Keep driver-side PT reporting available across all execution backends.
+                if self.report_interval > 0 and (
+                    (cycle + 1) % self.report_interval == 0
+                    or cycle == self.cycle_start
+                    or cycle == (n_cycles - 1)
+                ):
+                    rows_sorted = sorted(cycle_log_rows, key=lambda row: row["T"])
+                    for row in rows_sorted:
+                        logger.info(
+                            "[Replica %02d] T=%7.3f K | E=%12.6f eV | E/N=%10.6f eV | "
+                            "Cv(cycle)=%10.6f | Cv(cum)=%10.6f | Acc=%6.2f%%",
+                            row["rid"],
+                            row["T"],
+                            row["E"],
+                            row["e_per_atom"],
+                            row["cv_cycle"],
+                            row["cv_cum"],
+                            row["acc"],
+                        )
 
                 t_end = time.time()
                 duration = t_end - t_start

@@ -48,6 +48,12 @@ def main(sc_matrix):
     n_nodes = int(os.getenv("PT_NODES", "2"))
     gpus_per_node = int(os.getenv("PT_GPUS_PER_NODE", "4"))
     workers_per_gpu = int(os.getenv("PT_WORKERS_PER_GPU", "2"))
+    log_to_driver = os.getenv("PT_RAY_LOG_TO_DRIVER", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     total_gpu_slots = n_nodes * gpus_per_node
 
     # PT temperature-grid setup.
@@ -75,7 +81,7 @@ def main(sc_matrix):
         backend_kwargs={
             "init_kwargs": {
                 "address": "auto",
-                "log_to_driver": False,
+                "log_to_driver": log_to_driver,
             },
             # Keep placement explicit to spread actor bundles across nodes.
             "use_placement_group": True,
@@ -111,7 +117,8 @@ def main(sc_matrix):
 
     print(
         f"Ray PT config: n_gpus={total_gpu_slots}, workers_per_gpu={workers_per_gpu}, "
-        f"total_workers={total_gpu_slots * workers_per_gpu}"
+        f"total_workers={total_gpu_slots * workers_per_gpu}, "
+        f"log_to_driver={log_to_driver}"
     )
 
     pt = ReplicaExchange.from_auto_config(**pt_kwargs)

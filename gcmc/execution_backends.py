@@ -42,6 +42,10 @@ class MultiprocessingReplicaBackend(ReplicaExecutionBackend):
     ):
         self.n_gpus = int(n_gpus)
         self.workers_per_gpu = int(workers_per_gpu)
+        if self.n_gpus < 1:
+            raise ValueError("n_gpus must be >= 1.")
+        if self.workers_per_gpu < 1:
+            raise ValueError("workers_per_gpu must be >= 1.")
         self.worker_init_info = worker_init_info
 
         self._gpu_queues = [ctx.Queue() for _ in range(self.n_gpus)]
@@ -176,7 +180,16 @@ class RayReplicaBackend(ReplicaExecutionBackend):
 
     backend_kwargs supports:
       - init_kwargs: dict passed to ray.init() when needed.
-      - actor_options: dict merged into actor options (default {"num_gpus": 1}).
+      - actor_options: dict merged into actor options. If num_gpus is not provided,
+        default is set to 1/workers_per_gpu so worker over-subscription maps cleanly.
+      - use_placement_group: bool. If True, place actors via a Ray placement group.
+      - placement_group_strategy: strategy string for placement group (default "SPREAD").
+      - placement_group_bundles: optional explicit bundles list. If omitted, one bundle
+        per actor is generated automatically from CPU/GPU per actor requirements.
+      - placement_group_name: optional placement group name.
+      - placement_group_lifetime: optional placement group lifetime.
+      - placement_group_capture_child_tasks: bool passed to scheduling strategy.
+      - remove_placement_group_on_stop: bool (default True).
       - shutdown_on_stop: bool, if True call ray.shutdown() when this backend owns runtime.
     """
 
@@ -189,6 +202,10 @@ class RayReplicaBackend(ReplicaExecutionBackend):
     ):
         self.n_gpus = int(n_gpus)
         self.workers_per_gpu = int(workers_per_gpu)
+        if self.n_gpus < 1:
+            raise ValueError("n_gpus must be >= 1.")
+        if self.workers_per_gpu < 1:
+            raise ValueError("workers_per_gpu must be >= 1.")
         self.worker_init_info = worker_init_info
         self.backend_kwargs = backend_kwargs or {}
 
@@ -197,6 +214,9 @@ class RayReplicaBackend(ReplicaExecutionBackend):
         self._actors_by_gpu = {}
         self._next_actor_by_gpu = {}
         self._pending_refs = []
+        self._placement_group = None
+        self._remove_placement_group = None
+        self._owns_placement_group = False
 
     def start(self) -> None:
         try:
@@ -211,14 +231,85 @@ class RayReplicaBackend(ReplicaExecutionBackend):
             ray.init(**self.backend_kwargs.get("init_kwargs", {}))
             self._owns_ray_runtime = True
 
-        actor_options = {"num_gpus": 1}
-        actor_options.update(self.backend_kwargs.get("actor_options", {}))
+        actor_options = dict(self.backend_kwargs.get("actor_options", {}))
+        if "num_gpus" in actor_options:
+            num_gpus_per_actor = float(actor_options["num_gpus"])
+            if num_gpus_per_actor < 0:
+                raise ValueError("actor_options['num_gpus'] must be >= 0 for Ray backend.")
+        else:
+            num_gpus_per_actor = 1.0 / float(self.workers_per_gpu)
+            actor_options["num_gpus"] = num_gpus_per_actor
+
+        gpus_per_slot = num_gpus_per_actor * self.workers_per_gpu
+        if gpus_per_slot > 1.0 + 1e-8:
+            logger.warning(
+                "Ray backend requests %.3f GPUs per slot "
+                "(workers_per_gpu=%d * num_gpus_per_actor=%.3f). "
+                "This exceeds 1 GPU per logical slot and may cause unschedulable actors.",
+                gpus_per_slot,
+                self.workers_per_gpu,
+                num_gpus_per_actor,
+            )
         actor_cls = ray.remote(_RayReplicaActor)
 
         total_workers = self.n_gpus * self.workers_per_gpu
+        cpus_per_actor = float(actor_options.get("num_cpus", 1))
         logger.info(
-            f"Spawning {total_workers} Ray workers ({self.workers_per_gpu} per GPU slot)..."
+            "Spawning %d Ray workers (%d per GPU slot, %.3f GPU per actor, %.3f CPU per actor)...",
+            total_workers,
+            self.workers_per_gpu,
+            num_gpus_per_actor,
+            cpus_per_actor,
         )
+
+        use_placement_group = bool(self.backend_kwargs.get("use_placement_group", False))
+        actor_options_per_worker = [dict(actor_options) for _ in range(total_workers)]
+        if use_placement_group:
+            pg_mod = importlib.import_module("ray.util.placement_group")
+            sched_mod = importlib.import_module("ray.util.scheduling_strategies")
+            placement_group = getattr(pg_mod, "placement_group")
+            self._remove_placement_group = getattr(pg_mod, "remove_placement_group")
+            placement_group_strategy_cls = getattr(
+                sched_mod, "PlacementGroupSchedulingStrategy"
+            )
+
+            bundles = self.backend_kwargs.get("placement_group_bundles")
+            if bundles is None:
+                bundle = {"CPU": cpus_per_actor}
+                if num_gpus_per_actor > 0:
+                    bundle["GPU"] = num_gpus_per_actor
+                bundles = [dict(bundle) for _ in range(total_workers)]
+            elif len(bundles) < total_workers:
+                raise ValueError(
+                    "placement_group_bundles must have at least n_gpus * workers_per_gpu bundles."
+                )
+
+            pg = placement_group(
+                bundles=bundles,
+                strategy=self.backend_kwargs.get("placement_group_strategy", "SPREAD"),
+                name=self.backend_kwargs.get("placement_group_name"),
+                lifetime=self.backend_kwargs.get("placement_group_lifetime"),
+            )
+            ray.get(pg.ready())
+            self._placement_group = pg
+            self._owns_placement_group = True
+
+            capture_children = bool(
+                self.backend_kwargs.get("placement_group_capture_child_tasks", True)
+            )
+            for worker_idx in range(total_workers):
+                actor_options_per_worker[worker_idx]["scheduling_strategy"] = (
+                    placement_group_strategy_cls(
+                        placement_group=pg,
+                        placement_group_bundle_index=worker_idx,
+                        placement_group_capture_child_tasks=capture_children,
+                    )
+                )
+            logger.info(
+                "Ray placement group enabled: strategy=%s bundles=%d",
+                self.backend_kwargs.get("placement_group_strategy", "SPREAD"),
+                len(bundles),
+            )
 
         for gpu in range(self.n_gpus):
             self._actors_by_gpu[gpu] = []
@@ -226,7 +317,7 @@ class RayReplicaBackend(ReplicaExecutionBackend):
 
         for rank in range(total_workers):
             target_slot = rank % self.n_gpus
-            actor = actor_cls.options(**actor_options).remote(
+            actor = actor_cls.options(**actor_options_per_worker[rank]).remote(
                 rank=rank, worker_init_info=self.worker_init_info
             )
             self._actors_by_gpu[target_slot].append(actor)
@@ -258,6 +349,19 @@ class RayReplicaBackend(ReplicaExecutionBackend):
         self._actors_by_gpu = {}
         self._next_actor_by_gpu = {}
         self._pending_refs = []
+        if (
+            self._owns_placement_group
+            and self._placement_group is not None
+            and self._remove_placement_group is not None
+            and self.backend_kwargs.get("remove_placement_group_on_stop", True)
+        ):
+            try:
+                self._remove_placement_group(self._placement_group)
+            except Exception:
+                pass
+        self._placement_group = None
+        self._remove_placement_group = None
+        self._owns_placement_group = False
         if self._owns_ray_runtime and self.backend_kwargs.get("shutdown_on_stop", False):
             self._ray.shutdown()
 

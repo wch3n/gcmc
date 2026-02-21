@@ -84,6 +84,9 @@ def main(sc_matrix):
         traj_prefix='run'
     )"""
 
+    # Execution backend for replica workers: "multiprocessing" (default) or "ray".
+    execution_backend = "multiprocessing"
+
     # Run replica exchange.
     pt_kwargs = dict(
         atoms_template=atoms,
@@ -103,6 +106,7 @@ def main(sc_matrix):
         resume=True,
         n_gpus=4,
         workers_per_gpu=4,
+        execution_backend=execution_backend,
     )
 
     if use_nonuniform_grid:

@@ -2,9 +2,8 @@ import numpy as np
 import logging
 import os
 import pickle
-import multiprocessing
 import time
-from .process_replica import ReplicaWorker, ctx
+from .execution_backends import build_replica_backend
 from .utils import generate_nonuniform_temperature_grid
 
 logger = logging.getLogger("mc")
@@ -30,6 +29,8 @@ class ReplicaExchange:
         track_composition=None,
         seed: int = 67,
         seed_nonce: int = 0,
+        execution_backend: str = "multiprocessing",
+        backend_kwargs: dict = None,
     ):
         self.n_gpus = n_gpus
         self.workers_per_gpu = workers_per_gpu
@@ -43,6 +44,8 @@ class ReplicaExchange:
         if not (0.0 <= self.local_eq_fraction <= 1.0):
             raise ValueError("local_eq_fraction must be in [0, 1].")
         self.worker_init_info = worker_init_info
+        self.execution_backend = execution_backend
+        self.backend_kwargs = backend_kwargs or {}
         self.seed = seed
         self.seed_nonce = seed_nonce
         self.rng = np.random.default_rng(seed)
@@ -55,10 +58,13 @@ class ReplicaExchange:
         self.checkpoint_file = checkpoint_file
         self.cycle_start = 0
 
-        # Load balancing: one queue per GPU.
-        self.gpu_queues = [ctx.Queue() for _ in range(n_gpus)]
-        self.result_queue = ctx.Queue()
-        self.workers = []
+        self.backend = build_replica_backend(
+            execution_backend=self.execution_backend,
+            n_gpus=self.n_gpus,
+            workers_per_gpu=self.workers_per_gpu,
+            worker_init_info=self.worker_init_info,
+            backend_kwargs=self.backend_kwargs,
+        )
 
         # Keep RNG streams deterministic and isolated per replica, independent of worker scheduling and ordering.
         for state in self.replica_states:
@@ -86,23 +92,7 @@ class ReplicaExchange:
             self._load_master_checkpoint()
 
     def _start_workers(self):
-        total_workers = self.n_gpus * self.workers_per_gpu
-        logger.info(
-            f"Spawning {total_workers} persistent workers ({self.workers_per_gpu} per GPU)..."
-        )
-
-        for i in range(total_workers):
-            assigned_gpu = i % self.n_gpus
-            specific_queue = self.gpu_queues[assigned_gpu]
-            w = ReplicaWorker(
-                i,
-                assigned_gpu,
-                specific_queue,
-                self.result_queue,
-                self.worker_init_info,
-            )
-            w.start()
-            self.workers.append(w)
+        self.backend.start()
 
     @classmethod
     def from_auto_config(
@@ -129,6 +119,8 @@ class ReplicaExchange:
         fine_grid_strength: float = 4.0,
         fine_grid_width: float = None,
         grid_space: str = "temperature",
+        execution_backend: str = "multiprocessing",
+        backend_kwargs: dict = None,
         **pt_kwargs,
     ):
 
@@ -216,6 +208,8 @@ class ReplicaExchange:
             results_file=results_file,
             track_composition=track_composition,
             seed_nonce=seed_nonce,
+            execution_backend=execution_backend,
+            backend_kwargs=backend_kwargs,
             **pt_kwargs,
         )
 
@@ -262,12 +256,16 @@ class ReplicaExchange:
                         "eq_steps": eq_steps,
                     }
                     target_gpu = state["id"] % self.n_gpus
-                    self.gpu_queues[target_gpu].put((state["id"], task_data))
+                    self.backend.submit(
+                        replica_id=state["id"],
+                        target_gpu=target_gpu,
+                        task_data=task_data,
+                    )
 
                 # B. Collect results.
                 completed = 0
                 while completed < len(self.replica_states):
-                    res = self.result_queue.get()
+                    res = self.backend.get_result()
                     if isinstance(res, tuple) and res[0] == "ERROR":
                         raise RuntimeError(f"Worker Error: {res[1]}")
 
@@ -429,8 +427,4 @@ class ReplicaExchange:
                     state["atoms"].pbc = s_data["pbc"]
 
     def stop(self):
-        for q in self.gpu_queues:
-            for _ in range(self.workers_per_gpu):
-                q.put("STOP")
-        for w in self.workers:
-            w.join()
+        self.backend.stop()

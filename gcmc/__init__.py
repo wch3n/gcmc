@@ -18,6 +18,7 @@ from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
 from .cluster_analysis import analyze_and_plot, find_cu_clusters
+from .analysis import MXeneOrderingAnalyzer
 from . import utils
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "AlloyCMC",
     "SemiGrandAlloyMC",
     "ReplicaExchange",
+    "MXeneOrderingAnalyzer",
     "analyze_and_plot",
     "find_cu_clusters",
     "utils",

@@ -402,6 +402,7 @@ class MXeneOrderingAnalyzer:
         for el in self.alloy_elements:
             global_frac = []
             top_minus_bottom = []
+            abs_top_minus_bottom = []
             layer_spread = []
             for fid in frame_ids:
                 rows_f = frame_map[fid]
@@ -415,7 +416,9 @@ class MXeneOrderingAnalyzer:
                 }
                 if layer_fracs:
                     lids = sorted(layer_fracs)
-                    top_minus_bottom.append(layer_fracs[lids[-1]] - layer_fracs[lids[0]])
+                    delta_top_bottom = layer_fracs[lids[-1]] - layer_fracs[lids[0]]
+                    top_minus_bottom.append(delta_top_bottom)
+                    abs_top_minus_bottom.append(abs(delta_top_bottom))
                     layer_spread.append(max(layer_fracs.values()) - min(layer_fracs.values()))
 
             row[f"global_frac_{el}_mean"] = (
@@ -429,6 +432,16 @@ class MXeneOrderingAnalyzer:
             )
             row[f"layer_top_minus_bottom_frac_{el}_std"] = (
                 float(np.nanstd(top_minus_bottom)) if top_minus_bottom else float("nan")
+            )
+            row[f"layer_abs_top_minus_bottom_frac_{el}_mean"] = (
+                float(np.nanmean(abs_top_minus_bottom))
+                if abs_top_minus_bottom
+                else float("nan")
+            )
+            row[f"layer_abs_top_minus_bottom_frac_{el}_std"] = (
+                float(np.nanstd(abs_top_minus_bottom))
+                if abs_top_minus_bottom
+                else float("nan")
             )
             row[f"layer_frac_spread_{el}_mean"] = (
                 float(np.nanmean(layer_spread)) if layer_spread else float("nan")

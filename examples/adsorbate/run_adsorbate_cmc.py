@@ -1,70 +1,24 @@
 import argparse
 from pathlib import Path
 
-from ase import Atoms
-from ase.constraints import FixAtoms
-from ase.io import read
-
 from gcmc import AdsorbateCMC
-
-
-def parse_symbols(text: str) -> tuple[str, ...]:
-    return tuple(token for token in text.replace(",", " ").split() if token)
-
-
-def build_adsorbate_template(name: str) -> tuple[Atoms, int]:
-    key = name.upper()
-    if key == "H":
-        return Atoms("H", positions=[(0.0, 0.0, 0.0)]), 0
-    if key == "OH":
-        return Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]), 0
-    if key == "OOH":
-        ooh = Atoms(
-            "OOH",
-            positions=[
-                (0.0, 0.0, 0.0),
-                (0.0, 0.0, 1.46),
-                (0.79, 0.0, 2.01),
-            ],
-        )
-        return ooh, 0
-    raise ValueError(f"Unsupported preset adsorbate '{name}'. Use H, OH, or OOH.")
-
-
-def build_calculator(args):
-    if args.calculator == "mace":
-        if not args.model:
-            raise ValueError("--model is required when --calculator=mace.")
-        from mace.calculators import MACECalculator
-
-        return MACECalculator(model_paths=[args.model], device=args.device)
-
-    from ase.calculators.lj import LennardJones
-
-    return LennardJones(rc=args.lj_cutoff)
-
-
-def load_snapshot(path: Path, frame: int) -> Atoms:
-    suffix = path.suffix.lower()
-    index = frame if suffix in {".traj", ".db", ".extxyz", ".xyz"} else 0
-    return read(path, index=index)
-
-
-def maybe_fix_bottom(atoms: Atoms, z_cut: float | None) -> None:
-    if z_cut is None:
-        return
-    fixed_indices = [atom.index for atom in atoms if atom.position[2] < z_cut]
-    if fixed_indices:
-        atoms.set_constraint(FixAtoms(indices=fixed_indices))
+from common import (
+    build_adsorbate_template,
+    build_calculator,
+    infer_functional_elements,
+    load_snapshot,
+    maybe_fix_bottom,
+    parse_symbols,
+)
 
 
 def main() -> None:
-    default_snapshot = Path(__file__).resolve().with_name("POSCAR")
+    default_snapshot = Path(__file__).resolve().parents[1] / "alloy" / "POSCAR.Ti2CO2"
 
     parser = argparse.ArgumentParser(
         description=(
             "Run fixed-loading NVT AdsorbateCMC on a MXene snapshot. "
-            "By default this uses the shipped MXene snapshot in this directory, but "
+            "By default this uses the clean Ti2CO2 example snapshot, but "
             "--snapshot can point to any POSCAR or trajectory frame."
         )
     )
@@ -74,6 +28,14 @@ def main() -> None:
         type=int,
         default=0,
         help="Frame index when --snapshot is a trajectory-like file.",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        nargs=3,
+        metavar=("NX", "NY", "NZ"),
+        default=(2, 2, 1),
+        help="Repeat the input snapshot before building the adsorbate configuration.",
     )
     parser.add_argument(
         "--calculator",
@@ -143,18 +105,15 @@ def main() -> None:
     args = parser.parse_args()
 
     atoms = load_snapshot(args.snapshot, args.frame)
+    if tuple(args.repeat) != (1, 1, 1):
+        atoms = atoms.repeat(tuple(args.repeat))
     maybe_fix_bottom(atoms, args.fix_below_z)
     calculator = build_calculator(args)
 
     substrate_elements = parse_symbols(args.substrate_elements)
-    if args.functional_elements:
-        functional_elements = parse_symbols(args.functional_elements)
-    else:
-        functional_elements = tuple(
-            sorted(
-                set(atoms.get_chemical_symbols()) - set(substrate_elements)
-            )
-        )
+    functional_elements = infer_functional_elements(
+        atoms, substrate_elements, args.functional_elements
+    )
 
     adsorbate_template, adsorbate_anchor_index = build_adsorbate_template(
         args.adsorbate

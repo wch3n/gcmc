@@ -117,7 +117,8 @@ def _place_adsorbate_template(
     frac_layer = coverage - n_full_layers
     selected_layers = [all_site_indices for _ in range(n_full_layers)]
     if frac_layer > 1e-8:
-        n_partial = int(round(frac_layer * n_sites))
+        n_partial = int(np.floor(frac_layer * n_sites + 0.5))
+        n_partial = min(n_sites, max(0, n_partial))
         if n_partial > 0:
             selected_layers.append(rng.choice(n_sites, n_partial, replace=False))
 

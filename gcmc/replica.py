@@ -7,6 +7,25 @@ from .execution_backends import build_replica_backend
 from .utils import generate_nonuniform_temperature_grid
 
 logger = logging.getLogger("mc")
+ADSORBATE_TAG_OFFSET = 1_000_000
+
+
+def _count_tagged_adsorbate_groups(atoms):
+    tags = np.asarray(atoms.get_tags(), dtype=int)
+    if len(tags) != len(atoms):
+        return 0
+    return int(np.sum(np.unique(tags) >= ADSORBATE_TAG_OFFSET))
+
+
+def _count_move_units(atoms, mc_kwargs):
+    n_adsorbates = _count_tagged_adsorbate_groups(atoms)
+    if n_adsorbates > 0:
+        return n_adsorbates
+    swap_elements = mc_kwargs.get("swap_elements")
+    if not swap_elements:
+        return len(atoms)
+    symbols = np.asarray(atoms.get_chemical_symbols(), dtype=object)
+    return int(np.isin(symbols, list(swap_elements)).sum())
 
 
 class ReplicaExchange:
@@ -57,6 +76,13 @@ class ReplicaExchange:
         self.results_file = results_file
         self.checkpoint_file = checkpoint_file
         self.cycle_start = 0
+        self.has_adsorbate_observables = any(
+            (
+                _count_tagged_adsorbate_groups(state["atoms"]) > 0
+                or "adsorbate" in state.get("mc_kwargs", {})
+            )
+            for state in self.replica_states
+        )
 
         self.backend = build_replica_backend(
             execution_backend=self.execution_backend,
@@ -84,6 +110,8 @@ class ReplicaExchange:
                     "cycle,T_K,n_atoms,E_eV,E_eV_per_atom,"
                     "Cv_cycle_eV_per_K,Cv_cum_eV_per_K,acc_pct"
                 )
+                if self.has_adsorbate_observables:
+                    header += ",n_adsorbates"
                 for el in self.track_composition:
                     header += f",N_{el}_avg,chi_{el}"
                 f.write(header + "\n")
@@ -231,12 +259,18 @@ class ReplicaExchange:
                 eq_steps = nsweeps if is_equilibrating else local_eq_steps
 
                 t_start = time.time()
-                total_atoms_in_cycle = 0
+                total_atom_trial_moves_in_cycle = 0
+                total_move_units_in_cycle = 0
 
                 # A. Submit tasks.
                 for state in self.replica_states:
                     atoms = state["atoms"]
-                    total_atoms_in_cycle += len(atoms)
+                    n_atoms = len(atoms)
+                    n_move_units = _count_move_units(
+                        atoms, state.get("mc_kwargs", {})
+                    )
+                    total_move_units_in_cycle += n_move_units * nsweeps
+                    total_atom_trial_moves_in_cycle += n_atoms * n_move_units * nsweeps
 
                     task_data = {
                         "T": state["T"],
@@ -287,6 +321,7 @@ class ReplicaExchange:
                     cycle_E = cycle_stats["energy"]
                     cycle_Cv = cycle_stats.get("cv", 0.0)
                     acc = cycle_stats["acceptance"]
+                    n_adsorbates = cycle_stats.get("n_adsorbates")
 
                     # 3. Update cumulative stats in memory.
                     if not is_equilibrating:
@@ -315,6 +350,11 @@ class ReplicaExchange:
                         f"{cum_Cv:.6f},"
                         f"{acc:.2f}"
                     )
+                    if self.has_adsorbate_observables:
+                        if n_adsorbates is None:
+                            line += ","
+                        else:
+                            line += f",{int(n_adsorbates)}"
 
                     if self.track_composition and "composition" in cycle_stats:
                         for el in self.track_composition:
@@ -334,6 +374,7 @@ class ReplicaExchange:
                             "cv_cycle": cycle_Cv,
                             "cv_cum": cum_Cv,
                             "acc": acc,
+                            "n_adsorbates": n_adsorbates,
                         }
                     )
 
@@ -349,7 +390,7 @@ class ReplicaExchange:
                     for row in rows_sorted:
                         logger.info(
                             "[Replica %02d] T=%7.3f K | E=%12.6f eV | E/N=%10.6f eV | "
-                            "Cv(cycle)=%10.6f | Cv(cum)=%10.6f | Acc=%6.2f%%",
+                            "Cv(cycle)=%10.6f | Cv(cum)=%10.6f | Acc=%6.2f%%%s",
                             row["rid"],
                             row["T"],
                             row["E"],
@@ -357,13 +398,27 @@ class ReplicaExchange:
                             row["cv_cycle"],
                             row["cv_cum"],
                             row["acc"],
+                            (
+                                f" | Nads={int(row['n_adsorbates']):4d}"
+                                if row["n_adsorbates"] is not None
+                                else ""
+                            ),
                         )
 
                 t_end = time.time()
                 duration = t_end - t_start
-                total_ops = total_atoms_in_cycle * nsweeps
-                speed = total_ops / duration if duration > 0 else 0
-                logger.info(f"[Timing] {duration:.2f}s | {speed:.2e} atom_sweeps/s")
+                move_unit_rate = (
+                    total_move_units_in_cycle / duration if duration > 0 else 0.0
+                )
+                speed = (
+                    total_atom_trial_moves_in_cycle / duration / 1.0e6
+                    if duration > 0
+                    else 0
+                )
+                logger.info(
+                    f"[Timing] {duration:.2f}s | {speed:.2e} Matom-trial-moves/s | "
+                    f"{move_unit_rate:.2e} move-proposals/s"
+                )
 
                 self._attempt_swaps(cycle)
 

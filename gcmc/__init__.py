@@ -5,6 +5,7 @@ Exports:
 - BaseMC: Common MC functionality (ensemble-neutral).
 - GCMC: Grand Canonical Monte Carlo.
 - CMC: Canonical Monte Carlo.
+- AdsorbateCMC: Replica-compatible canonical MC for fixed-loading adsorbates.
 - AlloyCMC: Canonical Monte Carlo for solids.
 - SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids.
 - ReplicaExchange: Replica exchange module (ensemble- and system-neutral).
@@ -14,21 +15,29 @@ Exports:
 from .base import BaseMC
 from .gcmc import GCMC
 from .cmc import CMC
+from .adsorbate_cmc import AdsorbateCMC
 from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
 from .cluster_analysis import analyze_and_plot, find_cu_clusters
-from .analysis import MXeneOrderingAnalyzer
+from .analysis import (
+    MXeneAdsorptionSiteAnalyzer,
+    MXeneOrderingAnalyzer,
+    MXeneSurfaceMotifAnalyzer,
+)
 from . import utils
 
 __all__ = [
     "BaseMC",
     "GCMC",
     "CMC",
+    "AdsorbateCMC",
     "AlloyCMC",
     "SemiGrandAlloyMC",
     "ReplicaExchange",
+    "MXeneAdsorptionSiteAnalyzer",
     "MXeneOrderingAnalyzer",
+    "MXeneSurfaceMotifAnalyzer",
     "analyze_and_plot",
     "find_cu_clusters",
     "utils",

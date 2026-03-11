@@ -15,7 +15,7 @@ atoms = initialize_alloy_sublattice(
 calc = MACECalculator(model_paths=["mxene.model"], device="cuda")
 neighbor_backend = "auto"  # Use matscipy if installed, otherwise ASE.
 
-# Baseline CMC (swap moves only).
+# Baseline swap-only MC.
 mc = AlloyCMC(
     atoms=atoms.copy(),
     calculator=calc,
@@ -28,7 +28,7 @@ mc = AlloyCMC(
     thermo_file="cmc_only.dat",
 )
 stats = mc.run(nsweeps=200, traj_file="cmc_only.traj", interval=10, equilibration=20)
-print("CMC only:", stats)
+print("Swap-only MC:", stats)
 
 # Hybrid MC/MD with NVE MD proposals.
 mc_hybrid_nve = AlloyCMC(

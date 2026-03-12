@@ -39,6 +39,8 @@ CONFIG = SimpleNamespace(
     stop=None,
     step=1,
     align_translation=True,
+    canonicalize_layer_flip=False,
+    canonical_species=None,
     out_dir=Path("sro_analysis"),
     out_prefix="mxene_sro",
 )
@@ -71,6 +73,8 @@ def _build_analyzer() -> MXeneSROAnalyzer:
         n_shells=CONFIG.n_shells,
         shell_tol=CONFIG.shell_tol,
         fft_qmax=CONFIG.fft_qmax,
+        canonicalize_layer_flip=CONFIG.canonicalize_layer_flip,
+        canonical_species=CONFIG.canonical_species,
     )
 
     if CONFIG.reference is not None:

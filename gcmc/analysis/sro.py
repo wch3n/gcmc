@@ -32,6 +32,8 @@ class MXeneSROAnalyzer:
         n_shells: int = 1,
         shell_tol: float = 0.15,
         fft_qmax: int = 0,
+        canonicalize_layer_flip: bool = False,
+        canonical_species: str | None = None,
     ) -> None:
         if layer_axis not in AXIS_MAP:
             raise ValueError(f"layer_axis must be one of {tuple(AXIS_MAP)}.")
@@ -48,12 +50,16 @@ class MXeneSROAnalyzer:
         self.n_shells = int(n_shells)
         self.shell_tol = float(shell_tol)
         self.fft_qmax = int(fft_qmax)
+        self.canonicalize_layer_flip = bool(canonicalize_layer_flip)
+        self.canonical_species = canonical_species
         if self.n_shells < 1:
             raise ValueError("n_shells must be >= 1.")
         if self.shell_tol <= 0.0:
             raise ValueError("shell_tol must be > 0.")
         if self.fft_qmax < 0:
             raise ValueError("fft_qmax must be >= 0.")
+        if self.canonical_species is not None and self.canonical_species not in self.alloy_elements:
+            raise ValueError("canonical_species must be one of alloy_elements.")
         self._prepare_reference()
 
     @classmethod
@@ -279,6 +285,72 @@ class MXeneSROAnalyzer:
         self.reference_phase_matrix = np.exp(
             -1j * (self.reference_positions @ self.reference_q_vectors.T)
         )
+
+    @staticmethod
+    def _group_rows_by_frame(
+        rows: List[Dict[str, object]],
+    ) -> Dict[int, List[Dict[str, object]]]:
+        frame_map: Dict[int, List[Dict[str, object]]] = {}
+        for row in rows:
+            frame_map.setdefault(int(row["frame"]), []).append(row)
+        return frame_map
+
+    def _determine_layer_flip_map(
+        self,
+        layer_rows: List[Dict[str, object]],
+    ) -> Tuple[Dict[int, bool], str | None]:
+        if not self.canonicalize_layer_flip or not layer_rows:
+            return {}, None
+        if len(self.reference_layer_centers) != 2:
+            raise ValueError(
+                "canonicalize_layer_flip currently requires exactly 2 alloy layers."
+            )
+
+        frame_map = self._group_rows_by_frame(layer_rows)
+        if self.canonical_species is not None:
+            anchor = self.canonical_species
+        else:
+            scores: Dict[str, float] = {}
+            for el in self.alloy_elements:
+                deltas = []
+                for rows_f in frame_map.values():
+                    layer_fracs = {
+                        int(x["layer_id"]): float(x.get(f"frac_{el}", np.nan))
+                        for x in rows_f
+                    }
+                    if len(layer_fracs) >= 2:
+                        lids = sorted(layer_fracs)
+                        deltas.append(abs(layer_fracs[lids[-1]] - layer_fracs[lids[0]]))
+                scores[el] = float(np.nanmean(deltas)) if deltas else float("-inf")
+            anchor = max(scores, key=scores.get)
+
+        flip_by_frame: Dict[int, bool] = {}
+        for frame_id, rows_f in frame_map.items():
+            layer_fracs = {
+                int(x["layer_id"]): float(x.get(f"frac_{anchor}", np.nan))
+                for x in rows_f
+            }
+            lids = sorted(layer_fracs)
+            delta = layer_fracs[lids[-1]] - layer_fracs[lids[0]]
+            flip_by_frame[int(frame_id)] = bool(np.isfinite(delta) and delta < 0.0)
+        return flip_by_frame, anchor
+
+    @staticmethod
+    def _canonicalize_layer_rows(
+        rows: List[Dict[str, object]],
+        flip_by_frame: Dict[int, bool],
+    ) -> List[Dict[str, object]]:
+        if not rows or not flip_by_frame:
+            return rows
+
+        out_rows: List[Dict[str, object]] = []
+        for row in rows:
+            out_row = dict(row)
+            frame_id = int(out_row["frame"])
+            if flip_by_frame.get(frame_id, False):
+                out_row["layer_id"] = 1 - int(out_row["layer_id"])
+            out_rows.append(out_row)
+        return out_rows
 
     def _map_frame_to_reference(
         self, atoms: Atoms
@@ -648,6 +720,84 @@ class MXeneSROAnalyzer:
             if rows_sq_layer
             else [],
         }
+        flip_by_frame, flip_anchor_species = self._determine_layer_flip_map(rows_layer_comp)
+        canonical_layer_rows: List[Dict[str, object]] = []
+        canonical_wc_layer_rows: List[Dict[str, object]] = []
+        canonical_coord_layer_rows: List[Dict[str, object]] = []
+        canonical_sq_layer_rows: List[Dict[str, object]] = []
+        if self.canonicalize_layer_flip:
+            canonical_layer_rows = self._canonicalize_layer_rows(rows_layer_comp, flip_by_frame)
+            canonical_wc_layer_rows = self._canonicalize_layer_rows(rows_wc_layer, flip_by_frame)
+            canonical_coord_layer_rows = self._canonicalize_layer_rows(rows_coord_layer, flip_by_frame)
+            canonical_sq_layer_rows = self._canonicalize_layer_rows(rows_sq_layer, flip_by_frame)
+        result["canonicalize_layer_flip"] = self.canonicalize_layer_flip
+        result["canonical_anchor_species"] = flip_anchor_species
+        result["n_flipped_frames"] = int(sum(bool(v) for v in flip_by_frame.values()))
+        result["flip_fraction"] = (
+            float(np.mean([1.0 if flip else 0.0 for flip in flip_by_frame.values()]))
+            if flip_by_frame
+            else 0.0
+        )
+        result["layer_composition_canonical_summary"] = (
+            _grouped_mean_std(
+                canonical_layer_rows,
+                group_keys=["traj", "layer_id"],
+                value_keys=[f"frac_{el}" for el in self.alloy_elements],
+            )
+            if canonical_layer_rows
+            else []
+        )
+        result["wc_layer_canonical_summary"] = (
+            _grouped_mean_std(
+                canonical_wc_layer_rows,
+                group_keys=[
+                    "traj",
+                    "shell_id",
+                    "shell_distance_A",
+                    "layer_id",
+                    "central_species",
+                    "neighbor_species",
+                ],
+                value_keys=["alpha_wc"],
+            )
+            if canonical_wc_layer_rows
+            else []
+        )
+        result["coord_layer_canonical_summary"] = (
+            _grouped_mean_std(
+                canonical_coord_layer_rows,
+                group_keys=[
+                    "traj",
+                    "shell_id",
+                    "shell_distance_A",
+                    "layer_id",
+                    "central_species",
+                ],
+                value_keys=["mean_coordination"],
+            )
+            if canonical_coord_layer_rows
+            else []
+        )
+        result["sq_layer_canonical_summary"] = (
+            _grouped_mean_std(
+                canonical_sq_layer_rows,
+                group_keys=[
+                    "traj",
+                    "layer_id",
+                    "h",
+                    "k",
+                    "qx_invA",
+                    "qy_invA",
+                    "qz_invA",
+                    "q_abs_invA",
+                    "species_i",
+                    "species_j",
+                ],
+                value_keys=["sq_real", "sq_imag", "sq_abs"],
+            )
+            if canonical_sq_layer_rows
+            else []
+        )
         result["phase_indicators"] = self.compute_phase_indicators(result)
         return result
 
@@ -662,64 +812,96 @@ class MXeneSROAnalyzer:
         }
 
         layer_rows = result.get("layer_composition_per_frame", [])
-        frame_map: Dict[int, List[Dict[str, object]]] = {}
-        for r in layer_rows:
-            frame_map.setdefault(int(r["frame"]), []).append(r)
+        frame_map = self._group_rows_by_frame(layer_rows)
         frame_ids = sorted(frame_map)
         row["n_frames"] = len(frame_ids)
+        row["canonicalize_layer_flip"] = bool(result.get("canonicalize_layer_flip", False))
+        row["n_flipped_frames"] = int(result.get("n_flipped_frames", 0))
+        row["flip_fraction"] = float(result.get("flip_fraction", 0.0))
+        if result.get("canonical_anchor_species") is not None:
+            row["canonical_anchor_species"] = str(result["canonical_anchor_species"])
 
-        for el in self.alloy_elements:
-            global_frac = []
-            top_minus_bottom = []
-            abs_top_minus_bottom = []
-            layer_spread = []
-            for fid in frame_ids:
-                rows_f = frame_map[fid]
-                n_tot = float(sum(float(x["n_alloy_layer"]) for x in rows_f))
-                c_tot = float(sum(float(x[f"count_{el}"]) for x in rows_f))
-                global_frac.append(c_tot / n_tot if n_tot > 0 else float("nan"))
-                layer_fracs = {int(x["layer_id"]): float(x[f"frac_{el}"]) for x in rows_f}
-                if layer_fracs:
-                    lids = sorted(layer_fracs)
-                    delta = layer_fracs[lids[-1]] - layer_fracs[lids[0]]
-                    top_minus_bottom.append(delta)
-                    abs_top_minus_bottom.append(abs(delta))
-                    layer_spread.append(max(layer_fracs.values()) - min(layer_fracs.values()))
-
-            row[f"global_frac_{el}_mean"] = (
-                float(np.nanmean(global_frac)) if global_frac else float("nan")
-            )
-            row[f"global_frac_{el}_std"] = (
-                float(np.nanstd(global_frac)) if global_frac else float("nan")
-            )
-            row[f"layer_top_minus_bottom_frac_{el}_mean"] = (
-                float(np.nanmean(top_minus_bottom)) if top_minus_bottom else float("nan")
-            )
-            row[f"layer_top_minus_bottom_frac_{el}_std"] = (
-                float(np.nanstd(top_minus_bottom)) if top_minus_bottom else float("nan")
-            )
-            row[f"layer_abs_top_minus_bottom_frac_{el}_mean"] = (
-                float(np.nanmean(abs_top_minus_bottom))
-                if abs_top_minus_bottom
-                else float("nan")
-            )
-            row[f"layer_abs_top_minus_bottom_frac_{el}_std"] = (
-                float(np.nanstd(abs_top_minus_bottom))
-                if abs_top_minus_bottom
-                else float("nan")
-            )
-            row[f"layer_frac_spread_{el}_mean"] = (
-                float(np.nanmean(layer_spread)) if layer_spread else float("nan")
-            )
-            row[f"layer_frac_spread_{el}_std"] = (
-                float(np.nanstd(layer_spread)) if layer_spread else float("nan")
-            )
-
-        for r in result.get("layer_composition_summary", []):
-            lid = int(r["layer_id"])
+        def _add_layer_metrics(
+            rows_per_frame: List[Dict[str, object]],
+            summary_rows: List[Dict[str, object]],
+            prefix: str = "",
+            include_global: bool = False,
+        ) -> None:
+            local_frame_map = self._group_rows_by_frame(rows_per_frame)
+            local_frame_ids = sorted(local_frame_map)
             for el in self.alloy_elements:
-                row[f"layer{lid}_frac_{el}_mean"] = float(r.get(f"frac_{el}_mean", np.nan))
-                row[f"layer{lid}_frac_{el}_std"] = float(r.get(f"frac_{el}_std", np.nan))
+                global_frac = []
+                top_minus_bottom = []
+                abs_top_minus_bottom = []
+                layer_spread = []
+                for fid in local_frame_ids:
+                    rows_f = local_frame_map[fid]
+                    n_tot = float(sum(float(x["n_alloy_layer"]) for x in rows_f))
+                    c_tot = float(sum(float(x[f"count_{el}"]) for x in rows_f))
+                    global_frac.append(c_tot / n_tot if n_tot > 0 else float("nan"))
+                    layer_fracs = {int(x["layer_id"]): float(x[f"frac_{el}"]) for x in rows_f}
+                    if layer_fracs:
+                        lids = sorted(layer_fracs)
+                        delta = layer_fracs[lids[-1]] - layer_fracs[lids[0]]
+                        top_minus_bottom.append(delta)
+                        abs_top_minus_bottom.append(abs(delta))
+                        layer_spread.append(max(layer_fracs.values()) - min(layer_fracs.values()))
+
+                if include_global:
+                    row[f"{prefix}global_frac_{el}_mean"] = (
+                        float(np.nanmean(global_frac)) if global_frac else float("nan")
+                    )
+                    row[f"{prefix}global_frac_{el}_std"] = (
+                        float(np.nanstd(global_frac)) if global_frac else float("nan")
+                    )
+                row[f"{prefix}layer_top_minus_bottom_frac_{el}_mean"] = (
+                    float(np.nanmean(top_minus_bottom)) if top_minus_bottom else float("nan")
+                )
+                row[f"{prefix}layer_top_minus_bottom_frac_{el}_std"] = (
+                    float(np.nanstd(top_minus_bottom)) if top_minus_bottom else float("nan")
+                )
+                row[f"{prefix}layer_abs_top_minus_bottom_frac_{el}_mean"] = (
+                    float(np.nanmean(abs_top_minus_bottom))
+                    if abs_top_minus_bottom
+                    else float("nan")
+                )
+                row[f"{prefix}layer_abs_top_minus_bottom_frac_{el}_std"] = (
+                    float(np.nanstd(abs_top_minus_bottom))
+                    if abs_top_minus_bottom
+                    else float("nan")
+                )
+                row[f"{prefix}layer_frac_spread_{el}_mean"] = (
+                    float(np.nanmean(layer_spread)) if layer_spread else float("nan")
+                )
+                row[f"{prefix}layer_frac_spread_{el}_std"] = (
+                    float(np.nanstd(layer_spread)) if layer_spread else float("nan")
+                )
+
+            for r in summary_rows:
+                lid = int(r["layer_id"])
+                for el in self.alloy_elements:
+                    row[f"{prefix}layer{lid}_frac_{el}_mean"] = float(
+                        r.get(f"frac_{el}_mean", np.nan)
+                    )
+                    row[f"{prefix}layer{lid}_frac_{el}_std"] = float(
+                        r.get(f"frac_{el}_std", np.nan)
+                    )
+
+        _add_layer_metrics(
+            rows_per_frame=layer_rows,
+            summary_rows=result.get("layer_composition_summary", []),
+            prefix="",
+            include_global=True,
+        )
+        if result.get("layer_composition_canonical_summary"):
+            flip_by_frame, _ = self._determine_layer_flip_map(layer_rows)
+            canonical_layer_rows = self._canonicalize_layer_rows(layer_rows, flip_by_frame)
+            _add_layer_metrics(
+                rows_per_frame=canonical_layer_rows,
+                summary_rows=result.get("layer_composition_canonical_summary", []),
+                prefix="canonical_",
+                include_global=False,
+            )
 
         for r in result.get("wc_global_summary", []):
             shell_id = int(r["shell_id"])
@@ -732,9 +914,12 @@ class MXeneSROAnalyzer:
                 r.get("alpha_wc_std", np.nan)
             )
 
-        if result.get("wc_layer_summary"):
+        def _add_layer_wc_metrics(
+            summary_rows: List[Dict[str, object]],
+            prefix: str = "",
+        ) -> None:
             by_pair: Dict[Tuple[int, str, str], Dict[int, float]] = {}
-            for r in result["wc_layer_summary"]:
+            for r in summary_rows:
                 key = (int(r["shell_id"]), str(r["central_species"]), str(r["neighbor_species"]))
                 by_pair.setdefault(key, {})[int(r["layer_id"])] = float(
                     r.get("alpha_wc_mean", np.nan)
@@ -742,13 +927,20 @@ class MXeneSROAnalyzer:
             for (shell_id, i, j), lid_map in by_pair.items():
                 vals = [v for _, v in sorted(lid_map.items())]
                 if vals:
-                    row[f"wc_shell{shell_id}_layer_spread_{i}_{j}"] = float(
+                    row[f"{prefix}wc_shell{shell_id}_layer_spread_{i}_{j}"] = float(
                         np.nanmax(vals) - np.nanmin(vals)
                     )
                     lids = sorted(lid_map)
-                    row[f"wc_shell{shell_id}_layer_top_minus_bottom_{i}_{j}"] = float(
+                    row[f"{prefix}wc_shell{shell_id}_layer_top_minus_bottom_{i}_{j}"] = float(
                         lid_map[lids[-1]] - lid_map[lids[0]]
                     )
+        if result.get("wc_layer_summary"):
+            _add_layer_wc_metrics(result["wc_layer_summary"])
+        if result.get("wc_layer_canonical_summary"):
+            _add_layer_wc_metrics(
+                result["wc_layer_canonical_summary"],
+                prefix="canonical_",
+            )
 
         for r in result.get("coord_global_summary", []):
             shell_id = int(r["shell_id"])
@@ -889,13 +1081,17 @@ class MXeneSROAnalyzer:
         ]
         summary_keys = [
             "layer_composition_summary",
+            "layer_composition_canonical_summary",
             "wc_global_summary",
             "wc_layer_summary",
+            "wc_layer_canonical_summary",
             "coord_global_summary",
             "coord_layer_summary",
+            "coord_layer_canonical_summary",
             "mapping_summary",
             "sq_global_summary",
             "sq_layer_summary",
+            "sq_layer_canonical_summary",
         ]
 
         for key, fields in per_frame_specs:

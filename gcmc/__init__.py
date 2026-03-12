@@ -21,6 +21,7 @@ from .cluster_analysis import analyze_and_plot, find_cu_clusters
 from .analysis import (
     MXeneAdsorptionSiteAnalyzer,
     MXeneOrderingAnalyzer,
+    MXeneSROAnalyzer,
     MXeneSurfaceMotifAnalyzer,
 )
 from . import utils
@@ -34,6 +35,7 @@ __all__ = [
     "ReplicaExchange",
     "MXeneAdsorptionSiteAnalyzer",
     "MXeneOrderingAnalyzer",
+    "MXeneSROAnalyzer",
     "MXeneSurfaceMotifAnalyzer",
     "analyze_and_plot",
     "find_cu_clusters",

@@ -22,8 +22,13 @@ class MXeneSROAnalyzer:
 
     Modes:
     - ``reference``: map each frame onto a fixed reference lattice.
-    - ``adaptive``: avoid site mapping and use instantaneous layers plus
-      rank-based neighbor shells derived from the reference coordination.
+    - ``adaptive`` / ``projected_layer``: avoid site mapping, preserve the
+      reference layer populations in each frame, and build same-layer
+      neighbor shells from projected in-plane distances using reference
+      shell coordinations only as counts.
+    - ``xy_reference`` / ``layerwise_reference``: preserve the reference
+      layer populations, assign atoms to the fixed in-plane reference sites
+      within each layer, and evaluate SRO on the reference connectivity.
     """
 
     def __init__(
@@ -66,8 +71,15 @@ class MXeneSROAnalyzer:
             raise ValueError("shell_tol must be > 0.")
         if self.fft_qmax < 0:
             raise ValueError("fft_qmax must be >= 0.")
-        if self.analysis_mode not in {"reference", "adaptive"}:
-            raise ValueError("analysis_mode must be 'reference' or 'adaptive'.")
+        if self.analysis_mode == "projected_layer":
+            self.analysis_mode = "adaptive"
+        if self.analysis_mode == "layerwise_reference":
+            self.analysis_mode = "xy_reference"
+        if self.analysis_mode not in {"reference", "adaptive", "xy_reference"}:
+            raise ValueError(
+                "analysis_mode must be 'reference', 'adaptive', 'projected_layer', "
+                "'xy_reference', or 'layerwise_reference'."
+            )
         if self.canonical_species is not None and self.canonical_species not in self.alloy_elements:
             raise ValueError("canonical_species must be one of alloy_elements.")
         self._prepare_reference()
@@ -188,6 +200,28 @@ class MXeneSROAnalyzer:
         return np.argmin(np.abs(coord_1d[:, None] - centers[None, :]), axis=1)
 
     @staticmethod
+    def _assign_layers_by_counts(
+        coord_1d: np.ndarray,
+        layer_counts: Sequence[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        counts = [int(x) for x in layer_counts]
+        if sum(counts) != int(coord_1d.size):
+            raise ValueError(
+                "Reference layer counts do not match the number of alloy atoms in the frame."
+            )
+        order = np.argsort(coord_1d)
+        layers = np.empty(coord_1d.size, dtype=int)
+        centers = np.empty(len(counts), dtype=float)
+        start = 0
+        for lid, count in enumerate(counts):
+            stop = start + count
+            idx = order[start:stop]
+            layers[idx] = lid
+            centers[lid] = float(np.mean(coord_1d[idx])) if idx.size else float("nan")
+            start = stop
+        return layers, centers
+
+    @staticmethod
     def _cluster_shell_distances(distances: np.ndarray, shell_tol: float) -> np.ndarray:
         positive = np.sort(distances[distances > 1e-8])
         if positive.size == 0:
@@ -223,6 +257,10 @@ class MXeneSROAnalyzer:
             self.reference_positions[:, self.axis_idx],
             self.reference_layer_centers,
         )
+        self.reference_layer_counts = np.array(
+            [int(np.sum(self.reference_layers == lid)) for lid in range(len(self.reference_layer_centers))],
+            dtype=int,
+        )
 
         ref_alloy_atoms = self.reference_atoms[ref_mask]
         dist_matrix = np.asarray(ref_alloy_atoms.get_all_distances(mic=True), dtype=float)
@@ -238,11 +276,22 @@ class MXeneSROAnalyzer:
             )
             central_idx, neighbor_idx = np.where(mask)
             coordination = int(round(float(np.mean(np.sum(mask, axis=1)))))
+            coordination_by_layer: Dict[int, int] = {}
+            for lid in sorted(int(x) for x in np.unique(self.reference_layers)):
+                layer_mask = self.reference_layers == lid
+                same_layer_mask = mask[np.ix_(layer_mask, layer_mask)]
+                if same_layer_mask.size == 0:
+                    coordination_by_layer[int(lid)] = 0
+                    continue
+                coordination_by_layer[int(lid)] = int(
+                    round(float(np.mean(np.sum(same_layer_mask, axis=1))))
+                )
             self.reference_shells.append(
                 {
                     "shell_id": shell_id,
                     "shell_distance_A": float(distance),
                     "coordination_number": coordination,
+                    "coordination_number_by_layer": coordination_by_layer,
                     "central_idx": central_idx.astype(int),
                     "neighbor_idx": neighbor_idx.astype(int),
                 }
@@ -382,43 +431,97 @@ class MXeneSROAnalyzer:
             )
         return symbols[alloy_mask], atoms.positions[alloy_mask].copy()
 
+    def _project_inplane_geometry(
+        self,
+        positions: np.ndarray,
+        cell: np.ndarray,
+        pbc: Sequence[bool] | np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        positions_proj = np.asarray(positions, dtype=float).copy()
+        positions_proj[:, self.axis_idx] = 0.0
+        cell_proj = np.asarray(cell, dtype=float).copy()
+        cell_proj[:, self.axis_idx] = 0.0
+        if pbc is None:
+            pbc_proj = np.ones(3, dtype=bool)
+        else:
+            pbc_proj = np.asarray(pbc, dtype=bool).copy()
+        pbc_proj[self.axis_idx] = False
+        return positions_proj, cell_proj, pbc_proj
+
     def _build_adaptive_shells(
         self, atoms: Atoms
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, object]]]:
         frame_symbols, frame_positions = self._select_frame_alloy_atoms(atoms)
-        layer_centers = self._infer_layer_centers(frame_positions[:, self.axis_idx])
-        frame_layers = self._assign_layers(frame_positions[:, self.axis_idx], layer_centers)
-
-        frame_alloy = atoms[np.isin(atoms.get_chemical_symbols(), self.alloy_elements)]
-        dist_matrix = np.asarray(frame_alloy.get_all_distances(mic=True), dtype=float)
-        order = np.argsort(dist_matrix, axis=1)
-        sorted_dist = np.take_along_axis(dist_matrix, order, axis=1)
+        frame_layers, layer_centers = self._assign_layers_by_counts(
+            frame_positions[:, self.axis_idx],
+            self.reference_layer_counts,
+        )
+        positions_proj, cell_proj, pbc_proj = self._project_inplane_geometry(
+            frame_positions,
+            np.asarray(atoms.get_cell(), dtype=float),
+            atoms.get_pbc(),
+        )
+        unique_layers = sorted(int(x) for x in np.unique(frame_layers))
+        layer_order: Dict[int, np.ndarray] = {}
+        layer_sorted_dist: Dict[int, np.ndarray] = {}
+        layer_indices: Dict[int, np.ndarray] = {}
+        for lid in unique_layers:
+            idx = np.where(frame_layers == lid)[0].astype(int)
+            layer_indices[lid] = idx
+            if idx.size == 0:
+                continue
+            dist_matrix = get_distances(
+                positions_proj[idx],
+                positions_proj[idx],
+                cell=cell_proj,
+                pbc=pbc_proj,
+            )[1]
+            order = np.argsort(dist_matrix, axis=1)
+            sorted_dist = np.take_along_axis(dist_matrix, order, axis=1)
+            layer_order[lid] = order
+            layer_sorted_dist[lid] = sorted_dist
 
         shells: List[Dict[str, object]] = []
-        rank_start = 1
-        max_neighbors = len(frame_positions) - 1
+        rank_start_by_layer = {lid: 1 for lid in unique_layers}
         for shell in self.reference_shells:
-            coord = int(shell.get("coordination_number", 0))
-            if coord <= 0:
+            central_rows: List[np.ndarray] = []
+            neighbor_rows: List[np.ndarray] = []
+            shell_dist_rows: List[np.ndarray] = []
+            coord_by_layer = dict(shell.get("coordination_number_by_layer", {}))
+            for lid in unique_layers:
+                idx = layer_indices.get(lid)
+                if idx is None or idx.size == 0:
+                    continue
+                coord = int(coord_by_layer.get(int(lid), 0))
+                if coord <= 0:
+                    continue
+                rank_start = int(rank_start_by_layer[lid])
+                rank_stop = rank_start + coord
+                if rank_stop > idx.size:
+                    raise ValueError(
+                        "Not enough same-layer neighbors in frame to construct adaptive projected shells."
+                    )
+                order = layer_order[lid][:, rank_start:rank_stop]
+                sorted_dist = layer_sorted_dist[lid][:, rank_start:rank_stop]
+                central_rows.append(np.repeat(idx, coord))
+                neighbor_rows.append(idx[order.reshape(-1)])
+                shell_dist_rows.append(sorted_dist.reshape(-1))
+                rank_start_by_layer[lid] = rank_stop
+            if not central_rows:
                 continue
-            rank_stop = rank_start + coord
-            if rank_stop > max_neighbors + 1:
-                raise ValueError(
-                    "Not enough alloy atoms in frame to construct adaptive neighbor shells."
-                )
-            central_idx = np.repeat(np.arange(len(frame_positions), dtype=int), coord)
-            neighbor_idx = order[:, rank_start:rank_stop].reshape(-1).astype(int)
-            shell_dist = sorted_dist[:, rank_start:rank_stop]
+            central_idx = np.concatenate(central_rows).astype(int)
+            neighbor_idx = np.concatenate(neighbor_rows).astype(int)
+            shell_dist = np.concatenate(shell_dist_rows)
             shells.append(
                 {
                     "shell_id": int(shell["shell_id"]),
                     "shell_distance_A": float(np.mean(shell_dist)),
-                    "coordination_number": coord,
+                    "coordination_number": int(shell.get("coordination_number", 0)),
+                    "coordination_number_by_layer": coord_by_layer,
                     "central_idx": central_idx,
                     "neighbor_idx": neighbor_idx,
                 }
             )
-            rank_start = rank_stop
         return frame_symbols, frame_positions, frame_layers, layer_centers, shells
 
     def _compute_structure_factor_rows_positions(
@@ -520,6 +623,49 @@ class MXeneSROAnalyzer:
         mapped_distances = np.asarray(distance_matrix[row_ind, col_ind], dtype=float)
         return mapped_symbols, mapped_distances, shift_axis
 
+    def _map_frame_xy_reference(
+        self, atoms: Atoms
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        frame_symbols, frame_positions = self._select_frame_alloy_atoms(atoms)
+        frame_layers, layer_centers = self._assign_layers_by_counts(
+            frame_positions[:, self.axis_idx],
+            self.reference_layer_counts,
+        )
+        frame_proj, cell_proj, pbc_proj = self._project_inplane_geometry(
+            frame_positions,
+            np.asarray(atoms.get_cell(), dtype=float),
+            atoms.get_pbc(),
+        )
+        ref_proj, _, _ = self._project_inplane_geometry(
+            self.reference_positions,
+            np.asarray(self.reference_atoms.get_cell(), dtype=float),
+            self.reference_atoms.get_pbc(),
+        )
+
+        mapped_symbols = np.empty(len(self.reference_positions), dtype=object)
+        mapped_distances: List[np.ndarray] = []
+        for lid in range(len(self.reference_layer_counts)):
+            frame_idx = np.where(frame_layers == lid)[0].astype(int)
+            ref_idx = np.where(self.reference_layers == lid)[0].astype(int)
+            if frame_idx.size != ref_idx.size:
+                raise ValueError(
+                    "Frame/reference layer populations do not match for layerwise XY mapping."
+                )
+            distance_matrix = get_distances(
+                frame_proj[frame_idx],
+                ref_proj[ref_idx],
+                cell=cell_proj,
+                pbc=pbc_proj,
+            )[1]
+            row_ind, col_ind = linear_sum_assignment(distance_matrix)
+            mapped_symbols[ref_idx[col_ind]] = frame_symbols[frame_idx[row_ind]]
+            mapped_distances.append(np.asarray(distance_matrix[row_ind, col_ind], dtype=float))
+
+        all_distances = (
+            np.concatenate(mapped_distances).astype(float) if mapped_distances else np.zeros(0, dtype=float)
+        )
+        return mapped_symbols, all_distances, layer_centers
+
     def analyze_trajectory(
         self,
         traj_path: str | Path,
@@ -551,6 +697,28 @@ class MXeneSROAnalyzer:
                         "assignment_rms_A": float(np.sqrt(np.mean(mapped_distances**2))),
                         "assignment_max_A": float(np.max(mapped_distances)),
                         "shift_axis_A": shift_axis,
+                    }
+                )
+            elif self.analysis_mode == "xy_reference":
+                frame_symbols, mapped_distances, frame_layer_centers = self._map_frame_xy_reference(atoms)
+                frame_positions = self.reference_positions
+                frame_layers = self.reference_layers
+                shells = self.reference_shells
+                rows_mapping.append(
+                    {
+                        "traj": str(traj_path),
+                        "frame": frame_idx,
+                        "assignment_rms_A": (
+                            float(np.sqrt(np.mean(mapped_distances**2)))
+                            if mapped_distances.size
+                            else float("nan")
+                        ),
+                        "assignment_max_A": (
+                            float(np.max(mapped_distances))
+                            if mapped_distances.size
+                            else float("nan")
+                        ),
+                        "shift_axis_A": float("nan"),
                     }
                 )
             else:
@@ -694,6 +862,9 @@ class MXeneSROAnalyzer:
                     "shell_id": int(shell["shell_id"]),
                     "shell_distance_A": float(shell["shell_distance_A"]),
                     "coordination_number": int(shell.get("coordination_number", 0)),
+                    "coordination_number_by_layer": dict(
+                        shell.get("coordination_number_by_layer", {})
+                    ),
                 }
                 for shell in self.reference_shells
             ],

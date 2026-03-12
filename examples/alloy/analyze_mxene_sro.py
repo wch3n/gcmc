@@ -35,6 +35,7 @@ CONFIG = SimpleNamespace(
     n_shells=1,
     shell_tol=0.15,
     fft_qmax=1,
+    analysis_mode="reference",  # or "adaptive" for strongly distorted/high-T trajectories
     start=0,
     stop=None,
     step=1,
@@ -73,6 +74,7 @@ def _build_analyzer() -> MXeneSROAnalyzer:
         n_shells=CONFIG.n_shells,
         shell_tol=CONFIG.shell_tol,
         fft_qmax=CONFIG.fft_qmax,
+        analysis_mode=CONFIG.analysis_mode,
         canonicalize_layer_flip=CONFIG.canonicalize_layer_flip,
         canonical_species=CONFIG.canonical_species,
     )

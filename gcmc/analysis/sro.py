@@ -1,4 +1,4 @@
-"""Reference-lattice SRO analysis for relaxed multicomponent MXene trajectories."""
+"""SRO analysis for relaxed multicomponent MXene trajectories."""
 
 from __future__ import annotations
 
@@ -18,7 +18,13 @@ from .ordering import AXIS_MAP, _grouped_mean_std, _write_csv
 
 
 class MXeneSROAnalyzer:
-    """Occupational WC-SRO analysis on a fixed reference metal lattice."""
+    """WC-SRO analysis for MXene alloy sublattices.
+
+    Modes:
+    - ``reference``: map each frame onto a fixed reference lattice.
+    - ``adaptive``: avoid site mapping and use instantaneous layers plus
+      rank-based neighbor shells derived from the reference coordination.
+    """
 
     def __init__(
         self,
@@ -32,6 +38,7 @@ class MXeneSROAnalyzer:
         n_shells: int = 1,
         shell_tol: float = 0.15,
         fft_qmax: int = 0,
+        analysis_mode: str = "reference",
         canonicalize_layer_flip: bool = False,
         canonical_species: str | None = None,
     ) -> None:
@@ -50,6 +57,7 @@ class MXeneSROAnalyzer:
         self.n_shells = int(n_shells)
         self.shell_tol = float(shell_tol)
         self.fft_qmax = int(fft_qmax)
+        self.analysis_mode = str(analysis_mode).lower()
         self.canonicalize_layer_flip = bool(canonicalize_layer_flip)
         self.canonical_species = canonical_species
         if self.n_shells < 1:
@@ -58,6 +66,8 @@ class MXeneSROAnalyzer:
             raise ValueError("shell_tol must be > 0.")
         if self.fft_qmax < 0:
             raise ValueError("fft_qmax must be >= 0.")
+        if self.analysis_mode not in {"reference", "adaptive"}:
+            raise ValueError("analysis_mode must be 'reference' or 'adaptive'.")
         if self.canonical_species is not None and self.canonical_species not in self.alloy_elements:
             raise ValueError("canonical_species must be one of alloy_elements.")
         self._prepare_reference()
@@ -227,10 +237,12 @@ class MXeneSROAnalyzer:
                 ~np.eye(len(dist_matrix), dtype=bool)
             )
             central_idx, neighbor_idx = np.where(mask)
+            coordination = int(round(float(np.mean(np.sum(mask, axis=1)))))
             self.reference_shells.append(
                 {
                     "shell_id": shell_id,
                     "shell_distance_A": float(distance),
+                    "coordination_number": coordination,
                     "central_idx": central_idx.astype(int),
                     "neighbor_idx": neighbor_idx.astype(int),
                 }
@@ -301,7 +313,8 @@ class MXeneSROAnalyzer:
     ) -> Tuple[Dict[int, bool], str | None]:
         if not self.canonicalize_layer_flip or not layer_rows:
             return {}, None
-        if len(self.reference_layer_centers) != 2:
+        n_layers = len({int(row["layer_id"]) for row in layer_rows})
+        if n_layers != 2:
             raise ValueError(
                 "canonicalize_layer_flip currently requires exactly 2 alloy layers."
             )
@@ -352,6 +365,128 @@ class MXeneSROAnalyzer:
             out_rows.append(out_row)
         return out_rows
 
+    def _select_frame_alloy_atoms(
+        self,
+        atoms: Atoms,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        symbols = np.array(atoms.get_chemical_symbols(), dtype=object)
+        alloy_mask = np.isin(symbols, self.alloy_elements)
+        if not np.any(alloy_mask):
+            raise ValueError(
+                f"No atoms matched alloy_elements={self.alloy_elements} in frame."
+            )
+        if int(np.sum(alloy_mask)) != len(self.reference_positions):
+            raise ValueError(
+                "Frame alloy-site count does not match the reference alloy-site count. "
+                "Adaptive SRO analysis still assumes a fixed substitutional alloy sublattice."
+            )
+        return symbols[alloy_mask], atoms.positions[alloy_mask].copy()
+
+    def _build_adaptive_shells(
+        self, atoms: Atoms
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict[str, object]]]:
+        frame_symbols, frame_positions = self._select_frame_alloy_atoms(atoms)
+        layer_centers = self._infer_layer_centers(frame_positions[:, self.axis_idx])
+        frame_layers = self._assign_layers(frame_positions[:, self.axis_idx], layer_centers)
+
+        frame_alloy = atoms[np.isin(atoms.get_chemical_symbols(), self.alloy_elements)]
+        dist_matrix = np.asarray(frame_alloy.get_all_distances(mic=True), dtype=float)
+        order = np.argsort(dist_matrix, axis=1)
+        sorted_dist = np.take_along_axis(dist_matrix, order, axis=1)
+
+        shells: List[Dict[str, object]] = []
+        rank_start = 1
+        max_neighbors = len(frame_positions) - 1
+        for shell in self.reference_shells:
+            coord = int(shell.get("coordination_number", 0))
+            if coord <= 0:
+                continue
+            rank_stop = rank_start + coord
+            if rank_stop > max_neighbors + 1:
+                raise ValueError(
+                    "Not enough alloy atoms in frame to construct adaptive neighbor shells."
+                )
+            central_idx = np.repeat(np.arange(len(frame_positions), dtype=int), coord)
+            neighbor_idx = order[:, rank_start:rank_stop].reshape(-1).astype(int)
+            shell_dist = sorted_dist[:, rank_start:rank_stop]
+            shells.append(
+                {
+                    "shell_id": int(shell["shell_id"]),
+                    "shell_distance_A": float(np.mean(shell_dist)),
+                    "coordination_number": coord,
+                    "central_idx": central_idx,
+                    "neighbor_idx": neighbor_idx,
+                }
+            )
+            rank_start = rank_stop
+        return frame_symbols, frame_positions, frame_layers, layer_centers, shells
+
+    def _compute_structure_factor_rows_positions(
+        self,
+        traj_path: Path,
+        frame_idx: int,
+        positions: np.ndarray,
+        species: np.ndarray,
+        layers: np.ndarray,
+    ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+        if not self.reference_q_grid:
+            return [], []
+
+        phase_matrix = np.exp(-1j * (positions @ self.reference_q_vectors.T))
+        occ = np.vstack([(species == el).astype(float) for el in self.alloy_elements])
+        conc = np.mean(occ, axis=1)
+        amp = (occ - conc[:, None]) @ phase_matrix
+        n_sites = int(len(species))
+
+        rows_global: List[Dict[str, object]] = []
+        rows_layer: List[Dict[str, object]] = []
+        for q_idx, q_meta in enumerate(self.reference_q_grid):
+            for i_idx, el_i in enumerate(self.alloy_elements):
+                for j_idx, el_j in enumerate(self.alloy_elements):
+                    sq_val = amp[i_idx, q_idx] * np.conjugate(amp[j_idx, q_idx]) / n_sites
+                    rows_global.append(
+                        {
+                            "traj": str(traj_path),
+                            "frame": frame_idx,
+                            **q_meta,
+                            "species_i": el_i,
+                            "species_j": el_j,
+                            "sq_real": float(np.real(sq_val)),
+                            "sq_imag": float(np.imag(sq_val)),
+                            "sq_abs": float(np.abs(sq_val)),
+                        }
+                    )
+
+        unique_layers = sorted(int(x) for x in np.unique(layers))
+        for lid in unique_layers:
+            layer_mask = layers == lid
+            n_layer = int(np.sum(layer_mask))
+            if n_layer == 0:
+                continue
+            layer_phase = phase_matrix[layer_mask]
+            layer_species = species[layer_mask]
+            layer_occ = np.vstack([(layer_species == el).astype(float) for el in self.alloy_elements])
+            layer_conc = np.mean(layer_occ, axis=1)
+            layer_amp = (layer_occ - layer_conc[:, None]) @ layer_phase
+            for q_idx, q_meta in enumerate(self.reference_q_grid):
+                for i_idx, el_i in enumerate(self.alloy_elements):
+                    for j_idx, el_j in enumerate(self.alloy_elements):
+                        sq_val = layer_amp[i_idx, q_idx] * np.conjugate(layer_amp[j_idx, q_idx]) / n_layer
+                        rows_layer.append(
+                            {
+                                "traj": str(traj_path),
+                                "frame": frame_idx,
+                                "layer_id": lid,
+                                **q_meta,
+                                "species_i": el_i,
+                                "species_j": el_j,
+                                "sq_real": float(np.real(sq_val)),
+                                "sq_imag": float(np.imag(sq_val)),
+                                "sq_abs": float(np.abs(sq_val)),
+                            }
+                        )
+        return rows_global, rows_layer
+
     def _map_frame_to_reference(
         self, atoms: Atoms
     ) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -385,76 +520,6 @@ class MXeneSROAnalyzer:
         mapped_distances = np.asarray(distance_matrix[row_ind, col_ind], dtype=float)
         return mapped_symbols, mapped_distances, shift_axis
 
-    def _compute_structure_factor_rows(
-        self,
-        traj_path: Path,
-        frame_idx: int,
-        mapped_symbols: np.ndarray,
-    ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-        if not self.reference_q_grid:
-            return [], []
-
-        rows_global: List[Dict[str, object]] = []
-        rows_layer: List[Dict[str, object]] = []
-        n_q = len(self.reference_q_grid)
-
-        global_occ = np.vstack(
-            [(mapped_symbols == el).astype(float) for el in self.alloy_elements]
-        )
-        global_conc = np.mean(global_occ, axis=1)
-        global_amp = (global_occ - global_conc[:, None]) @ self.reference_phase_matrix
-        n_sites = int(global_occ.shape[1])
-
-        for q_idx in range(n_q):
-            q_meta = self.reference_q_grid[q_idx]
-            for i_idx, el_i in enumerate(self.alloy_elements):
-                for j_idx, el_j in enumerate(self.alloy_elements):
-                    sq_val = global_amp[i_idx, q_idx] * np.conjugate(global_amp[j_idx, q_idx]) / n_sites
-                    rows_global.append(
-                        {
-                            "traj": str(traj_path),
-                            "frame": frame_idx,
-                            **q_meta,
-                            "species_i": el_i,
-                            "species_j": el_j,
-                            "sq_real": float(np.real(sq_val)),
-                            "sq_imag": float(np.imag(sq_val)),
-                            "sq_abs": float(np.abs(sq_val)),
-                        }
-                    )
-
-        for lid in range(len(self.reference_layer_centers)):
-            layer_mask = self.reference_layers == lid
-            n_layer = int(np.sum(layer_mask))
-            if n_layer == 0:
-                continue
-            layer_phase = self.reference_phase_matrix[layer_mask]
-            layer_symbols = mapped_symbols[layer_mask]
-            layer_occ = np.vstack(
-                [(layer_symbols == el).astype(float) for el in self.alloy_elements]
-            )
-            layer_conc = np.mean(layer_occ, axis=1)
-            layer_amp = (layer_occ - layer_conc[:, None]) @ layer_phase
-            for q_idx in range(n_q):
-                q_meta = self.reference_q_grid[q_idx]
-                for i_idx, el_i in enumerate(self.alloy_elements):
-                    for j_idx, el_j in enumerate(self.alloy_elements):
-                        sq_val = layer_amp[i_idx, q_idx] * np.conjugate(layer_amp[j_idx, q_idx]) / n_layer
-                        rows_layer.append(
-                            {
-                                "traj": str(traj_path),
-                                "frame": frame_idx,
-                                "layer_id": lid,
-                                **q_meta,
-                                "species_i": el_i,
-                                "species_j": el_j,
-                                "sq_real": float(np.real(sq_val)),
-                                "sq_imag": float(np.imag(sq_val)),
-                                "sq_abs": float(np.abs(sq_val)),
-                            }
-                        )
-        return rows_global, rows_layer
-
     def analyze_trajectory(
         self,
         traj_path: str | Path,
@@ -473,45 +538,59 @@ class MXeneSROAnalyzer:
         rows_sq_layer: List[Dict[str, object]] = []
 
         for frame_idx, atoms in self._iter_frames(traj_path, start=start, stop=stop, step=step):
-            mapped_symbols, mapped_distances, shift_axis = self._map_frame_to_reference(atoms)
-            conc = {el: float(np.mean(mapped_symbols == el)) for el in self.alloy_elements}
-            rows_mapping.append(
-                {
-                    "traj": str(traj_path),
-                    "frame": frame_idx,
-                    "assignment_rms_A": float(np.sqrt(np.mean(mapped_distances**2))),
-                    "assignment_max_A": float(np.max(mapped_distances)),
-                    "shift_axis_A": shift_axis,
-                }
-            )
+            if self.analysis_mode == "reference":
+                frame_symbols, mapped_distances, shift_axis = self._map_frame_to_reference(atoms)
+                frame_positions = self.reference_positions
+                frame_layers = self.reference_layers
+                frame_layer_centers = self.reference_layer_centers
+                shells = self.reference_shells
+                rows_mapping.append(
+                    {
+                        "traj": str(traj_path),
+                        "frame": frame_idx,
+                        "assignment_rms_A": float(np.sqrt(np.mean(mapped_distances**2))),
+                        "assignment_max_A": float(np.max(mapped_distances)),
+                        "shift_axis_A": shift_axis,
+                    }
+                )
+            else:
+                (
+                    frame_symbols,
+                    frame_positions,
+                    frame_layers,
+                    frame_layer_centers,
+                    shells,
+                ) = self._build_adaptive_shells(atoms)
 
-            for lid in range(len(self.reference_layer_centers)):
-                in_layer = self.reference_layers == lid
+            conc = {el: float(np.mean(frame_symbols == el)) for el in self.alloy_elements}
+
+            for lid in sorted(int(x) for x in np.unique(frame_layers)):
+                in_layer = frame_layers == lid
                 n_layer = int(np.sum(in_layer))
                 row = {
                     "traj": str(traj_path),
                     "frame": frame_idx,
                     "layer_id": lid,
-                    "layer_pos_ref_A": float(self.reference_layer_centers[lid]),
+                    "layer_pos_ref_A": float(frame_layer_centers[lid]),
                     "n_alloy_layer": n_layer,
                 }
                 for el in self.alloy_elements:
-                    n_el = int(np.sum(mapped_symbols[in_layer] == el))
+                    n_el = int(np.sum(frame_symbols[in_layer] == el))
                     row[f"count_{el}"] = n_el
                     row[f"frac_{el}"] = float(n_el / n_layer) if n_layer > 0 else float("nan")
                 rows_layer_comp.append(row)
 
-            for shell in self.reference_shells:
+            for shell in shells:
                 shell_id = int(shell["shell_id"])
                 shell_distance = float(shell["shell_distance_A"])
                 central_idx = np.asarray(shell["central_idx"], dtype=int)
                 neighbor_idx = np.asarray(shell["neighbor_idx"], dtype=int)
-                central_symbols = mapped_symbols[central_idx]
-                neighbor_symbols = mapped_symbols[neighbor_idx]
-                central_layers = self.reference_layers[central_idx]
+                central_symbols = frame_symbols[central_idx]
+                neighbor_symbols = frame_symbols[neighbor_idx]
+                central_layers = frame_layers[central_idx]
 
                 for el_i in self.alloy_elements:
-                    n_atoms_i = int(np.sum(mapped_symbols == el_i))
+                    n_atoms_i = int(np.sum(frame_symbols == el_i))
                     mask_i = central_symbols == el_i
                     total_neighbors_i = int(np.sum(mask_i))
                     rows_coord_global.append(
@@ -549,11 +628,11 @@ class MXeneSROAnalyzer:
                             }
                         )
 
-                for lid in range(len(self.reference_layer_centers)):
+                for lid in range(len(frame_layer_centers)):
                     layer_mask = central_layers == lid
                     for el_i in self.alloy_elements:
                         n_atoms_i_layer = int(
-                            np.sum((self.reference_layers == lid) & (mapped_symbols == el_i))
+                            np.sum((frame_layers == lid) & (frame_symbols == el_i))
                         )
                         mask_i_layer = layer_mask & (central_symbols == el_i)
                         total_neighbors_i_layer = int(np.sum(mask_i_layer))
@@ -595,22 +674,26 @@ class MXeneSROAnalyzer:
                                 }
                             )
 
-            sq_global, sq_layer = self._compute_structure_factor_rows(
+            sq_global, sq_layer = self._compute_structure_factor_rows_positions(
                 traj_path=traj_path,
                 frame_idx=frame_idx,
-                mapped_symbols=mapped_symbols,
+                positions=frame_positions,
+                species=frame_symbols,
+                layers=frame_layers,
             )
             rows_sq_global.extend(sq_global)
             rows_sq_layer.extend(sq_layer)
 
         result = {
             "traj": str(traj_path),
+            "analysis_mode": self.analysis_mode,
             "reference_layer_centers_A": self.reference_layer_centers,
             "reference_site_indices": self.reference_site_indices.astype(int).tolist(),
             "reference_shells": [
                 {
                     "shell_id": int(shell["shell_id"]),
                     "shell_distance_A": float(shell["shell_distance_A"]),
+                    "coordination_number": int(shell.get("coordination_number", 0)),
                 }
                 for shell in self.reference_shells
             ],
@@ -806,6 +889,7 @@ class MXeneSROAnalyzer:
         row: Dict[str, object] = {
             "traj": traj,
             "temperature_K": self._parse_temperature_from_traj_name(traj),
+            "analysis_mode": str(result.get("analysis_mode", self.analysis_mode)),
             "n_layers": int(len(result.get("reference_layer_centers_A", []))),
             "n_shells": int(len(result.get("reference_shells", []))),
             "n_q_points": int(len(result.get("reference_q_grid", []))),
@@ -815,6 +899,8 @@ class MXeneSROAnalyzer:
         frame_map = self._group_rows_by_frame(layer_rows)
         frame_ids = sorted(frame_map)
         row["n_frames"] = len(frame_ids)
+        if layer_rows:
+            row["n_layers"] = len({int(r["layer_id"]) for r in layer_rows})
         row["canonicalize_layer_flip"] = bool(result.get("canonicalize_layer_flip", False))
         row["n_flipped_frames"] = int(result.get("n_flipped_frames", 0))
         row["flip_fraction"] = float(result.get("flip_fraction", 0.0))

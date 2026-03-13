@@ -15,6 +15,58 @@ from ase.geometry import find_mic
 from scipy.spatial import Delaunay
 
 
+def _cluster_axis_values(values: np.ndarray, tol: float) -> List[np.ndarray]:
+    """Cluster sorted 1D coordinates using a simple absolute tolerance."""
+    if tol <= 0:
+        raise ValueError("tol must be > 0.")
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return []
+
+    order = np.argsort(values)
+    sorted_values = values[order]
+    clusters: List[List[int]] = [[int(order[0])]]
+    cluster_mean = float(sorted_values[0])
+
+    for sorted_idx, original_idx in enumerate(order[1:], start=1):
+        value = float(sorted_values[sorted_idx])
+        if abs(value - cluster_mean) <= tol:
+            clusters[-1].append(int(original_idx))
+            cluster_mean = float(np.mean(values[clusters[-1]]))
+        else:
+            clusters.append([int(original_idx)])
+            cluster_mean = value
+
+    return [np.asarray(cluster, dtype=int) for cluster in clusters]
+
+
+def _select_site_layers_for_coverage(
+    n_sites: int,
+    coverage: float,
+    rng: np.random.Generator,
+) -> List[np.ndarray]:
+    """Return the site indices occupied in each full/partial coverage layer."""
+    if n_sites <= 0:
+        raise ValueError("n_sites must be > 0.")
+    if coverage < 0:
+        raise ValueError("coverage must be >= 0.")
+
+    all_site_indices = np.arange(n_sites, dtype=int)
+    n_full_layers = int(np.floor(coverage))
+    frac_layer = float(coverage - n_full_layers)
+    selected_layers = [all_site_indices.copy() for _ in range(n_full_layers)]
+
+    if frac_layer > 1e-8:
+        n_partial = int(np.floor(frac_layer * n_sites + 0.5))
+        n_partial = min(n_sites, max(0, n_partial))
+        if n_partial > 0:
+            selected_layers.append(
+                np.asarray(rng.choice(n_sites, n_partial, replace=False), dtype=int)
+            )
+
+    return selected_layers
+
+
 def generate_nonuniform_temperature_grid(
     T_start: float,
     T_end: float,
@@ -193,6 +245,7 @@ def classify_hollow_sites(
     element: str = "Ti",
     xy_tol: float = 0.5,
     stacking: Literal["fcc", "hcp"] = "fcc",
+    layer_tol: float = 0.5,
 ) -> np.ndarray:
     """
     Select hollow sites above a specific substrate layer (fcc = third, hcp = second).
@@ -203,21 +256,25 @@ def classify_hollow_sites(
         element: Substrate atom symbol.
         xy_tol: Lateral tolerance for matching hollow to substrate site.
         stacking: "fcc" or "hcp".
+        layer_tol: Tolerance for clustering substrate z-layers.
 
     Returns:
         (K,2) array of selected hollow xy positions.
     """
     subs = [atom for atom in atoms if atom.symbol == element]
+    if not subs:
+        raise ValueError(f"No atoms with symbol '{element}' in atoms object.")
     zvals = np.array([atom.position[2] for atom in subs])
-    unique_layers = np.unique(np.round(zvals, 0))
-    z_layers = np.sort(unique_layers)[::-1]
-    if len(z_layers) < 3:
+    layer_clusters = _cluster_axis_values(zvals, tol=layer_tol)
+    layer_clusters = sorted(
+        layer_clusters,
+        key=lambda cluster: float(np.mean(zvals[cluster])),
+        reverse=True,
+    )
+    if len(layer_clusters) < 3:
         raise RuntimeError("Not enough substrate layers to classify hollows.")
     idx = 2 if stacking == "fcc" else 1
-    ref_z = z_layers[idx]
-    ref_atoms = [
-        atom for atom in subs if abs(np.round(atom.position[2], 0) - ref_z) < 1e-3
-    ]
+    ref_atoms = [subs[int(i)] for i in layer_clusters[idx]]
 
     # Prepare the cell for PBC operations.
     cell = atoms.cell.array  # Shape (3, 3).
@@ -282,32 +339,8 @@ def generate_adsorbate_configuration(
     n_sites = len(site_xy)
     if n_sites == 0:
         raise RuntimeError("*** NO REGISTRY SITES AVAILABLE ***")
-    # Handle multilayer coverage.
-    n_layers = int(np.floor(coverage))
-    frac_layer = coverage - n_layers
-    # Add an integer number of layers.
-    for ilayer in range(n_layers):
-        for xy in site_xy:
-            neighbors_z = []
-            for atom in atoms_new:
-                dxyz = np.zeros(3)
-                dxyz[:2] = atom.position[:2] - xy
-                dxyz_mic, _ = find_mic(dxyz.reshape(1, 3), cell, atoms_new.pbc)
-                if np.linalg.norm(dxyz_mic[0][:2]) < support_xy_tol:
-                    neighbors_z.append(atom.position[2])
-            if not neighbors_z:
-                raise RuntimeError(
-                    f"No support found at site {xy} for adsorbate placement."
-                )
-            z_max = max(neighbors_z)
-            pos = np.array([xy[0], xy[1], z_max + vertical_offset])
-            atoms_new.append(Atom(element, pos))
-    # Add a partial layer if needed.
-    if frac_layer > 1e-8:
-        n_partial = int(np.floor(frac_layer * n_sites + 0.5))
-        n_partial = min(n_sites, max(0, n_partial))
-        chosen = rng.choice(n_sites, n_partial, replace=False)
-        for xy in site_xy[chosen]:
+    for layer_indices in _select_site_layers_for_coverage(n_sites, coverage, rng):
+        for xy in site_xy[np.asarray(layer_indices, dtype=int)]:
             neighbors_z = []
             for atom in atoms_new:
                 dxyz = np.zeros(3)

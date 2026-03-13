@@ -12,6 +12,7 @@ from ase.symbols import string2symbols
 from .base import SurfaceMCBase
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .utils import (
+    _select_site_layers_for_coverage,
     classify_hollow_sites,
     get_hollow_xy,
     get_toplayer_xy,
@@ -112,18 +113,8 @@ def _place_adsorbate_template(
     if len(tags) != len(atoms_new):
         tags = np.zeros(len(atoms_new), dtype=int)
 
-    all_site_indices = np.arange(n_sites)
-    n_full_layers = int(np.floor(coverage))
-    frac_layer = coverage - n_full_layers
-    selected_layers = [all_site_indices for _ in range(n_full_layers)]
-    if frac_layer > 1e-8:
-        n_partial = int(np.floor(frac_layer * n_sites + 0.5))
-        n_partial = min(n_sites, max(0, n_partial))
-        if n_partial > 0:
-            selected_layers.append(rng.choice(n_sites, n_partial, replace=False))
-
     group_id = 0
-    for layer_indices in selected_layers:
+    for layer_indices in _select_site_layers_for_coverage(n_sites, coverage, rng):
         for site_idx in np.asarray(layer_indices, dtype=int):
             xy = np.asarray(site_xy[site_idx], dtype=float)
             neighbors_z = []
@@ -185,6 +176,7 @@ class AdsorbateCMC(SurfaceMCBase):
         rotation_max_angle_deg: float = 25.0,
         min_moves_per_sweep: int = 5,
         xy_tol: float = 0.5,
+        same_site_tol: Optional[float] = None,
         support_xy_tol: Optional[float] = None,
         z_max_support: float = 3.5,
         vertical_offset: float = 1.8,
@@ -243,6 +235,8 @@ class AdsorbateCMC(SurfaceMCBase):
 
         if support_xy_tol is None:
             support_xy_tol = xy_tol
+        if same_site_tol is None:
+            same_site_tol = xy_tol
 
         super().__init__(
             atoms=self.atoms,
@@ -304,6 +298,7 @@ class AdsorbateCMC(SurfaceMCBase):
         self.rotation_max_angle_rad = np.deg2rad(float(rotation_max_angle_deg))
         self.min_moves_per_sweep = int(min_moves_per_sweep)
         self.xy_tol = xy_tol
+        self.same_site_tol = float(same_site_tol)
         self.support_xy_tol = support_xy_tol
         self.z_max_support = z_max_support
         self.vertical_offset = vertical_offset
@@ -487,6 +482,7 @@ class AdsorbateCMC(SurfaceMCBase):
         coverage: float = 1.0,
         site_type: str = "fcc",
         xy_tol: float = 0.5,
+        same_site_tol: Optional[float] = None,
         support_xy_tol: Optional[float] = None,
         vertical_offset: float = 1.8,
         detach_tol: float = 3.0,
@@ -496,6 +492,8 @@ class AdsorbateCMC(SurfaceMCBase):
     ) -> "AdsorbateCMC":
         if support_xy_tol is None:
             support_xy_tol = xy_tol
+        if same_site_tol is None:
+            same_site_tol = xy_tol
         if functional_elements is None:
             functional_elements = tuple(
                 sorted(
@@ -545,6 +543,7 @@ class AdsorbateCMC(SurfaceMCBase):
             coverage=coverage,
             site_type=site_type,
             xy_tol=xy_tol,
+            same_site_tol=same_site_tol,
             support_xy_tol=support_xy_tol,
             vertical_offset=vertical_offset,
             detach_tol=detach_tol,
@@ -829,7 +828,7 @@ class AdsorbateCMC(SurfaceMCBase):
             mic_xy = get_distances(
                 np.zeros((1, 3)), delta_xyz, cell=cell, pbc=pbc
             )[1].flatten()[0]
-            if mic_xy < 0.5 * self.xy_tol:
+            if mic_xy < self.same_site_tol:
                 continue
 
             new_z = self._candidate_support_z(xy, exclude_indices=group)
@@ -979,7 +978,6 @@ class AdsorbateCMC(SurfaceMCBase):
                     self.accepted_moves += 1
                     if self.relax:
                         self._site_xy = None
-                    self._update_indices()
                     if accepted_writer is not None:
                         accepted_writer.write(self.atoms)
                 elif rejected_writer is not None:

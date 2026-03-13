@@ -4,6 +4,7 @@ import os
 import pickle
 from typing import Any, Optional, List, Union, Dict, Tuple
 from ase import Atoms
+from ase import units
 from ase.io import read, Trajectory
 from ase.constraints import FixAtoms, FixCartesian
 from ase.md.verlet import VelocityVerlet

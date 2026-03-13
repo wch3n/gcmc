@@ -7,6 +7,7 @@ from ase import Atoms
 from ase.io import Trajectory, write, read
 from scipy.spatial import cKDTree
 from .alloy_cmc import AlloyCMC
+from .constants import KB_EV_PER_K
 
 logger = logging.getLogger("mc")
 
@@ -125,7 +126,7 @@ class SemiGrandAlloyMC(AlloyCMC):
 
                 # 3. Acceptance.
                 if delta_phi < 0 or (
-                    self.rng.random() < np.exp(-delta_phi / (8.617e-5 * self.T))
+                    self.rng.random() < np.exp(-delta_phi / (KB_EV_PER_K * self.T))
                 ):
                     # Accept move.
                     self.raw_potential_energy = e_new_raw
@@ -215,7 +216,7 @@ class SemiGrandAlloyMC(AlloyCMC):
             ),
         }
         if self.n_samples > 0:
-            kB = 8.617333e-5
+            kB = KB_EV_PER_K
             avg_phi = self.sum_phi / self.n_samples
             avg_E = self.sum_E / self.n_samples
             var_phi = (self.sum_phi_sq / self.n_samples) - (avg_phi**2)

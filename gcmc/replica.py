@@ -3,11 +3,11 @@ import logging
 import os
 import pickle
 import time
+from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .execution_backends import build_replica_backend
 from .utils import generate_nonuniform_temperature_grid
 
 logger = logging.getLogger("mc")
-ADSORBATE_TAG_OFFSET = 1_000_000
 
 
 def _count_tagged_adsorbate_groups(atoms):
@@ -244,7 +244,7 @@ class ReplicaExchange:
     def run(self, n_cycles, equilibration_cycles=0):
         self._start_workers()
         logger.info(f"Starting PT Loop: Cycles {self.cycle_start} -> {n_cycles}")
-        kB = 8.617333e-5
+        kB = KB_EV_PER_K
 
         try:
             for cycle in range(self.cycle_start, n_cycles):
@@ -441,7 +441,7 @@ class ReplicaExchange:
             logger.info("PT Completed.")
 
     def _attempt_swaps(self, cycle):
-        kB = 8.617333e-5
+        kB = KB_EV_PER_K
         stride = self.swap_stride
         n = len(self.replica_states)
         phase = self.rng.integers(0, stride)

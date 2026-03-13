@@ -9,6 +9,7 @@ from ase.io import write, read
 from ase.io.trajectory import Trajectory
 from ase.geometry import find_mic, get_distances
 from ase.neighborlist import neighbor_list
+from .constants import KB_EV_PER_K
 
 logger = logging.getLogger("gcmc")
 logger.setLevel(logging.INFO)
@@ -406,7 +407,7 @@ class GCMC:
                     if self.T_anneal is not None and self.nsteps_anneal is not None and sweep == self.nsteps_anneal:
                         logger.info(f"Switching to production T={self.T_prod} K at sweep {sweep}")
                     self.T = self.T_prod
-                self.beta = 1 / (8.617333e-5 * self.T)
+                self.beta = 1 / (KB_EV_PER_K * self.T)
 
                 N_ads = len(self._get_adsorbate_atoms())
                 n_moves = max(N_ads, self.min_moves)

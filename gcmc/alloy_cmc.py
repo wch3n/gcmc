@@ -5,7 +5,6 @@ import pickle
 from typing import Any, Optional, List, Union, Dict, Tuple
 from ase import Atoms
 from ase.io import read, Trajectory
-from ase import units
 from ase.constraints import FixAtoms, FixCartesian
 from ase.md.verlet import VelocityVerlet
 from ase.md.langevin import Langevin
@@ -13,6 +12,7 @@ from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
 from ase.neighborlist import neighbor_list
 
 from .base import BaseMC
+from .constants import KB_EV_PER_K
 
 logger = logging.getLogger("mc")
 
@@ -316,7 +316,7 @@ class AlloyCMC(BaseMC):
         if delta_e < 0:
             return True
         if beta is None:
-            beta = 1.0 / (8.617e-5 * self.T)
+            beta = 1.0 / (KB_EV_PER_K * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
 
     def _apply_planar_constraint(self, atoms_obj: Atoms) -> None:
@@ -482,7 +482,7 @@ class AlloyCMC(BaseMC):
         # Optional start-of-run header can be added here if needed.
 
         for sweep in range(nsweeps):
-            beta = 1.0 / (8.617e-5 * self.T)
+            beta = 1.0 / (KB_EV_PER_K * self.T)
             if self.neighbor_cache and self.swap_mode in ("neighbor", "hybrid"):
                 self._ensure_neighbor_cache()
             for i in range(moves_per_sweep):
@@ -569,7 +569,7 @@ class AlloyCMC(BaseMC):
                 Cv = 0.0
                 if self.n_samples > 1:
                     var = (self.sum_E_sq / self.n_samples) - (avg**2)
-                    Cv = var / (8.617e-5 * self.T**2)
+                    Cv = var / (KB_EV_PER_K * self.T**2)
 
                 log_msg = (
                     f"T={self.T:4.0f}K | {self.sweep:6d} | E: {self.e_old:10.4f} | "
@@ -607,7 +607,7 @@ class AlloyCMC(BaseMC):
         final_Cv = 0.0
         if self.n_samples > 1:
             var = (self.sum_E_sq / self.n_samples) - (final_avg**2)
-            final_Cv = var / (8.617e-5 * self.T**2)
+            final_Cv = var / (KB_EV_PER_K * self.T**2)
 
         return {
             "T": self.T,

@@ -10,6 +10,7 @@ from ase.io import Trajectory, read, write
 from ase.symbols import string2symbols
 
 from .base import BaseMC
+from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .utils import (
     classify_hollow_sites,
     get_hollow_xy,
@@ -17,7 +18,6 @@ from .utils import (
 )
 
 logger = logging.getLogger("mc")
-ADSORBATE_TAG_OFFSET = 1_000_000
 
 
 def _load_adsorbate_template(
@@ -592,7 +592,7 @@ class AdsorbateCMC(BaseMC):
         if delta_e < 0.0:
             return True
         if beta is None:
-            beta = 1.0 / (8.617333e-5 * self.T)
+            beta = 1.0 / (KB_EV_PER_K * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
 
     def _moves_per_sweep(self) -> int:
@@ -934,7 +934,7 @@ class AdsorbateCMC(BaseMC):
             logger.warning("AdsorbateCMC run started with no adsorbates present.")
 
         for sweep in range(nsweeps):
-            beta = 1.0 / (8.617333e-5 * self.T)
+            beta = 1.0 / (KB_EV_PER_K * self.T)
             moves_this_sweep = self._moves_per_sweep()
 
             for i in range(moves_this_sweep):
@@ -1005,7 +1005,7 @@ class AdsorbateCMC(BaseMC):
                 cv = 0.0
                 if self.n_samples > 1:
                     var = (self.sum_E_sq / self.n_samples) - (avg**2)
-                    cv = var / (8.617333e-5 * self.T**2)
+                    cv = var / (KB_EV_PER_K * self.T**2)
 
                 logger.info(
                     f"T={self.T:4.0f}K | {self.sweep:6d} | "
@@ -1029,7 +1029,7 @@ class AdsorbateCMC(BaseMC):
         final_cv = 0.0
         if self.n_samples > 1:
             var = (self.sum_E_sq / self.n_samples) - (final_avg**2)
-            final_cv = var / (8.617333e-5 * self.T**2)
+            final_cv = var / (KB_EV_PER_K * self.T**2)
 
         return {
             "T": self.T,

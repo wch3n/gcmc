@@ -276,6 +276,7 @@ class ReplicaExchange:
                         "T": state["T"],
                         "positions": atoms.get_positions(),
                         "numbers": atoms.get_atomic_numbers(),
+                        "tags": atoms.get_tags(),
                         "cell": atoms.get_cell(),
                         "pbc": atoms.get_pbc(),
                         "e_old": state["e_old"],
@@ -310,6 +311,7 @@ class ReplicaExchange:
                     # 1. Update state.
                     state["atoms"].set_positions(res["positions"])
                     state["atoms"].set_atomic_numbers(res["numbers"])
+                    state["atoms"].set_tags(res["tags"])
                     state["atoms"].set_cell(res["cell"])
                     state["atoms"].pbc = res["pbc"]
                     state["e_old"] = res["e_old"]
@@ -422,10 +424,17 @@ class ReplicaExchange:
 
                 self._attempt_swaps(cycle)
 
-                if (cycle + 1) % self.checkpoint_interval == 0:
+                if (
+                    self.checkpoint_interval > 0
+                    and (cycle + 1) % self.checkpoint_interval == 0
+                ):
                     self._save_master_checkpoint(cycle + 1)
 
-            self._save_master_checkpoint(n_cycles)
+            if (
+                self.checkpoint_interval > 0
+                and (n_cycles == 0 or n_cycles % self.checkpoint_interval != 0)
+            ):
+                self._save_master_checkpoint(n_cycles)
 
         finally:
             self.stop()
@@ -471,6 +480,7 @@ class ReplicaExchange:
                 "rng_state": state["rng_state"],
                 "positions": state["atoms"].get_positions(),
                 "numbers": state["atoms"].get_atomic_numbers(),
+                "tags": state["atoms"].get_tags(),
                 "cell": state["atoms"].get_cell(),
                 "pbc": state["atoms"].get_pbc(),
             }
@@ -511,6 +521,8 @@ class ReplicaExchange:
                         ).bit_generator.state
                     state["atoms"].set_positions(s_data["positions"])
                     state["atoms"].set_atomic_numbers(s_data["numbers"])
+                    if "tags" in s_data:
+                        state["atoms"].set_tags(s_data["tags"])
                     state["atoms"].set_cell(s_data["cell"])
                     state["atoms"].pbc = s_data["pbc"]
 

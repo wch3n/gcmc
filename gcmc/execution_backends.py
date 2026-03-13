@@ -132,6 +132,8 @@ class _RayReplicaActor:
 
             sim.atoms.set_positions(data["positions"])
             sim.atoms.set_atomic_numbers(data["numbers"])
+            if "tags" in data:
+                sim.atoms.set_tags(data["tags"])
             sim.atoms.set_cell(data["cell"])
             sim.atoms.pbc = data["pbc"]
 
@@ -159,6 +161,7 @@ class _RayReplicaActor:
                 "replica_id": replica_id,
                 "positions": sim.atoms.get_positions(),
                 "numbers": sim.atoms.get_atomic_numbers(),
+                "tags": sim.atoms.get_tags(),
                 "cell": sim.atoms.get_cell(),
                 "pbc": sim.atoms.get_pbc(),
                 "e_old": sim.e_old,

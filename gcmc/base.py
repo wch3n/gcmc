@@ -187,10 +187,16 @@ class BaseMC:
         else:
             target = atoms_relax
 
-        # Optimization with logging.
-        # Route output to logger.debug.
-        log_stream = LoggerStream(logger, logging.DEBUG)
+        return self._run_relaxation(atoms_relax, target, move_ind)
 
+    def _run_relaxation(
+        self,
+        atoms_relax: Atoms,
+        target: Any,
+        move_ind: Optional[list] = None,
+    ) -> Tuple[Atoms, bool]:
+        """Run the optimizer on a prepared relaxation target."""
+        log_stream = LoggerStream(logger, logging.DEBUG)
         dyn = LBFGS(target, logfile=log_stream)
 
         if self.verbose_relax and move_ind:

@@ -6,7 +6,7 @@ from typing import Any, Optional, List, Union, Dict, Tuple
 from ase import Atoms
 from ase.io import read, Trajectory
 from ase import units
-from ase.constraints import FixCartesian
+from ase.constraints import FixAtoms, FixCartesian
 from ase.md.verlet import VelocityVerlet
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -85,6 +85,9 @@ class AlloyCMC(BaseMC):
         self.relax = relax
         self.local_relax = local_relax
         self.relax_radius = relax_radius
+        self.current_swap_indices: Optional[list[int]] = None
+        self._warned_local_relax_missing_indices = False
+        self._warned_local_relax_cell = False
         self.traj_file = traj_file
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
@@ -386,15 +389,58 @@ class AlloyCMC(BaseMC):
         if not self.local_relax:
             return super().relax_structure(atoms, move_ind)
 
-        # Local relaxation logic.
         atoms_relax = atoms.copy()
+        atoms_relax.calc = self.calculator
 
-        # Identify active region (swapped atoms plus neighbors).
-        # Note: move_ind is [sweep, step], not atom indices.
-        # Run() does not pass swapped indices directly, so robust local relaxation would require storing those indices in self.current_swap_indices.
+        if not self.current_swap_indices:
+            if not self._warned_local_relax_missing_indices:
+                logger.warning(
+                    "local_relax requested but no swap indices are available; "
+                    "falling back to full relaxation for this move."
+                )
+                self._warned_local_relax_missing_indices = True
+            return super().relax_structure(atoms, move_ind)
 
-        # Fall back to BaseMC relaxation when robust index tracking is unavailable.
-        return super().relax_structure(atoms, move_ind)
+        swap_indices = np.asarray(self.current_swap_indices, dtype=int)
+        active_mask = np.zeros(len(atoms_relax), dtype=bool)
+        active_mask[swap_indices] = True
+
+        if self.relax_radius > 0.0:
+            i_idx, j_idx = neighbor_list("ij", atoms_relax, cutoff=self.relax_radius)
+            if i_idx.size:
+                near_swap = np.isin(i_idx, swap_indices) | np.isin(j_idx, swap_indices)
+                active_mask[i_idx[near_swap]] = True
+                active_mask[j_idx[near_swap]] = True
+
+        active_indices = np.flatnonzero(active_mask)
+        fixed_indices = np.flatnonzero(~active_mask)
+
+        constraints = []
+        existing_constraints = atoms_relax.constraints
+        if existing_constraints:
+            if isinstance(existing_constraints, (list, tuple)):
+                constraints.extend(existing_constraints)
+            else:
+                constraints.append(existing_constraints)
+
+        if fixed_indices.size:
+            constraints.append(FixAtoms(indices=fixed_indices.tolist()))
+
+        if self.relax_z_only:
+            for idx in active_indices:
+                constraints.append(FixCartesian(int(idx), mask=[True, True, False]))
+            atoms_relax.set_constraint(constraints)
+            target = atoms_relax
+        else:
+            if self.relax_cell and not self._warned_local_relax_cell:
+                logger.warning(
+                    "local_relax does not support relax_cell; using fixed-cell local relaxation."
+                )
+                self._warned_local_relax_cell = True
+            atoms_relax.set_constraint(constraints)
+            target = atoms_relax
+
+        return self._run_relaxation(atoms_relax, target, move_ind)
 
     def run(
         self,
@@ -497,6 +543,8 @@ class AlloyCMC(BaseMC):
                             self._invalidate_neighbor_cache()
                 else:
                     self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym1, sym2
+
+                self.current_swap_indices = None
 
             self.sweep += 1
 

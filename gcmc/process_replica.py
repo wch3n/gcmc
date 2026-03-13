@@ -78,6 +78,7 @@ class ReplicaWorker(ctx.Process):
                     sim.atoms.set_tags(data["tags"])
                 sim.atoms.set_cell(data["cell"])
                 sim.atoms.pbc = data["pbc"]
+                sim._refresh_cached_state()
 
                 sim.e_old = data["e_old"]
                 if "rng_state" in data and data["rng_state"] is not None:

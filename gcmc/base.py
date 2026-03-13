@@ -258,7 +258,7 @@ class BaseMC:
         self.e_old = state.get("e_old", None)
         self.accepted_moves = state.get("accepted_moves", 0)
         self.total_moves = state.get("total_moves", 0)
-        self.T = state.get("T", self.T)
+        self.T = state.get("T", getattr(self, "T", None))
 
         if "rng_state" in state and hasattr(self, "rng"):
             self.rng.bit_generator.state = state["rng_state"]
@@ -346,7 +346,14 @@ class SurfaceMCBase(BaseMC):
 
         for ia in ads_indices:
             ads_pos = pos[ia]
-            support_indices = [i for i in range(n_atoms) if i != ia]
+            support_indices = [
+                i
+                for i in range(n_atoms)
+                if i != ia and atoms[i].symbol != self.adsorbate_element
+            ]
+            if not support_indices:
+                logger.debug(f"[AFLOAT] Ads {ia}: No non-adsorbate support atoms available.")
+                return True
             support_pos = pos[support_indices]
             deltas, _ = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)

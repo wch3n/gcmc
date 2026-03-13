@@ -29,6 +29,17 @@ def _count_move_units(atoms, mc_kwargs):
 
 
 class ReplicaExchange:
+    """
+    Parallel tempering driver for MC engines.
+
+    Notes:
+    - Per-replica RNG streams are anchored to the temperature slot, not the
+      physical configuration. After an accepted swap, the configuration moves to
+      a new slot while each slot keeps its own RNG state.
+    - Heat-capacity estimates use the population variance convention
+      ``E[E^2] - E[E]^2`` (division by ``n`` rather than ``n-1``).
+    """
+
     def __init__(
         self,
         n_gpus,
@@ -92,7 +103,8 @@ class ReplicaExchange:
             backend_kwargs=self.backend_kwargs,
         )
 
-        # Keep RNG streams deterministic and isolated per replica, independent of worker scheduling and ordering.
+        # Keep RNG streams deterministic and isolated per temperature slot,
+        # independent of worker scheduling and collection order.
         for state in self.replica_states:
             if "rng_state" not in state or state["rng_state"] is None:
                 rid = state.get("id", 0)
@@ -334,6 +346,8 @@ class ReplicaExchange:
                     N = state["cum_n_samples"]
                     if N > 1:
                         cum_avg_E = state["cum_sum_E"] / N
+                        # Use the population-variance convention for consistency
+                        # with the per-cycle Cv estimator returned by the workers.
                         cum_var = (state["cum_sum_E_sq"] / N) - (cum_avg_E**2)
                         cum_Cv = cum_var / (kB * state["T"] ** 2)
                     else:
@@ -460,6 +474,8 @@ class ReplicaExchange:
             accepted = False
             if delta > 0 or self.rng.random() < np.exp(delta):
                 accepted = True
+                # Swap the sampled configuration and cached observables only;
+                # the RNG state intentionally stays with the temperature slot.
                 s_i["atoms"], s_j["atoms"] = s_j["atoms"], s_i["atoms"]
                 s_i["e_old"], s_j["e_old"] = s_j["e_old"], s_i["e_old"]
                 logger.info(f"  [Swap] {s_i['T']:.0f}K <-> {s_j['T']:.0f}K | ACCEPTED")

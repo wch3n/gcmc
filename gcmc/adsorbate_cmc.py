@@ -152,6 +152,13 @@ class AdsorbateCMC(SurfaceMCBase):
     This class is designed to match the `AlloyCMC`/`ReplicaExchange` worker
     interface. Molecular adsorbates are handled as rigid groups whose anchor
     atom defines support and site-hop placement.
+
+    Tolerance conventions:
+    - ``xy_tol`` is retained for backward compatibility, but in the current
+      implementation it acts as the minimum full 3D clearance used by
+      `_group_positions_are_valid()`.
+    - ``same_site_tol`` is the in-plane threshold used to reject site-hop
+      proposals that land on the current site.
     """
 
     def __init__(
@@ -297,7 +304,10 @@ class AdsorbateCMC(SurfaceMCBase):
         )
         self.rotation_max_angle_rad = np.deg2rad(float(rotation_max_angle_deg))
         self.min_moves_per_sweep = int(min_moves_per_sweep)
+        # Historical name kept for API compatibility; this is used as a 3D
+        # minimum-separation cutoff in _group_positions_are_valid().
         self.xy_tol = xy_tol
+        # Dedicated in-plane threshold for skipping current-site hops.
         self.same_site_tol = float(same_site_tol)
         self.support_xy_tol = support_xy_tol
         self.z_max_support = z_max_support

@@ -1,12 +1,15 @@
 """
-BaseMC class for MC simulation of surface/adsorbate systems.
-Ensemble-neutral utilities for canonical and grand canonical MC.
+Base classes for Monte Carlo simulation infrastructure.
 
-Provides:
-- Logging and reproducibility
-- Relaxation (Fixed and Variable Cell)
-- PBC-aware detection of unsupported (afloat) adsorbates
-- Functional group detachment detection
+BaseMC contains only generic MC mechanics:
+- logging and reproducibility
+- structural relaxation helpers
+- checkpoint I/O
+
+SurfaceMCBase adds slab/adsorbate-specific bookkeeping:
+- adsorbate/substrate/functional indices
+- afloat-adsorbate detection
+- detached-functional-group detection
 """
 
 import numpy as np
@@ -61,17 +64,13 @@ class BaseMC:
         - Logging setup
         - RNG seeding
         - Structural relaxation (Atomic positions + Optional Cell)
-        - PBC-aware detection of unsupported (afloat) adsorbates
-        - Functional group detachment detection
+        - Generic checkpoint persistence
     """
 
     def __init__(
         self,
         atoms: Atoms,
         calculator: Any,
-        adsorbate_element: str = "Cu",
-        substrate_elements: Tuple[str, ...] = ("Ti", "C"),
-        functional_elements: Optional[Tuple[str, ...]] = None,
         detach_tol: float = 3.0,
         relax_steps: int = 100,
         relax_z_only: bool = False,
@@ -87,19 +86,6 @@ class BaseMC:
     ):
         self.atoms: Atoms = atoms
         self.calculator = calculator
-        self.adsorbate_element = adsorbate_element
-        self.substrate_elements = substrate_elements
-
-        # Auto-detect functional elements when not provided.
-        all_elements = set(atom.symbol for atom in self.atoms)
-        if functional_elements is None:
-            self.functional_elements = tuple(
-                e
-                for e in all_elements
-                if e not in self.substrate_elements and e != self.adsorbate_element
-            )
-        else:
-            self.functional_elements = functional_elements
 
         # Relaxation parameters.
         self.detach_tol = detach_tol
@@ -116,9 +102,6 @@ class BaseMC:
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
 
-        # Cache indices for performance.
-        self._update_indices()
-
         # Attach the calculator immediately.
         self.atoms.calc = self.calculator
 
@@ -130,17 +113,13 @@ class BaseMC:
         else:
             logger.debug("Relaxation: Full (Fixed Cell).")
 
-    def _update_indices(self) -> None:
-        """Update atom indices for adsorbates, substrate, and functionals."""
-        self.ads_indices = [
-            i for i, a in enumerate(self.atoms) if a.symbol == self.adsorbate_element
-        ]
-        self.sub_indices = [
-            i for i, a in enumerate(self.atoms) if a.symbol in self.substrate_elements
-        ]
-        self.func_indices = [
-            i for i, a in enumerate(self.atoms) if a.symbol in self.functional_elements
-        ]
+    def _refresh_cached_state(self) -> None:
+        """Hook for subclasses that cache atom-index state."""
+        return None
+
+    def _z_relax_indices(self) -> Optional[List[int]]:
+        """Hook returning indices allowed to move along z in relax_z_only mode."""
+        return None
 
     def relax_structure(
         self, atoms: Atoms, move_ind: Optional[list] = None
@@ -161,12 +140,19 @@ class BaseMC:
 
         # Mode 1: Z-only relaxation (fixed cell).
         if self.relax_z_only:
-            constraints = []
-            # Only allow adsorbate atoms to move in z.
-            for i in getattr(self, "ads_indices", []):
-                constraints.append(FixCartesian(i, mask=[True, True, False]))
-            atoms_relax.set_constraint(constraints)
-            target = atoms_relax
+            relax_indices = self._z_relax_indices()
+            if relax_indices is None:
+                logger.warning(
+                    "relax_z_only requested but no z-relax indices are defined; "
+                    "falling back to full-coordinate relaxation."
+                )
+                target = atoms_relax
+            else:
+                constraints = [
+                    FixCartesian(i, mask=[True, True, False]) for i in relax_indices
+                ]
+                atoms_relax.set_constraint(constraints)
+                target = atoms_relax
 
         # Mode 2: Variable-cell relaxation (important for alloys).
         elif self.relax_cell:
@@ -212,121 +198,6 @@ class BaseMC:
             converged = False
 
         return atoms_relax, converged
-
-    def has_afloat_adsorbates(
-        self,
-        atoms: Optional[Atoms] = None,
-        support_xy_tol: float = None,
-        z_max_support: float = None,
-    ) -> bool:
-        """
-        Returns True if there is any adsorbate atom that lacks a physical support beneath it.
-        """
-        if support_xy_tol is None:
-            support_xy_tol = getattr(self, "support_xy_tol", 2.0)
-        if z_max_support is None:
-            z_max_support = getattr(self, "z_max_support", 2.5)
-        if atoms is None:
-            atoms = self.atoms
-
-        pos = atoms.get_positions()
-        cell = atoms.get_cell()
-        pbc = atoms.get_pbc()
-        n_atoms = len(atoms)
-        adsorbate_element = getattr(self, "adsorbate_element", "Cu")  # Fallback default.
-        ads_indices = [i for i, a in enumerate(atoms) if a.symbol == adsorbate_element]
-
-        if len(ads_indices) == 0:
-            logger.debug("No adsorbates found for afloat check.")
-            return False
-
-        for ia in ads_indices:
-            ads_pos = pos[ia]
-            support_indices = [i for i in range(n_atoms) if i != ia]
-            support_pos = pos[support_indices]
-            deltas, dists = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
-            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)  # In-plane distance.
-            dz = ads_pos[2] - support_pos[:, 2]  # Only atoms below the adsorbate.
-
-            lateral_mask = dxy < support_xy_tol
-            dz_lateral = dz[lateral_mask]
-            support_mask = (dz_lateral > 0) & (dz_lateral < z_max_support)
-            if not np.any(support_mask):
-                if dz_lateral.size > 0 and np.any(dz_lateral > 0):
-                    min_dz = dz_lateral[dz_lateral > 0].min()
-                    logger.debug(
-                        f"[AFLOAT] Ads {ia}: No support. Closest dz={min_dz:.2f} A"
-                    )
-                else:
-                    logger.debug(f"[AFLOAT] Ads {ia}: No atoms within lateral cutoff.")
-                return True
-        return False
-
-    def has_detached_functional_groups(
-        self,
-        atoms: Optional[Atoms] = None,
-        detach_tol: float = 3.0,
-    ) -> bool:
-        """
-        Returns True if any functional group atom is farther than detach_tol (in z)
-        from the closest substrate atom.
-        """
-        if atoms is None:
-            atoms = self.atoms
-        if not hasattr(self, "sub_indices") or not hasattr(self, "func_indices"):
-            self._update_indices()
-
-        if len(self.func_indices) == 0 or len(self.sub_indices) == 0:
-            return False
-
-        sub_pos = atoms.get_positions()[self.sub_indices]
-        func_pos = atoms.get_positions()[self.func_indices]
-        cell = atoms.get_cell()
-        pbc = atoms.get_pbc()
-
-        for i, fpos in enumerate(func_pos):
-            f_xyz = fpos.reshape(1, 3)
-            dists = get_distances(f_xyz, sub_pos, cell=cell, pbc=pbc)[1].flatten()
-            min_d = np.min(dists)
-            if min_d > detach_tol:
-                logger.debug(
-                    f"Functional group atom {self.func_indices[i]} detached: dist {min_d:.2f} A"
-                )
-                return True
-        return False
-
-    def get_non_buried_adsorbate_indices(
-        self,
-        support_xy_tol: float = None,
-        z_tol: float = None,
-    ) -> List[int]:
-        """
-        Returns indices of adsorbates that are not buried.
-        """
-        if support_xy_tol is None:
-            support_xy_tol = getattr(self, "support_xy_tol", 2.0)
-        if z_tol is None:
-            z_tol = getattr(self, "z_tol", 0.1)
-
-        atoms = self.atoms
-        ads = [i for i, a in enumerate(atoms) if a.symbol == self.adsorbate_element]
-        pos = atoms.get_positions()
-        cell = atoms.get_cell()
-        pbc = atoms.get_pbc()
-
-        non_buried = []
-        for ia in ads:
-            ads_pos = pos[ia]
-            other_indices = [i for i in range(len(atoms)) if i != ia]
-            other_pos = pos[other_indices]
-            deltas, dists = get_distances(ads_pos, other_pos, cell=cell, pbc=pbc)
-            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
-            dz = other_pos[:, 2] - ads_pos[2]
-
-            mask = (dxy < support_xy_tol) & (dz > z_tol)
-            if not np.any(mask):
-                non_buried.append(ia)
-        return non_buried
 
     def get_potential_energy(self, atoms: Optional[Atoms] = None) -> float:
         """Returns potential energy (calls calculator if necessary)."""
@@ -398,4 +269,165 @@ class BaseMC:
             self.sum_E_sq = state["sum_E_sq"]
             self.n_samples = state["n_samples"]
 
+        self._refresh_cached_state()
         logger.info(f"Resumed from sweep {self.sweep}")
+
+
+class SurfaceMCBase(BaseMC):
+    """Base class for slab/adsorbate MC algorithms."""
+
+    def __init__(
+        self,
+        atoms: Atoms,
+        calculator: Any,
+        adsorbate_element: str = "Cu",
+        substrate_elements: Tuple[str, ...] = ("Ti", "C"),
+        functional_elements: Optional[Tuple[str, ...]] = None,
+        **kwargs,
+    ):
+        self.adsorbate_element = adsorbate_element
+        self.substrate_elements = substrate_elements
+
+        all_elements = set(atom.symbol for atom in atoms)
+        if functional_elements is None:
+            self.functional_elements = tuple(
+                e
+                for e in all_elements
+                if e not in self.substrate_elements and e != self.adsorbate_element
+            )
+        else:
+            self.functional_elements = functional_elements
+
+        super().__init__(atoms=atoms, calculator=calculator, **kwargs)
+
+    def _refresh_cached_state(self) -> None:
+        self._update_indices()
+
+    def _z_relax_indices(self) -> Optional[List[int]]:
+        return list(getattr(self, "ads_indices", []))
+
+    def _update_indices(self) -> None:
+        """Update atom indices for adsorbates, substrate, and functionals."""
+        self.ads_indices = [
+            i for i, a in enumerate(self.atoms) if a.symbol == self.adsorbate_element
+        ]
+        self.sub_indices = [
+            i for i, a in enumerate(self.atoms) if a.symbol in self.substrate_elements
+        ]
+        self.func_indices = [
+            i for i, a in enumerate(self.atoms) if a.symbol in self.functional_elements
+        ]
+
+    def has_afloat_adsorbates(
+        self,
+        atoms: Optional[Atoms] = None,
+        support_xy_tol: float = None,
+        z_max_support: float = None,
+    ) -> bool:
+        """
+        Returns True if there is any adsorbate atom that lacks a physical support beneath it.
+        """
+        if support_xy_tol is None:
+            support_xy_tol = getattr(self, "support_xy_tol", 2.0)
+        if z_max_support is None:
+            z_max_support = getattr(self, "z_max_support", 2.5)
+        if atoms is None:
+            atoms = self.atoms
+
+        pos = atoms.get_positions()
+        cell = atoms.get_cell()
+        pbc = atoms.get_pbc()
+        n_atoms = len(atoms)
+        ads_indices = [i for i, a in enumerate(atoms) if a.symbol == self.adsorbate_element]
+
+        if len(ads_indices) == 0:
+            logger.debug("No adsorbates found for afloat check.")
+            return False
+
+        for ia in ads_indices:
+            ads_pos = pos[ia]
+            support_indices = [i for i in range(n_atoms) if i != ia]
+            support_pos = pos[support_indices]
+            deltas, _ = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
+            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
+            dz = ads_pos[2] - support_pos[:, 2]
+
+            lateral_mask = dxy < support_xy_tol
+            dz_lateral = dz[lateral_mask]
+            support_mask = (dz_lateral > 0) & (dz_lateral < z_max_support)
+            if not np.any(support_mask):
+                if dz_lateral.size > 0 and np.any(dz_lateral > 0):
+                    min_dz = dz_lateral[dz_lateral > 0].min()
+                    logger.debug(
+                        f"[AFLOAT] Ads {ia}: No support. Closest dz={min_dz:.2f} A"
+                    )
+                else:
+                    logger.debug(f"[AFLOAT] Ads {ia}: No atoms within lateral cutoff.")
+                return True
+        return False
+
+    def has_detached_functional_groups(
+        self,
+        atoms: Optional[Atoms] = None,
+        detach_tol: float = 3.0,
+    ) -> bool:
+        """
+        Returns True if any functional group atom is farther than detach_tol from
+        the closest substrate atom.
+        """
+        if atoms is None:
+            atoms = self.atoms
+        if not hasattr(self, "sub_indices") or not hasattr(self, "func_indices"):
+            self._refresh_cached_state()
+
+        if len(self.func_indices) == 0 or len(self.sub_indices) == 0:
+            return False
+
+        sub_pos = atoms.get_positions()[self.sub_indices]
+        func_pos = atoms.get_positions()[self.func_indices]
+        cell = atoms.get_cell()
+        pbc = atoms.get_pbc()
+
+        for i, fpos in enumerate(func_pos):
+            f_xyz = fpos.reshape(1, 3)
+            dists = get_distances(f_xyz, sub_pos, cell=cell, pbc=pbc)[1].flatten()
+            min_d = np.min(dists)
+            if min_d > detach_tol:
+                logger.debug(
+                    f"Functional group atom {self.func_indices[i]} detached: dist {min_d:.2f} A"
+                )
+                return True
+        return False
+
+    def get_non_buried_adsorbate_indices(
+        self,
+        support_xy_tol: float = None,
+        z_tol: float = None,
+    ) -> List[int]:
+        """
+        Returns indices of adsorbates that are not buried.
+        """
+        if support_xy_tol is None:
+            support_xy_tol = getattr(self, "support_xy_tol", 2.0)
+        if z_tol is None:
+            z_tol = getattr(self, "z_tol", 0.1)
+
+        atoms = self.atoms
+        ads = [i for i, a in enumerate(atoms) if a.symbol == self.adsorbate_element]
+        pos = atoms.get_positions()
+        cell = atoms.get_cell()
+        pbc = atoms.get_pbc()
+
+        non_buried = []
+        for ia in ads:
+            ads_pos = pos[ia]
+            other_indices = [i for i in range(len(atoms)) if i != ia]
+            other_pos = pos[other_indices]
+            deltas, _ = get_distances(ads_pos, other_pos, cell=cell, pbc=pbc)
+            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
+            dz = other_pos[:, 2] - ads_pos[2]
+
+            mask = (dxy < support_xy_tol) & (dz > z_tol)
+            if not np.any(mask):
+                non_buried.append(ia)
+        return non_buried

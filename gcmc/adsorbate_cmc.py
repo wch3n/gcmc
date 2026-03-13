@@ -9,7 +9,7 @@ from ase.geometry import get_distances
 from ase.io import Trajectory, read, write
 from ase.symbols import string2symbols
 
-from .base import BaseMC
+from .base import SurfaceMCBase
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .utils import (
     classify_hollow_sites,
@@ -154,7 +154,7 @@ def _place_adsorbate_template(
     return atoms_new
 
 
-class AdsorbateCMC(BaseMC):
+class AdsorbateCMC(SurfaceMCBase):
     """
     Canonical Monte Carlo for fixed-loading adsorbates on a surface.
 
@@ -317,6 +317,7 @@ class AdsorbateCMC(BaseMC):
         self.checkpoint_interval = checkpoint_interval
         self._site_xy: Optional[np.ndarray] = None
 
+        self._update_indices()
         self.sum_E = 0.0
         self.sum_E_sq = 0.0
         self.n_samples = 0

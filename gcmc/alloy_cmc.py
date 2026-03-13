@@ -67,8 +67,6 @@ class AlloyCMC(BaseMC):
         super().__init__(
             atoms=self.atoms,
             calculator=calculator,
-            adsorbate_element="X",
-            substrate_elements=(),
             relax_steps=relax_steps,
             fmax=fmax,
             seed=seed,
@@ -135,16 +133,9 @@ class AlloyCMC(BaseMC):
         else:
             self.swap_elements = swap_elements
 
-        self.swap_indices = np.array(
-            [
-                i
-                for i, s in enumerate(self.atoms.get_chemical_symbols())
-                if s in self.swap_elements
-            ]
-        )
-        self.swap_index_set = set(self.swap_indices.tolist())
         self._swap_neighbors: Optional[list[np.ndarray]] = None
         self._neighbor_cache_ready = False
+        self._refresh_cached_state()
 
         self.atoms.calc = self.calculator
         self.e_old = self.atoms.get_potential_energy()
@@ -195,6 +186,17 @@ class AlloyCMC(BaseMC):
                 self_interaction=False,
             )
         return np.asarray(i_idx, dtype=int), np.asarray(j_idx, dtype=int)
+
+    def _refresh_cached_state(self) -> None:
+        self.swap_indices = np.array(
+            [
+                i
+                for i, s in enumerate(self.atoms.get_chemical_symbols())
+                if s in self.swap_elements
+            ],
+            dtype=int,
+        )
+        self._invalidate_neighbor_cache()
 
     def _compute_swap_neighbor_lists(self) -> list[np.ndarray]:
         n_atoms = len(self.atoms)
@@ -282,7 +284,7 @@ class AlloyCMC(BaseMC):
         self.sum_E = state.get("sum_E", 0.0)
         self.sum_E_sq = state.get("sum_E_sq", 0.0)
         self.n_samples = state.get("n_samples", 0)
-        self._invalidate_neighbor_cache()
+        self._refresh_cached_state()
         logger.info(f"[{self.T:.0f}K] Resumed from checkpoint.")
 
     def propose_swap_indices(self) -> Optional[Tuple[int, int]]:

@@ -29,6 +29,12 @@ class MXeneSROAnalyzer:
     - ``xy_reference`` / ``layerwise_reference``: preserve the reference
       layer populations, assign atoms to the fixed in-plane reference sites
       within each layer, and evaluate SRO on the reference connectivity.
+
+    Shell selection:
+    - ``n_shells`` is the target number of anisotropic shells per relation.
+      The analyzer expands the underlying global 3D shell list until both
+      ``same_layer`` and ``cross_layer`` have at least ``n_shells`` shells,
+      or until no further reference shells exist.
     """
 
     def __init__(
@@ -265,16 +271,19 @@ class MXeneSROAnalyzer:
         ref_alloy_atoms = self.reference_atoms[ref_mask]
         dist_matrix = np.asarray(ref_alloy_atoms.get_all_distances(mic=True), dtype=float)
         upper = dist_matrix[np.triu_indices_from(dist_matrix, k=1)]
-        shell_centers = self._cluster_shell_distances(upper, self.shell_tol)[: self.n_shells]
+        shell_centers = self._cluster_shell_distances(upper, self.shell_tol)
         if shell_centers.size == 0:
             raise ValueError("No non-zero shell distances found in the reference structure.")
 
         self.reference_shells: List[Dict[str, object]] = []
+        relation_counts = {"same_layer": 0, "cross_layer": 0}
         for shell_id, distance in enumerate(shell_centers, start=1):
             mask = (np.abs(dist_matrix - distance) <= self.shell_tol) & (
                 ~np.eye(len(dist_matrix), dtype=bool)
             )
             central_idx, neighbor_idx = np.where(mask)
+            central_layers = self.reference_layers[central_idx]
+            neighbor_layers = self.reference_layers[neighbor_idx]
             coordination = int(round(float(np.mean(np.sum(mask, axis=1)))))
             coordination_by_layer: Dict[int, int] = {}
             for lid in sorted(int(x) for x in np.unique(self.reference_layers)):
@@ -296,8 +305,61 @@ class MXeneSROAnalyzer:
                     "neighbor_idx": neighbor_idx.astype(int),
                 }
             )
+            if np.any(central_layers == neighbor_layers):
+                relation_counts["same_layer"] += 1
+            if np.any(central_layers != neighbor_layers):
+                relation_counts["cross_layer"] += 1
+            if all(count >= self.n_shells for count in relation_counts.values()):
+                break
 
+        self._prepare_relation_shells()
         self._prepare_reciprocal_grid()
+
+    def _prepare_relation_shells(self) -> None:
+        self.reference_relation_shells: Dict[str, List[Dict[str, object]]] = {
+            "same_layer": [],
+            "cross_layer": [],
+        }
+        self.reference_relation_shell_id_map: Dict[Tuple[str, int], int] = {}
+
+        relation_counts = {"same_layer": 0, "cross_layer": 0}
+        for shell in self.reference_shells:
+            central_idx = np.asarray(shell["central_idx"], dtype=int)
+            neighbor_idx = np.asarray(shell["neighbor_idx"], dtype=int)
+            central_layers = self.reference_layers[central_idx]
+            neighbor_layers = self.reference_layers[neighbor_idx]
+            relation_shell_id_by_relation: Dict[str, int] = {}
+            relation_coordination_number: Dict[str, int] = {}
+            for relation_name, relation_mask in (
+                ("same_layer", central_layers == neighbor_layers),
+                ("cross_layer", central_layers != neighbor_layers),
+            ):
+                if not np.any(relation_mask):
+                    continue
+                relation_counts[relation_name] += 1
+                relation_shell_id = relation_counts[relation_name]
+                relation_shell_id_by_relation[relation_name] = relation_shell_id
+                self.reference_relation_shell_id_map[(relation_name, int(shell["shell_id"]))] = (
+                    relation_shell_id
+                )
+
+                relation_counts_per_site = np.bincount(
+                    central_idx[relation_mask],
+                    minlength=len(self.reference_positions),
+                )
+                relation_coordination_number[relation_name] = int(
+                    round(float(np.mean(relation_counts_per_site)))
+                )
+                self.reference_relation_shells[relation_name].append(
+                    {
+                        "relation_shell_id": relation_shell_id,
+                        "shell_id": int(shell["shell_id"]),
+                        "shell_distance_A": float(shell["shell_distance_A"]),
+                        "coordination_number": relation_coordination_number[relation_name],
+                    }
+                )
+            shell["relation_shell_id_by_relation"] = relation_shell_id_by_relation
+            shell["relation_coordination_number"] = relation_coordination_number
 
     def _prepare_reciprocal_grid(self) -> None:
         self.inplane_axes = tuple(idx for idx in range(3) if idx != self.axis_idx)
@@ -676,6 +738,7 @@ class MXeneSROAnalyzer:
         traj_path = Path(traj_path)
         rows_layer_comp: List[Dict[str, object]] = []
         rows_wc_global: List[Dict[str, object]] = []
+        rows_wc_relation: List[Dict[str, object]] = []
         rows_wc_layer: List[Dict[str, object]] = []
         rows_coord_global: List[Dict[str, object]] = []
         rows_coord_layer: List[Dict[str, object]] = []
@@ -756,6 +819,7 @@ class MXeneSROAnalyzer:
                 central_symbols = frame_symbols[central_idx]
                 neighbor_symbols = frame_symbols[neighbor_idx]
                 central_layers = frame_layers[central_idx]
+                neighbor_layers = frame_layers[neighbor_idx]
 
                 for el_i in self.alloy_elements:
                     n_atoms_i = int(np.sum(frame_symbols == el_i))
@@ -795,6 +859,40 @@ class MXeneSROAnalyzer:
                                 "alpha_wc": alpha_ij,
                             }
                         )
+                        for relation_name, relation_mask in (
+                            ("same_layer", central_layers == neighbor_layers),
+                            ("cross_layer", central_layers != neighbor_layers),
+                        ):
+                            relation_shell_id = shell.get(
+                                "relation_shell_id_by_relation", {}
+                            ).get(relation_name)
+                            if relation_shell_id is None:
+                                continue
+                            mask_i_relation = mask_i & relation_mask
+                            total_neighbors_i_relation = int(np.sum(mask_i_relation))
+                            if total_neighbors_i_relation > 0 and conc[el_j] > 0.0:
+                                p_ij_relation = float(
+                                    np.sum(mask_i_relation & (neighbor_symbols == el_j))
+                                    / total_neighbors_i_relation
+                                )
+                                alpha_ij_relation = float(
+                                    1.0 - p_ij_relation / conc[el_j]
+                                )
+                            else:
+                                alpha_ij_relation = float("nan")
+                            rows_wc_relation.append(
+                                {
+                                    "traj": str(traj_path),
+                                    "frame": frame_idx,
+                                    "shell_id": shell_id,
+                                    "relation_shell_id": int(relation_shell_id),
+                                    "shell_distance_A": shell_distance,
+                                    "layer_relation": relation_name,
+                                    "central_species": el_i,
+                                    "neighbor_species": el_j,
+                                    "alpha_wc": alpha_ij_relation,
+                                }
+                            )
 
                 for lid in range(len(frame_layer_centers)):
                     layer_mask = central_layers == lid
@@ -868,9 +966,14 @@ class MXeneSROAnalyzer:
                 }
                 for shell in self.reference_shells
             ],
+            "reference_relation_shells": {
+                relation: [dict(meta) for meta in shells]
+                for relation, shells in self.reference_relation_shells.items()
+            },
             "reference_q_grid": [dict(q) for q in self.reference_q_grid],
             "layer_composition_per_frame": rows_layer_comp,
             "wc_global_per_frame": rows_wc_global,
+            "wc_relation_per_frame": rows_wc_relation,
             "wc_layer_per_frame": rows_wc_layer,
             "coord_global_per_frame": rows_coord_global,
             "coord_layer_per_frame": rows_coord_layer,
@@ -910,6 +1013,21 @@ class MXeneSROAnalyzer:
                 value_keys=["alpha_wc"],
             )
             if rows_wc_layer
+            else [],
+            "wc_relation_summary": _grouped_mean_std(
+                rows_wc_relation,
+                group_keys=[
+                    "traj",
+                    "shell_id",
+                    "relation_shell_id",
+                    "shell_distance_A",
+                    "layer_relation",
+                    "central_species",
+                    "neighbor_species",
+                ],
+                value_keys=["alpha_wc"],
+            )
+            if rows_wc_relation
             else [],
             "coord_global_summary": _grouped_mean_std(
                 rows_coord_global,
@@ -1077,6 +1195,15 @@ class MXeneSROAnalyzer:
         row["flip_fraction"] = float(result.get("flip_fraction", 0.0))
         if result.get("canonical_anchor_species") is not None:
             row["canonical_anchor_species"] = str(result["canonical_anchor_species"])
+        for relation, shells in result.get("reference_relation_shells", {}).items():
+            for shell in shells:
+                relation_shell_id = int(shell["relation_shell_id"])
+                row[f"{relation}_shell{relation_shell_id}_distance_A"] = float(
+                    shell["shell_distance_A"]
+                )
+                row[f"{relation}_shell{relation_shell_id}_coordination"] = int(
+                    shell["coordination_number"]
+                )
 
         def _add_layer_metrics(
             rows_per_frame: List[Dict[str, object]],
@@ -1168,6 +1295,24 @@ class MXeneSROAnalyzer:
                 r.get("alpha_wc_mean", np.nan)
             )
             row[f"wc_shell{shell_id}_global_{i}_{j}_std"] = float(
+                r.get("alpha_wc_std", np.nan)
+            )
+        for r in result.get("wc_relation_summary", []):
+            shell_id = int(r["shell_id"])
+            relation_shell_id = int(r["relation_shell_id"])
+            relation = str(r["layer_relation"])
+            i = str(r["central_species"])
+            j = str(r["neighbor_species"])
+            row[f"wc_shell{shell_id}_{relation}_{i}_{j}_mean"] = float(
+                r.get("alpha_wc_mean", np.nan)
+            )
+            row[f"wc_shell{shell_id}_{relation}_{i}_{j}_std"] = float(
+                r.get("alpha_wc_std", np.nan)
+            )
+            row[f"wc_{relation}_shell{relation_shell_id}_{i}_{j}_mean"] = float(
+                r.get("alpha_wc_mean", np.nan)
+            )
+            row[f"wc_{relation}_shell{relation_shell_id}_{i}_{j}_std"] = float(
                 r.get("alpha_wc_std", np.nan)
             )
 
@@ -1270,6 +1415,20 @@ class MXeneSROAnalyzer:
                 ],
             ),
             (
+                "wc_relation_per_frame",
+                [
+                    "traj",
+                    "frame",
+                    "shell_id",
+                    "relation_shell_id",
+                    "shell_distance_A",
+                    "layer_relation",
+                    "central_species",
+                    "neighbor_species",
+                    "alpha_wc",
+                ],
+            ),
+            (
                 "coord_global_per_frame",
                 [
                     "traj",
@@ -1340,6 +1499,7 @@ class MXeneSROAnalyzer:
             "layer_composition_summary",
             "layer_composition_canonical_summary",
             "wc_global_summary",
+            "wc_relation_summary",
             "wc_layer_summary",
             "wc_layer_canonical_summary",
             "coord_global_summary",

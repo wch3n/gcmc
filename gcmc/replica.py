@@ -3,6 +3,7 @@ import logging
 import os
 import pickle
 import time
+from ase import Atoms
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .execution_backends import build_replica_backend
 from .utils import generate_nonuniform_temperature_grid
@@ -164,8 +165,6 @@ class ReplicaExchange:
         **pt_kwargs,
     ):
 
-        atoms_clean = atoms_template.copy()
-        atoms_clean.calc = None
         if calculator_class is None:
             raise ValueError("calculator_class must be provided.")
         if mc_class is None:
@@ -208,13 +207,44 @@ class ReplicaExchange:
             f"Configuration: {len(temps)} Replicas | {n_gpus} GPUs | {workers_per_gpu} Workers/GPU"
         )
 
+        if isinstance(atoms_template, Atoms):
+            initial_structures = [atoms_template.copy() for _ in temps]
+        else:
+            try:
+                initial_structures = [atoms.copy() for atoms in atoms_template]
+            except TypeError as exc:
+                raise TypeError(
+                    "atoms_template must be an ASE Atoms object or a sequence of ASE Atoms."
+                ) from exc
+            if not initial_structures:
+                raise ValueError("atoms_template sequence must not be empty.")
+            if len(initial_structures) == 1 and len(temps) > 1:
+                initial_structures = [initial_structures[0].copy() for _ in temps]
+            elif len(initial_structures) != len(temps):
+                raise ValueError(
+                    "When atoms_template is a sequence, its length must match the number "
+                    "of replicas (or be length 1)."
+                )
+            if not all(isinstance(atoms, Atoms) for atoms in initial_structures):
+                raise TypeError(
+                    "All entries in atoms_template must be ASE Atoms objects."
+                )
+
+        n_atoms_reference = len(initial_structures[0])
+        if any(len(atoms) != n_atoms_reference for atoms in initial_structures):
+            raise ValueError(
+                "All initial replica structures must contain the same number of atoms."
+            )
+
         replica_states = []
         for i, T in enumerate(temps):
             t_str = f"{T:.0f}"
+            atoms_i = initial_structures[i].copy()
+            atoms_i.calc = None
             state = {
                 "id": i,
                 "T": T,
-                "atoms": atoms_clean.copy(),
+                "atoms": atoms_i,
                 "e_old": 0.0,
                 "sweep": 0,
                 # Cumulative counters kept in memory for logging.
@@ -235,7 +265,7 @@ class ReplicaExchange:
             "mc_class": mc_class.__name__,
             "calc_kwargs": calc_kwargs,
             "mc_kwargs": pt_mc_kwargs,
-            "atoms_template": atoms_clean,
+            "atoms_template": initial_structures[0].copy(),
         }
 
         return cls(

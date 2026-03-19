@@ -707,6 +707,54 @@ def _load_adsorbate_template(
     raise TypeError("adsorbate must be an ASE Atoms object or a string.")
 
 
+def place_adsorbate_on_site(
+    atoms: Atoms,
+    adsorbate: Union[str, Atoms],
+    site: Dict[str, object],
+    *,
+    anchor_index: int = 0,
+) -> Tuple[Atoms, np.ndarray]:
+    """
+    Place one adsorbate on a specific site-registry entry.
+
+    Args:
+        atoms: Base slab structure.
+        adsorbate: Monoatomic symbol or ASE adsorbate template.
+        site: One row from ``build_surface_site_registry(...)``.
+        anchor_index: Anchor atom index within the adsorbate template.
+
+    Returns:
+        Tuple of:
+          - new structure with the adsorbate placed
+          - support/site-defining slab indices for the chosen site
+    """
+    adsorbate_template = _load_adsorbate_template(adsorbate)
+    if not (0 <= int(anchor_index) < len(adsorbate_template)):
+        raise ValueError("anchor_index is out of range for the adsorbate template.")
+
+    suggested_z = float(site.get("suggested_z_A", np.nan))
+    if not np.isfinite(suggested_z):
+        raise ValueError("Selected site does not define a finite adsorption height.")
+
+    atoms_new = atoms.copy()
+    anchor_pos = np.array(
+        [
+            float(site["xy"][0]),
+            float(site["xy"][1]),
+            suggested_z,
+        ],
+        dtype=float,
+    )
+    relative = (
+        adsorbate_template.get_positions()
+        - adsorbate_template.positions[int(anchor_index)].copy()
+    )
+    for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
+        atoms_new.append(Atom(symbol, anchor_pos + rel))
+
+    return atoms_new, np.asarray(site["support_indices"], dtype=int)
+
+
 def select_surface_atom_indices(
     atoms: Atoms,
     elements: Union[str, Sequence[str]],
@@ -808,24 +856,16 @@ def initialize_surface_adsorbates(
     )
     selected_sites = [candidate_sites[int(i)] for i in selected_site_indices]
 
-    atoms_new = atoms.copy()
-    relative = (
-        adsorbate_template.get_positions()
-        - adsorbate_template.positions[int(anchor_index)].copy()
-    )
     selected_support_groups = []
+    atoms_new = atoms.copy()
     for site in selected_sites:
-        anchor_pos = np.array(
-            [
-                float(site["xy"][0]),
-                float(site["xy"][1]),
-                float(site["suggested_z_A"]),
-            ],
-            dtype=float,
+        atoms_new, support_indices = place_adsorbate_on_site(
+            atoms_new,
+            adsorbate_template,
+            site,
+            anchor_index=anchor_index,
         )
-        for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
-            atoms_new.append(Atom(symbol, anchor_pos + rel))
-        selected_support_groups.append(np.asarray(site["support_indices"], dtype=int))
+        selected_support_groups.append(np.asarray(support_indices, dtype=int))
 
     selected_support_indices = (
         np.unique(np.concatenate(selected_support_groups))

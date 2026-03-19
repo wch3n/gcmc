@@ -4,7 +4,8 @@ gcmc package: Monte Carlo simulation tools for surface/adsorbate and solid syste
 Exports:
 - BaseMC: Generic MC infrastructure.
 - SurfaceMCBase: Slab/adsorbate-specific MC infrastructure.
-- GCMC: Grand Canonical Monte Carlo.
+- GCMC: Legacy Grand Canonical Monte Carlo.
+- AdsorbateGCMC: Site-based grand-canonical MC for adsorbates.
 - AdsorbateCMC: Replica-compatible canonical MC for fixed-loading adsorbates.
 - AlloyCMC: Canonical Monte Carlo for solids.
 - SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids.
@@ -15,6 +16,7 @@ Exports:
 from .base import BaseMC, SurfaceMCBase
 from .gcmc import GCMC
 from .adsorbate_cmc import AdsorbateCMC
+from .adsorbate_gcmc import AdsorbateGCMC
 from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
@@ -31,6 +33,7 @@ __all__ = [
     "BaseMC",
     "SurfaceMCBase",
     "GCMC",
+    "AdsorbateGCMC",
     "AdsorbateCMC",
     "AlloyCMC",
     "SemiGrandAlloyMC",

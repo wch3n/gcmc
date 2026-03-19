@@ -8,10 +8,13 @@ placement (works for any coverage, e.g., 2.5 ML).
 All functions compatible with ASE Atoms objects.
 """
 
+import os
 import numpy as np
-from typing import List, Literal, Optional, Sequence
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 from ase import Atom, Atoms
 from ase.geometry import find_mic
+from ase.io import read
+from ase.symbols import string2symbols
 from scipy.spatial import Delaunay
 
 
@@ -65,6 +68,23 @@ def _select_site_layers_for_coverage(
             )
 
     return selected_layers
+
+
+def _normalize_site_types(
+    site_types: Union[str, Sequence[str]],
+) -> Tuple[str, ...]:
+    raw = _normalize_symbol_list(site_types)
+    normalized = tuple(
+        "atop" if str(site).lower() == "top" else str(site).lower() for site in raw
+    )
+    if "all" in normalized:
+        return ("atop", "bridge", "fcc", "hcp")
+    allowed = {"atop", "bridge", "fcc", "hcp"}
+    if not set(normalized).issubset(allowed):
+        raise ValueError(
+            "site_types must be drawn from 'atop', 'bridge', 'fcc', 'hcp', or 'all'."
+        )
+    return normalized
 
 
 def generate_nonuniform_temperature_grid(
@@ -239,6 +259,317 @@ def get_hollow_xy(toplayer_xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
     return np.array(hollow_xy_unique)
 
 
+def _normalize_symbol_list(
+    elements: Union[str, Sequence[str]],
+) -> Tuple[str, ...]:
+    if isinstance(elements, str):
+        tokens = tuple(token for token in elements.replace(",", " ").split() if token)
+        if tokens:
+            return tokens
+        return tuple(string2symbols(elements))
+    return tuple(str(el) for el in elements)
+
+
+def _cell_2d(cell: np.ndarray) -> np.ndarray:
+    return np.column_stack((cell[0, :2], cell[1, :2]))
+
+
+def _wrap_xy(xy: np.ndarray, cell: np.ndarray) -> np.ndarray:
+    cell_2d = _cell_2d(np.asarray(cell, dtype=float))
+    frac = np.linalg.solve(cell_2d, np.asarray(xy, dtype=float))
+    frac -= np.floor(frac)
+    return np.dot(cell_2d, frac)
+
+
+def _xy_distances(
+    xy: np.ndarray,
+    points_xy: np.ndarray,
+    cell: np.ndarray,
+    pbc: Sequence[bool],
+) -> np.ndarray:
+    if len(points_xy) == 0:
+        return np.array([], dtype=float)
+    disp = np.zeros((len(points_xy), 3), dtype=float)
+    disp[:, :2] = np.asarray(points_xy, dtype=float) - np.asarray(xy, dtype=float)[None, :]
+    disp_mic, _ = find_mic(disp, np.asarray(cell, dtype=float), np.asarray(pbc, dtype=bool))
+    return np.linalg.norm(disp_mic[:, :2], axis=1)
+
+
+def _midpoint_xy(
+    pos_i: np.ndarray,
+    pos_j: np.ndarray,
+    cell: np.ndarray,
+    pbc: Sequence[bool],
+) -> np.ndarray:
+    disp = np.zeros((1, 3), dtype=float)
+    disp[0] = np.asarray(pos_j, dtype=float) - np.asarray(pos_i, dtype=float)
+    disp_mic, _ = find_mic(disp, np.asarray(cell, dtype=float), np.asarray(pbc, dtype=bool))
+    xy = np.asarray(pos_i, dtype=float)[:2] + 0.5 * disp_mic[0, :2]
+    return _wrap_xy(xy, cell)
+
+
+def _select_surface_atom_indices_by_cluster(
+    atoms: Atoms,
+    elements: Union[str, Sequence[str]],
+    *,
+    surface_side: Literal["top", "bottom"] = "top",
+    layer_tol: float = 0.5,
+) -> np.ndarray:
+    """
+    Select one exposed alloy/support layer from a layered slab using z-clustering.
+    """
+    side = str(surface_side).lower()
+    if side not in {"top", "bottom"}:
+        raise ValueError("surface_side must be 'top' or 'bottom'.")
+    symbols = _normalize_symbol_list(elements)
+    indices = np.array(
+        [atom.index for atom in atoms if atom.symbol in set(symbols)],
+        dtype=int,
+    )
+    if indices.size == 0:
+        raise ValueError(f"No atoms with symbols {symbols} found.")
+
+    zvals = atoms.positions[indices, 2]
+    clusters = _cluster_axis_values(zvals, tol=layer_tol)
+    if not clusters:
+        raise RuntimeError("Could not identify any surface layers.")
+    clusters = sorted(
+        clusters,
+        key=lambda cluster: float(np.mean(zvals[np.asarray(cluster, dtype=int)])),
+        reverse=(side == "top"),
+    )
+    return np.sort(indices[np.asarray(clusters[0], dtype=int)].astype(int))
+
+
+def classify_hollow_sites_on_surface(
+    atoms: Atoms,
+    hollow_xy: np.ndarray,
+    *,
+    elements: Union[str, Sequence[str]],
+    xy_tol: float = 0.5,
+    stacking: Literal["fcc", "hcp"] = "fcc",
+    layer_tol: float = 0.5,
+    surface_side: Literal["top", "bottom"] = "top",
+) -> np.ndarray:
+    """
+    Classify hollow sites against the second/third subsurface alloy layer on a
+    chosen slab side.
+    """
+    side = str(surface_side).lower()
+    if side not in {"top", "bottom"}:
+        raise ValueError("surface_side must be 'top' or 'bottom'.")
+    symbols = set(_normalize_symbol_list(elements))
+    subs = [atom for atom in atoms if atom.symbol in symbols]
+    if not subs:
+        raise ValueError(f"No atoms with symbols {tuple(sorted(symbols))} found.")
+
+    zvals = np.array([atom.position[2] for atom in subs], dtype=float)
+    layer_clusters = _cluster_axis_values(zvals, tol=layer_tol)
+    layer_clusters = sorted(
+        layer_clusters,
+        key=lambda cluster: float(np.mean(zvals[np.asarray(cluster, dtype=int)])),
+        reverse=(side == "top"),
+    )
+    if len(layer_clusters) < 3:
+        raise RuntimeError("Not enough substrate layers to classify hollows.")
+    idx = 2 if stacking == "fcc" else 1
+    ref_atoms = [subs[int(i)] for i in np.asarray(layer_clusters[idx], dtype=int)]
+
+    cell = atoms.cell.array
+    pbc = atoms.pbc
+    selected_hollows = []
+    for xy in np.asarray(hollow_xy, dtype=float):
+        for atom in ref_atoms:
+            dxyz = np.zeros((1, 3), dtype=float)
+            dxyz[0, :2] = atom.position[:2] - xy
+            dxyz_mic, _ = find_mic(dxyz, cell, pbc)
+            if np.linalg.norm(dxyz_mic[0][:2]) < xy_tol:
+                selected_hollows.append(_wrap_xy(xy, cell))
+                break
+    if not selected_hollows:
+        return np.empty((0, 2), dtype=float)
+    unique = []
+    for xy in selected_hollows:
+        if not any(np.linalg.norm(xy - other) < 1e-5 for other in unique):
+            unique.append(xy)
+    return np.asarray(unique, dtype=float)
+
+
+def _auto_bridge_cutoff(
+    positions: np.ndarray,
+    cell: np.ndarray,
+    pbc: Sequence[bool],
+    scale: float,
+) -> float:
+    if len(positions) < 2:
+        return float("nan")
+    nearest = []
+    for i in range(len(positions)):
+        others = np.delete(positions, i, axis=0)
+        disp = np.asarray(others, dtype=float) - np.asarray(positions[i], dtype=float)[None, :]
+        disp_mic, _ = find_mic(disp, np.asarray(cell, dtype=float), np.asarray(pbc, dtype=bool))
+        nearest.append(float(np.min(np.linalg.norm(disp_mic[:, :2], axis=1))))
+    return float(np.median(nearest)) * float(scale)
+
+
+def build_surface_site_registry(
+    atoms: Atoms,
+    *,
+    site_elements: Union[str, Sequence[str]],
+    surface_side: Literal["top", "bottom"] = "top",
+    site_types: Union[str, Sequence[str]] = ("atop", "bridge", "fcc", "hcp"),
+    layer_tol: float = 0.5,
+    xy_tol: float = 0.5,
+    bridge_cutoff: Optional[float] = None,
+    bridge_cutoff_scale: float = 1.15,
+    support_xy_tol: float = 2.5,
+    vertical_offset: float = 1.8,
+    termination_elements: Sequence[str] = (),
+    min_termination_dist: float = 0.75,
+) -> List[Dict[str, object]]:
+    """
+    Build an instantaneous adsorption-site registry for one slab surface.
+
+    Each site record contains:
+    - ``site_type``: atop / bridge / fcc / hcp
+    - ``xy``: wrapped in-plane position
+    - ``anchor_z_A`` and ``suggested_z_A``
+    - ``support_indices`` for the metal/support atoms defining the site
+    - ``blocked_by_termination`` based on nearby terminations on the same side
+    """
+    side = str(surface_side).lower()
+    if side not in {"top", "bottom"}:
+        raise ValueError("surface_side must be 'top' or 'bottom'.")
+    normalized_site_types = _normalize_site_types(site_types)
+
+    surface_indices = _select_surface_atom_indices_by_cluster(
+        atoms,
+        site_elements,
+        surface_side=side,
+        layer_tol=layer_tol,
+    )
+    surface_positions = atoms.positions[surface_indices]
+    if len(surface_indices) == 0:
+        return []
+
+    def _support_anchor(xy: np.ndarray) -> Tuple[float, float, int]:
+        positions = atoms.positions
+        slab_midpoint = float(np.mean(positions[:, 2]))
+        side_mask = positions[:, 2] >= slab_midpoint if side == "top" else positions[:, 2] <= slab_midpoint
+        side_positions = positions[side_mask]
+        distances_xy = _xy_distances(xy, side_positions[:, :2], atoms.cell.array, atoms.pbc)
+        support_mask = distances_xy <= support_xy_tol
+        if not np.any(support_mask):
+            return float("nan"), float("nan"), 0
+        support_positions = side_positions[support_mask]
+        anchor_z = (
+            float(np.max(support_positions[:, 2]))
+            if side == "top"
+            else float(np.min(support_positions[:, 2]))
+        )
+        suggested_z = anchor_z + vertical_offset if side == "top" else anchor_z - vertical_offset
+        return anchor_z, suggested_z, int(np.sum(support_mask))
+
+    def _termination_distance(xy: np.ndarray, suggested_z: float) -> float:
+        if not termination_elements or not np.isfinite(suggested_z):
+            return float("nan")
+        term_mask = np.isin(atoms.get_chemical_symbols(), tuple(termination_elements))
+        termination_positions = atoms.positions[term_mask]
+        if termination_positions.size == 0:
+            return float("nan")
+        slab_midpoint = float(np.mean(atoms.positions[:, 2]))
+        side_mask = termination_positions[:, 2] >= slab_midpoint if side == "top" else termination_positions[:, 2] <= slab_midpoint
+        side_positions = termination_positions[side_mask]
+        if side_positions.size == 0:
+            return float("nan")
+        disp = np.zeros((len(side_positions), 3), dtype=float)
+        disp[:, :2] = side_positions[:, :2] - np.asarray(xy, dtype=float)[None, :]
+        disp[:, 2] = side_positions[:, 2] - float(suggested_z)
+        disp_mic, _ = find_mic(disp, atoms.cell.array, atoms.pbc)
+        return float(np.min(np.linalg.norm(disp_mic, axis=1)))
+
+    registry: List[Dict[str, object]] = []
+    seen: Dict[str, List[np.ndarray]] = {site_type: [] for site_type in normalized_site_types}
+    unique_tol = 1e-4
+
+    def _append_site(site_type: str, xy: np.ndarray, support_indices_for_site: np.ndarray) -> None:
+        xy_wrapped = _wrap_xy(np.asarray(xy, dtype=float), atoms.cell.array)
+        if any(np.linalg.norm(xy_wrapped - other) < unique_tol for other in seen[site_type]):
+            return
+        anchor_z, suggested_z, support_atom_count_local = _support_anchor(xy_wrapped)
+        termination_dist = _termination_distance(xy_wrapped, suggested_z)
+        registry.append(
+            {
+                "site_type": site_type,
+                "surface_side": side,
+                "xy": xy_wrapped,
+                "support_indices": np.asarray(support_indices_for_site, dtype=int),
+                "anchor_z_A": anchor_z,
+                "suggested_z_A": suggested_z,
+                "support_atom_count_local": int(support_atom_count_local),
+                "nearest_termination_dist_A": termination_dist,
+                "blocked_by_termination": bool(
+                    np.isfinite(termination_dist) and termination_dist < float(min_termination_dist)
+                ),
+            }
+        )
+        seen[site_type].append(xy_wrapped)
+
+    if "atop" in normalized_site_types:
+        for support_idx in surface_indices:
+            _append_site("atop", atoms.positions[int(support_idx), :2], np.asarray([support_idx], dtype=int))
+
+    if "bridge" in normalized_site_types and len(surface_indices) >= 2:
+        cutoff = float(bridge_cutoff) if bridge_cutoff is not None else _auto_bridge_cutoff(
+            surface_positions,
+            atoms.cell.array,
+            atoms.pbc,
+            bridge_cutoff_scale,
+        )
+        if np.isfinite(cutoff):
+            for i_local, idx_i in enumerate(surface_indices[:-1]):
+                for idx_j in surface_indices[i_local + 1 :]:
+                    vector = np.asarray(
+                        atoms.get_distances(int(idx_i), int(idx_j), mic=True, vector=True),
+                        dtype=float,
+                    )
+                    if float(np.linalg.norm(vector[:2])) <= cutoff:
+                        xy = _midpoint_xy(
+                            atoms.positions[int(idx_i)],
+                            atoms.positions[int(idx_j)],
+                            atoms.cell.array,
+                            atoms.pbc,
+                        )
+                        _append_site("bridge", xy, np.asarray([idx_i, idx_j], dtype=int))
+
+    if any(site in normalized_site_types for site in ("fcc", "hcp")) and len(surface_indices) >= 3:
+        hollow_xy = get_hollow_xy(surface_positions[:, :2], atoms.cell.array)
+        for site_type in ("fcc", "hcp"):
+            if site_type not in normalized_site_types:
+                continue
+            selected_xy = classify_hollow_sites_on_surface(
+                atoms,
+                hollow_xy,
+                elements=site_elements,
+                xy_tol=xy_tol,
+                stacking=site_type,
+                layer_tol=layer_tol,
+                surface_side=side,
+            )
+            for xy in np.asarray(selected_xy, dtype=float):
+                distances_xy = _xy_distances(
+                    xy,
+                    surface_positions[:, :2],
+                    atoms.cell.array,
+                    atoms.pbc,
+                )
+                order = np.argsort(distances_xy)
+                support = surface_indices[order[: min(3, len(order))]]
+                _append_site(site_type, xy, np.asarray(support, dtype=int))
+
+    return registry
+
+
 def classify_hollow_sites(
     atoms: Atoms,
     hollow_xy: np.ndarray,
@@ -356,6 +687,161 @@ def generate_adsorbate_configuration(
             pos = np.array([xy[0], xy[1], z_max + vertical_offset])
             atoms_new.append(Atom(element, pos))
     return atoms_new
+
+
+def _load_adsorbate_template(
+    adsorbate: Union[str, Atoms],
+) -> Atoms:
+    """Load a monoatomic or molecular adsorbate template."""
+    if isinstance(adsorbate, Atoms):
+        return adsorbate.copy()
+    if isinstance(adsorbate, str):
+        if os.path.exists(adsorbate):
+            return read(adsorbate)
+        symbols = string2symbols(adsorbate)
+        if len(symbols) != 1:
+            raise ValueError(
+                "String adsorbates must be a single chemical symbol or a structure file."
+            )
+        return Atoms(symbols=symbols, positions=[(0.0, 0.0, 0.0)])
+    raise TypeError("adsorbate must be an ASE Atoms object or a string.")
+
+
+def select_surface_atom_indices(
+    atoms: Atoms,
+    elements: Union[str, Sequence[str]],
+    *,
+    surface_side: Literal["top", "bottom"] = "top",
+    split_method: Literal["count"] = "count",
+    layer_tol: float = 0.5,
+) -> np.ndarray:
+    """
+    Select one exposed surface layer from a two-sided slab.
+
+    ``split_method='count'`` is retained for backward compatibility. The
+    implementation uses tolerance-based z clustering so it also works for
+    multicomponent surfaces where one surface layer spans several elements.
+    """
+    if split_method != "count":
+        raise ValueError("Only split_method='count' is currently supported.")
+    return np.sort(
+        _select_surface_atom_indices_by_cluster(
+            atoms,
+            elements,
+            surface_side=surface_side,
+            layer_tol=layer_tol,
+        ).astype(int)
+    )
+
+
+def initialize_surface_adsorbates(
+    atoms: Atoms,
+    adsorbate: Union[str, Atoms],
+    *,
+    n_adsorbates: int,
+    support_element: Optional[str] = None,
+    site_elements: Optional[Union[str, Sequence[str]]] = None,
+    surface_side: Literal["top", "bottom"] = "top",
+    site_types: Union[str, Sequence[str]] = "atop",
+    layer_tol: float = 0.5,
+    xy_tol: float = 0.5,
+    bridge_cutoff: Optional[float] = None,
+    bridge_cutoff_scale: float = 1.15,
+    support_xy_tol: float = 2.5,
+    vertical_offset: float = 1.8,
+    termination_elements: Sequence[str] = (),
+    min_termination_dist: float = 0.75,
+    anchor_index: int = 0,
+    seed: int = 42,
+) -> Tuple[Atoms, np.ndarray, np.ndarray]:
+    """
+    Place a fixed number of adsorbates on a chosen slab surface using an
+    instantaneous high-symmetry site registry.
+
+    Returns:
+        atoms_new: structure with adsorbates added
+        selected_support_indices: chosen support/site-defining atom indices
+        candidate_support_indices: all eligible support/site-defining atom indices
+    """
+    adsorbate_template = _load_adsorbate_template(adsorbate)
+    if not (0 <= int(anchor_index) < len(adsorbate_template)):
+        raise ValueError("anchor_index is out of range for the adsorbate template.")
+    if int(n_adsorbates) < 1:
+        raise ValueError("n_adsorbates must be >= 1.")
+
+    if site_elements is None:
+        if support_element is None:
+            raise ValueError("Provide either support_element or site_elements.")
+        site_elements = support_element
+
+    registry = build_surface_site_registry(
+        atoms,
+        site_elements=site_elements,
+        surface_side=surface_side,
+        site_types=site_types,
+        layer_tol=layer_tol,
+        xy_tol=xy_tol,
+        bridge_cutoff=bridge_cutoff,
+        bridge_cutoff_scale=bridge_cutoff_scale,
+        support_xy_tol=support_xy_tol,
+        vertical_offset=vertical_offset,
+        termination_elements=termination_elements,
+        min_termination_dist=min_termination_dist,
+    )
+    candidate_sites = [
+        row
+        for row in registry
+        if np.isfinite(float(row["suggested_z_A"]))
+        and not bool(row["blocked_by_termination"])
+    ]
+    if not candidate_sites:
+        raise RuntimeError("No eligible adsorption sites were generated.")
+    if int(n_adsorbates) > len(candidate_sites):
+        raise ValueError(
+            f"n_adsorbates must satisfy 1 <= n_adsorbates <= {len(candidate_sites)}."
+        )
+
+    rng = np.random.default_rng(seed)
+    selected_site_indices = np.asarray(
+        rng.choice(len(candidate_sites), size=int(n_adsorbates), replace=False),
+        dtype=int,
+    )
+    selected_sites = [candidate_sites[int(i)] for i in selected_site_indices]
+
+    atoms_new = atoms.copy()
+    relative = (
+        adsorbate_template.get_positions()
+        - adsorbate_template.positions[int(anchor_index)].copy()
+    )
+    selected_support_groups = []
+    for site in selected_sites:
+        anchor_pos = np.array(
+            [
+                float(site["xy"][0]),
+                float(site["xy"][1]),
+                float(site["suggested_z_A"]),
+            ],
+            dtype=float,
+        )
+        for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
+            atoms_new.append(Atom(symbol, anchor_pos + rel))
+        selected_support_groups.append(np.asarray(site["support_indices"], dtype=int))
+
+    selected_support_indices = (
+        np.unique(np.concatenate(selected_support_groups))
+        if selected_support_groups
+        else np.array([], dtype=int)
+    )
+    candidate_support_indices = np.unique(
+        np.concatenate(
+            [
+                np.asarray(site["support_indices"], dtype=int)
+                for site in candidate_sites
+            ]
+        )
+    )
+
+    return atoms_new, selected_support_indices, candidate_support_indices
 
 
 def initialize_alloy_sublattice(

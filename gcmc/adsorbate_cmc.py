@@ -5,17 +5,20 @@ import pickle
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from ase import Atoms
+from ase import units
+from ase.constraints import FixCartesian
 from ase.geometry import get_distances
 from ase.io import Trajectory, read, write
+from ase.md.langevin import Langevin
+from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
+from ase.md.verlet import VelocityVerlet
 from ase.symbols import string2symbols
 
 from .base import SurfaceMCBase
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .utils import (
     _select_site_layers_for_coverage,
-    classify_hollow_sites,
-    get_hollow_xy,
-    get_toplayer_xy,
+    build_surface_site_registry,
 )
 
 logger = logging.getLogger("mc")
@@ -62,29 +65,25 @@ def _rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
-def _site_xy_for_surface(
-    atoms: Atoms,
-    site_type: str,
-    top_layer_element: Optional[str],
-    xy_tol: float,
-) -> np.ndarray:
-    if top_layer_element is None:
-        return np.empty((0, 2), dtype=float)
-    if site_type == "atop":
-        return np.asarray(get_toplayer_xy(atoms, element=top_layer_element), dtype=float)
-
-    atop_xy = get_toplayer_xy(atoms, element=top_layer_element)
-    hollow_xy = get_hollow_xy(atop_xy, atoms.get_cell().array)
-    return np.asarray(
-        classify_hollow_sites(
-            atoms,
-            hollow_xy,
-            element=top_layer_element,
-            xy_tol=xy_tol,
-            stacking=site_type,
-        ),
-        dtype=float,
+def _normalize_site_types(
+    site_type: Union[str, Sequence[str]],
+) -> Tuple[str, ...]:
+    if isinstance(site_type, str):
+        tokens = tuple(token for token in site_type.replace(",", " ").split() if token)
+        normalized = tokens if tokens else (site_type,)
+    else:
+        normalized = tuple(str(token) for token in site_type)
+    normalized = tuple(
+        "atop" if token.lower() == "top" else token.lower() for token in normalized
     )
+    if "all" in normalized:
+        return ("atop", "bridge", "fcc", "hcp")
+    allowed = {"atop", "bridge", "fcc", "hcp"}
+    if not set(normalized).issubset(allowed):
+        raise ValueError(
+            "site_type must contain only 'atop', 'bridge', 'fcc', 'hcp', or 'all'."
+        )
+    return normalized
 
 
 def _place_adsorbate_template(
@@ -92,22 +91,25 @@ def _place_adsorbate_template(
     adsorbate_template: Atoms,
     *,
     anchor_index: int,
-    site_xy: np.ndarray,
+    site_registry: Sequence[Dict[str, object]],
     coverage: float,
-    support_xy_tol: float,
-    vertical_offset: float,
     seed: int,
 ) -> Atoms:
     rng = np.random.default_rng(seed)
     atoms_new = atoms.copy()
-    cell = atoms_new.get_cell()
     relative = (
         adsorbate_template.get_positions()
         - adsorbate_template.positions[anchor_index].copy()
     )
-    n_sites = len(site_xy)
+    candidate_sites = [
+        row
+        for row in site_registry
+        if np.isfinite(float(row["suggested_z_A"]))
+        and not bool(row["blocked_by_termination"])
+    ]
+    n_sites = len(candidate_sites)
     if n_sites == 0:
-        raise RuntimeError("*** NO REGISTRY SITES AVAILABLE ***")
+        raise RuntimeError("*** NO ELIGIBLE REGISTRY SITES AVAILABLE ***")
 
     tags = np.asarray(atoms_new.get_tags(), dtype=int)
     if len(tags) != len(atoms_new):
@@ -116,23 +118,15 @@ def _place_adsorbate_template(
     group_id = 0
     for layer_indices in _select_site_layers_for_coverage(n_sites, coverage, rng):
         for site_idx in np.asarray(layer_indices, dtype=int):
-            xy = np.asarray(site_xy[site_idx], dtype=float)
-            neighbors_z = []
-            for atom in atoms_new:
-                dxy = atom.position[:2] - xy
-                trial_xyz = np.zeros((1, 3))
-                trial_xyz[0, :2] = dxy
-                mic = get_distances(
-                    np.zeros((1, 3)), trial_xyz, cell=cell, pbc=atoms_new.pbc
-                )[1].flatten()[0]
-                if mic < support_xy_tol:
-                    neighbors_z.append(atom.position[2])
-            if not neighbors_z:
-                raise RuntimeError(
-                    f"No support found at site ({xy[0]:.3f}, {xy[1]:.3f}) for adsorbate placement."
-                )
-            anchor_z = max(neighbors_z) + vertical_offset
-            anchor_pos = np.array([xy[0], xy[1], anchor_z], dtype=float)
+            site = candidate_sites[int(site_idx)]
+            anchor_pos = np.array(
+                [
+                    float(site["xy"][0]),
+                    float(site["xy"][1]),
+                    float(site["suggested_z_A"]),
+                ],
+                dtype=float,
+            )
 
             group_tag = ADSORBATE_TAG_OFFSET + group_id
             for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
@@ -154,11 +148,12 @@ class AdsorbateCMC(SurfaceMCBase):
     atom defines support and site-hop placement.
 
     Tolerance conventions:
-    - ``xy_tol`` is retained for backward compatibility, but in the current
-      implementation it acts as the minimum full 3D clearance used by
-      `_group_positions_are_valid()`.
-    - ``same_site_tol`` is the in-plane threshold used to reject site-hop
-      proposals that land on the current site.
+    - ``min_clearance`` is the minimum full 3D adsorbate/slab clearance.
+    - ``site_match_tol`` controls how strictly high-symmetry sites are matched
+      on the instantaneous surface.
+    - ``surface_layer_tol`` controls z-layer clustering for the exposed surface.
+    - ``termination_clearance`` blocks sites or trial placements that come too
+      close to surface terminations.
     """
 
     def __init__(
@@ -172,8 +167,10 @@ class AdsorbateCMC(SurfaceMCBase):
         substrate_elements: Tuple[str, ...] = ("Ti", "C"),
         functional_elements: Optional[Tuple[str, ...]] = None,
         top_layer_element: Optional[str] = None,
+        site_elements: Optional[Union[str, Sequence[str]]] = None,
+        surface_side: str = "top",
         coverage: Optional[float] = None,
-        site_type: str = "fcc",
+        site_type: Union[str, Sequence[str]] = "fcc",
         move_mode: str = "displacement",
         site_hop_prob: float = 0.5,
         reorientation_prob: float = 0.2,
@@ -181,10 +178,11 @@ class AdsorbateCMC(SurfaceMCBase):
         max_displacement_trials: int = 10,
         max_reorientation_trials: Optional[int] = None,
         rotation_max_angle_deg: float = 25.0,
-        min_moves_per_sweep: int = 5,
-        xy_tol: float = 0.5,
-        same_site_tol: Optional[float] = None,
-        support_xy_tol: Optional[float] = None,
+        min_clearance: float = 0.8,
+        site_match_tol: float = 0.6,
+        surface_layer_tol: float = 0.5,
+        termination_clearance: float = 0.75,
+        bridge_cutoff: Optional[float] = None,
         z_max_support: float = 3.5,
         vertical_offset: float = 1.8,
         detach_tol: float = 3.0,
@@ -202,6 +200,17 @@ class AdsorbateCMC(SurfaceMCBase):
         checkpoint_interval: int = 100,
         seed: int = 81,
         resume: bool = False,
+        enable_hybrid_md: bool = False,
+        md_move_prob: float = 0.1,
+        md_steps: int = 50,
+        md_timestep_fs: float = 1.0,
+        md_ensemble: str = "nve",
+        md_accept_mode: str = "potential",
+        md_friction: float = 0.01,
+        md_planar: bool = False,
+        md_planar_axis: int = 2,
+        md_init_momenta: bool = True,
+        md_remove_drift: bool = True,
         **kwargs,
     ):
         if isinstance(atoms, str):
@@ -240,10 +249,8 @@ class AdsorbateCMC(SurfaceMCBase):
                     )
                 )
 
-        if support_xy_tol is None:
-            support_xy_tol = xy_tol
-        if same_site_tol is None:
-            same_site_tol = xy_tol
+        support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
+        same_site_tol = max(0.2, 0.5 * float(site_match_tol))
 
         super().__init__(
             atoms=self.atoms,
@@ -283,15 +290,45 @@ class AdsorbateCMC(SurfaceMCBase):
             )
         if rotation_max_angle_deg < 0.0:
             raise ValueError("rotation_max_angle_deg must be >= 0.")
+        if min_clearance <= 0.0:
+            raise ValueError("min_clearance must be > 0.")
+        if site_match_tol <= 0.0:
+            raise ValueError("site_match_tol must be > 0.")
+        if surface_layer_tol <= 0.0:
+            raise ValueError("surface_layer_tol must be > 0.")
+        if termination_clearance < 0.0:
+            raise ValueError("termination_clearance must be >= 0.")
+        if bridge_cutoff is not None and bridge_cutoff <= 0.0:
+            raise ValueError("bridge_cutoff must be > 0 when provided.")
 
         self.T = T
+        if surface_side not in {"top", "bottom"}:
+            raise ValueError("surface_side must be 'top' or 'bottom'.")
         self.top_layer_element = (
             top_layer_element
             if top_layer_element is not None
             else (substrate_elements[0] if substrate_elements else None)
         )
+        if site_elements is None:
+            resolved_site_elements: Tuple[str, ...] = (
+                (self.top_layer_element,) if self.top_layer_element is not None else ()
+            )
+        elif isinstance(site_elements, str):
+            tokens = tuple(
+                token for token in site_elements.replace(",", " ").split() if token
+            )
+            resolved_site_elements = tokens if tokens else tuple(string2symbols(site_elements))
+        else:
+            resolved_site_elements = tuple(str(el) for el in site_elements)
+        self.site_elements = resolved_site_elements
+        if not self.site_elements:
+            raise ValueError(
+                "site_elements resolved to an empty set. Provide site_elements or top_layer_element."
+            )
+        self.surface_side = surface_side
         self.coverage = coverage
-        self.site_type = site_type
+        self.site_types = _normalize_site_types(site_type)
+        self.site_type = self.site_types[0] if len(self.site_types) == 1 else "all"
         self.move_mode = move_mode
         self.site_hop_prob = float(site_hop_prob)
         self.reorientation_prob = float(reorientation_prob)
@@ -303,15 +340,16 @@ class AdsorbateCMC(SurfaceMCBase):
             else int(max_displacement_trials)
         )
         self.rotation_max_angle_rad = np.deg2rad(float(rotation_max_angle_deg))
-        self.min_moves_per_sweep = int(min_moves_per_sweep)
-        # Historical name kept for API compatibility; this is used as a 3D
-        # minimum-separation cutoff in _group_positions_are_valid().
-        self.xy_tol = xy_tol
-        # Dedicated in-plane threshold for skipping current-site hops.
+        self.min_clearance = float(min_clearance)
+        self.site_match_tol = float(site_match_tol)
         self.same_site_tol = float(same_site_tol)
-        self.support_xy_tol = support_xy_tol
+        self.support_xy_tol = float(support_xy_tol)
         self.z_max_support = z_max_support
         self.vertical_offset = vertical_offset
+        self.surface_layer_tol = float(surface_layer_tol)
+        self.bridge_cutoff = bridge_cutoff
+        self.bridge_cutoff_scale = 1.15
+        self.termination_clearance = float(termination_clearance)
         self.relax = relax
         self.traj_file = traj_file
         self.accepted_traj_file = accepted_traj_file
@@ -320,7 +358,39 @@ class AdsorbateCMC(SurfaceMCBase):
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
-        self._site_xy: Optional[np.ndarray] = None
+        self._site_registry: Optional[list[dict[str, object]]] = None
+        self.enable_hybrid_md = bool(enable_hybrid_md)
+        self.md_move_prob = float(md_move_prob)
+        self.md_steps = int(md_steps)
+        self.md_timestep_fs = float(md_timestep_fs)
+        self.md_ensemble = str(md_ensemble).lower()
+        self.md_accept_mode = str(md_accept_mode).lower()
+        self.md_friction = float(md_friction)
+        self.md_planar = bool(md_planar)
+        self.md_planar_axis = int(md_planar_axis)
+        self.md_init_momenta = bool(md_init_momenta)
+        self.md_remove_drift = bool(md_remove_drift)
+        if not (0.0 <= self.md_move_prob <= 1.0):
+            raise ValueError("md_move_prob must be in [0, 1].")
+        if self.md_steps < 1:
+            raise ValueError("md_steps must be >= 1.")
+        if self.md_timestep_fs <= 0.0:
+            raise ValueError("md_timestep_fs must be > 0.")
+        if self.md_ensemble not in ("nve", "langevin"):
+            raise ValueError("md_ensemble must be 'nve' or 'langevin'.")
+        if self.md_accept_mode not in ("potential", "hamiltonian"):
+            raise ValueError("md_accept_mode must be 'potential' or 'hamiltonian'.")
+        if self.md_planar_axis not in (0, 1, 2):
+            raise ValueError("md_planar_axis must be 0, 1, or 2.")
+        if self.md_accept_mode == "hamiltonian":
+            if self.md_ensemble != "nve":
+                raise ValueError(
+                    "md_accept_mode='hamiltonian' requires md_ensemble='nve'."
+                )
+            if not self.md_init_momenta:
+                raise ValueError(
+                    "md_accept_mode='hamiltonian' requires md_init_momenta=True."
+                )
 
         self._update_indices()
         self.sum_E = 0.0
@@ -328,6 +398,8 @@ class AdsorbateCMC(SurfaceMCBase):
         self.n_samples = 0
         self.accepted_moves = 0
         self.total_moves = 0
+        self.md_attempted_moves = 0
+        self.md_accepted_moves = 0
         self.sweep = 0
 
         self.atoms.calc = self.calculator
@@ -478,6 +550,10 @@ class AdsorbateCMC(SurfaceMCBase):
             if (not ads_mask[i]) and atom.symbol in self.functional_elements
         ]
 
+    def _refresh_cached_state(self) -> None:
+        self._site_registry = None
+        self._update_indices()
+
     @classmethod
     def from_clean_surface(
         cls,
@@ -488,22 +564,23 @@ class AdsorbateCMC(SurfaceMCBase):
         adsorbate_anchor_index: int = 0,
         substrate_elements: Tuple[str, ...] = ("Ti", "C"),
         top_layer_element: str = "Ti",
+        site_elements: Optional[Union[str, Sequence[str]]] = None,
+        surface_side: str = "top",
         functional_elements: Optional[Tuple[str, ...]] = None,
         coverage: float = 1.0,
-        site_type: str = "fcc",
-        xy_tol: float = 0.5,
-        same_site_tol: Optional[float] = None,
-        support_xy_tol: Optional[float] = None,
+        site_type: Union[str, Sequence[str]] = "fcc",
+        min_clearance: float = 0.8,
+        site_match_tol: float = 0.6,
+        surface_layer_tol: float = 0.5,
+        termination_clearance: float = 0.75,
+        bridge_cutoff: Optional[float] = None,
         vertical_offset: float = 1.8,
         detach_tol: float = 3.0,
         seed: int = 81,
         initial_traj_file: str = "adsorbate_cmc_initial.traj",
         **kwargs,
     ) -> "AdsorbateCMC":
-        if support_xy_tol is None:
-            support_xy_tol = xy_tol
-        if same_site_tol is None:
-            same_site_tol = xy_tol
+        support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
         if functional_elements is None:
             functional_elements = tuple(
                 sorted(
@@ -521,20 +598,30 @@ class AdsorbateCMC(SurfaceMCBase):
             raise ValueError(
                 "adsorbate_anchor_index is out of range for the adsorbate template."
             )
-        site_xy = _site_xy_for_surface(
+        site_registry = build_surface_site_registry(
             atoms,
-            site_type=site_type,
-            top_layer_element=top_layer_element,
-            xy_tol=xy_tol,
+            site_elements=(
+                site_elements
+                if site_elements is not None
+                else ((top_layer_element,) if top_layer_element is not None else ())
+            ),
+            surface_side=surface_side,
+            site_types=site_type,
+            layer_tol=surface_layer_tol,
+            xy_tol=site_match_tol,
+            bridge_cutoff=bridge_cutoff,
+            bridge_cutoff_scale=1.15,
+            support_xy_tol=support_xy_tol,
+            vertical_offset=vertical_offset,
+            termination_elements=functional_elements,
+            min_termination_dist=termination_clearance,
         )
         atoms_with_ads = _place_adsorbate_template(
             atoms,
             adsorbate_template,
             anchor_index=int(adsorbate_anchor_index),
-            site_xy=site_xy,
+            site_registry=site_registry,
             coverage=coverage,
-            support_xy_tol=support_xy_tol,
-            vertical_offset=vertical_offset,
             seed=seed,
         )
         write(initial_traj_file, atoms_with_ads)
@@ -550,12 +637,16 @@ class AdsorbateCMC(SurfaceMCBase):
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
             top_layer_element=top_layer_element,
+            site_elements=site_elements,
+            surface_side=surface_side,
             coverage=coverage,
             site_type=site_type,
-            xy_tol=xy_tol,
-            same_site_tol=same_site_tol,
-            support_xy_tol=support_xy_tol,
+            min_clearance=min_clearance,
+            site_match_tol=site_match_tol,
+            surface_layer_tol=surface_layer_tol,
+            termination_clearance=termination_clearance,
             vertical_offset=vertical_offset,
+            bridge_cutoff=bridge_cutoff,
             detach_tol=detach_tol,
             seed=seed,
             **kwargs,
@@ -594,7 +685,7 @@ class AdsorbateCMC(SurfaceMCBase):
         self.sum_E = state.get("sum_E", 0.0)
         self.sum_E_sq = state.get("sum_E_sq", 0.0)
         self.n_samples = state.get("n_samples", 0)
-        self._site_xy = None
+        self._site_registry = None
         self._update_indices()
         logger.info(f"[{self.T:.0f}K] Resumed adsorbate MC from checkpoint.")
 
@@ -605,11 +696,86 @@ class AdsorbateCMC(SurfaceMCBase):
             beta = 1.0 / (KB_EV_PER_K * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
 
+    def _apply_planar_constraint(self, atoms_obj: Atoms) -> None:
+        if not self.md_planar:
+            return
+
+        mask = [False, False, False]
+        mask[self.md_planar_axis] = True
+        planar_fix = FixCartesian(np.arange(len(atoms_obj)), mask=mask)
+
+        existing = atoms_obj.constraints
+        if existing is None:
+            atoms_obj.set_constraint(planar_fix)
+            return
+        if isinstance(existing, (list, tuple)):
+            atoms_obj.set_constraint(list(existing) + [planar_fix])
+            return
+        atoms_obj.set_constraint([existing, planar_fix])
+
+    def _project_momenta_to_plane(self, atoms_obj: Atoms) -> None:
+        if not self.md_planar:
+            return
+
+        momenta = atoms_obj.get_momenta()
+        momenta[:, self.md_planar_axis] = 0.0
+        atoms_obj.set_momenta(momenta)
+
+    def _propose_md_move(self) -> Tuple[Optional[Atoms], float, float]:
+        atoms_trial = self.atoms.copy()
+        atoms_trial.calc = self.calculator
+        self._apply_planar_constraint(atoms_trial)
+
+        if self.md_init_momenta:
+            MaxwellBoltzmannDistribution(
+                atoms_trial,
+                temperature_K=self.T,
+                rng=self.rng,
+            )
+            if self.md_remove_drift:
+                Stationary(atoms_trial)
+            self._project_momenta_to_plane(atoms_trial)
+
+        e_old = self.e_old
+        k_old = atoms_trial.get_kinetic_energy()
+        dt = self.md_timestep_fs * units.fs
+        if self.md_ensemble == "langevin":
+            dyn = Langevin(
+                atoms_trial,
+                timestep=dt,
+                temperature_K=self.T,
+                friction=self.md_friction,
+                rng=self.rng,
+            )
+        else:
+            dyn = VelocityVerlet(atoms_trial, timestep=dt)
+
+        try:
+            dyn.run(self.md_steps)
+            e_new = self.get_potential_energy(atoms_trial)
+        except Exception as exc:
+            logger.warning(f"Adsorbate MD trial move failed: {exc}")
+            return None, 0.0, 0.0
+
+        delta_e = e_new - e_old
+        k_new = atoms_trial.get_kinetic_energy()
+        delta_h = (e_new + k_new) - (e_old + k_old)
+        return atoms_trial, delta_e, delta_h
+
     def _moves_per_sweep(self) -> int:
         n_ads = len(self.ads_groups)
         if n_ads == 0:
             return 0
-        return max(n_ads, self.min_moves_per_sweep)
+        if self.move_mode in ("site_hop", "hybrid"):
+            active_sites = sum(
+                1
+                for row in self._get_site_registry()
+                if np.isfinite(float(row.get("suggested_z_A", np.nan)))
+                and not bool(row.get("blocked_by_termination", False))
+            )
+            if active_sites > 0:
+                return int(active_sites)
+        return int(n_ads)
 
     def _candidate_support_z(
         self, new_xy: np.ndarray, exclude_indices: Optional[Sequence[int]] = None
@@ -629,7 +795,11 @@ class AdsorbateCMC(SurfaceMCBase):
         support_indices = np.where(dxy < self.support_xy_tol)[0]
         if len(support_indices) == 0:
             return None
-        return float(np.max(all_pos[support_indices, 2]) + self.vertical_offset)
+        if self.surface_side == "top":
+            anchor_z = np.max(all_pos[support_indices, 2]) + self.vertical_offset
+        else:
+            anchor_z = np.min(all_pos[support_indices, 2]) - self.vertical_offset
+        return float(anchor_z)
 
     def _position_is_valid(self, idx: int, trial_pos: np.ndarray) -> bool:
         return self._group_positions_are_valid(
@@ -665,7 +835,7 @@ class AdsorbateCMC(SurfaceMCBase):
             cell=cell,
             pbc=pbc,
         )[1]
-        return float(np.min(dists)) >= self.xy_tol
+        return float(np.min(dists)) >= self.min_clearance
 
     def get_non_buried_adsorbate_indices(
         self,
@@ -694,7 +864,8 @@ class AdsorbateCMC(SurfaceMCBase):
             deltas, _ = get_distances(anchor_pos, other_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
             dz = other_pos[:, 2] - anchor_pos[2]
-            mask = (dxy < support_xy_tol) & (dz > z_tol)
+            side_sign = 1.0 if self.surface_side == "top" else -1.0
+            mask = (dxy < support_xy_tol) & ((side_sign * dz) > z_tol)
             if not np.any(mask):
                 non_buried_group_ids.append(group_id)
         return non_buried_group_ids
@@ -733,36 +904,67 @@ class AdsorbateCMC(SurfaceMCBase):
 
             lateral_mask = dxy < support_xy_tol
             dz_lateral = dz[lateral_mask]
-            support_mask = (dz_lateral > 0) & (dz_lateral < z_max_support)
+            side_sign = 1.0 if self.surface_side == "top" else -1.0
+            support_mask = ((side_sign * dz_lateral) > 0) & (
+                (side_sign * dz_lateral) < z_max_support
+            )
             if not np.any(support_mask):
                 return True
         return False
 
-    def _build_site_xy(self) -> np.ndarray:
-        if self.top_layer_element is None:
-            return np.empty((0, 2), dtype=float)
-        if self.site_type == "atop":
-            return np.asarray(
-                get_toplayer_xy(self.atoms, element=self.top_layer_element), dtype=float
-            )
-
-        atop_xy = get_toplayer_xy(self.atoms, element=self.top_layer_element)
-        hollow_xy = get_hollow_xy(atop_xy, self.atoms.get_cell().array)
-        return np.asarray(
-            classify_hollow_sites(
-                self.atoms,
-                hollow_xy,
-                element=self.top_layer_element,
-                xy_tol=self.xy_tol,
-                stacking=self.site_type,
-            ),
-            dtype=float,
+    def _build_site_registry(self) -> list[dict[str, object]]:
+        return build_surface_site_registry(
+            self.atoms,
+            site_elements=self.site_elements,
+            surface_side=self.surface_side,
+            site_types=self.site_types,
+            layer_tol=self.surface_layer_tol,
+            xy_tol=self.site_match_tol,
+            bridge_cutoff=self.bridge_cutoff,
+            bridge_cutoff_scale=self.bridge_cutoff_scale,
+            support_xy_tol=self.support_xy_tol,
+            vertical_offset=self.vertical_offset,
+            termination_elements=self.functional_elements,
+            min_termination_dist=self.termination_clearance,
         )
 
-    def _get_site_xy(self) -> np.ndarray:
-        if self._site_xy is None:
-            self._site_xy = self._build_site_xy()
-        return self._site_xy
+    def _get_site_registry(self) -> list[dict[str, object]]:
+        if self._site_registry is None:
+            self._site_registry = self._build_site_registry()
+        return self._site_registry
+
+    def _group_clears_terminations(
+        self,
+        group: np.ndarray,
+        trial_positions: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> bool:
+        if self.termination_clearance <= 0.0:
+            return True
+        if atoms is None:
+            atoms = self.atoms
+        if not self.functional_elements:
+            return True
+
+        term_indices = np.asarray(
+            [
+                i
+                for i, atom in enumerate(atoms)
+                if atom.symbol in set(self.functional_elements)
+                and i not in set(np.asarray(group, dtype=int).tolist())
+            ],
+            dtype=int,
+        )
+        if term_indices.size == 0:
+            return True
+
+        dists = get_distances(
+            np.asarray(trial_positions, dtype=float),
+            atoms.get_positions()[term_indices],
+            cell=atoms.get_cell(),
+            pbc=atoms.get_pbc(),
+        )[1]
+        return float(np.min(dists)) >= self.termination_clearance
 
     def _propose_displacement(self) -> Optional[Atoms]:
         movable_group_ids = self.get_non_buried_adsorbate_indices(
@@ -804,10 +1006,13 @@ class AdsorbateCMC(SurfaceMCBase):
 
             new_anchor = np.array([new_xy[0], new_xy[1], new_z], dtype=float)
             trial_positions = new_anchor + relative
-            if self._group_positions_are_valid(group, trial_positions):
-                atoms_new = self.atoms.copy()
-                atoms_new.positions[group] = trial_positions
-                return atoms_new
+            if not self._group_positions_are_valid(group, trial_positions):
+                continue
+            if not self._group_clears_terminations(group, trial_positions):
+                continue
+            atoms_new = self.atoms.copy()
+            atoms_new.positions[group] = trial_positions
+            return atoms_new
 
         return None
 
@@ -818,8 +1023,8 @@ class AdsorbateCMC(SurfaceMCBase):
         if not movable_group_ids:
             return None
 
-        site_xy = self._get_site_xy()
-        if site_xy.size == 0:
+        site_registry = self._get_site_registry()
+        if not site_registry:
             return None
 
         group_id = int(self.rng.choice(movable_group_ids))
@@ -830,9 +1035,15 @@ class AdsorbateCMC(SurfaceMCBase):
         cell = self.atoms.get_cell()
         pbc = self.atoms.get_pbc()
 
-        site_order = self.rng.permutation(len(site_xy))
+        site_order = self.rng.permutation(len(site_registry))
         for site_idx in site_order:
-            xy = np.asarray(site_xy[site_idx], dtype=float)
+            site = site_registry[int(site_idx)]
+            if bool(site.get("blocked_by_termination", False)):
+                continue
+            suggested_z = float(site.get("suggested_z_A", np.nan))
+            if not np.isfinite(suggested_z):
+                continue
+            xy = np.asarray(site["xy"], dtype=float)
             delta_xyz = np.zeros((1, 3), dtype=float)
             delta_xyz[0, :2] = current_anchor[:2] - xy[:2]
             mic_xy = get_distances(
@@ -841,13 +1052,11 @@ class AdsorbateCMC(SurfaceMCBase):
             if mic_xy < self.same_site_tol:
                 continue
 
-            new_z = self._candidate_support_z(xy, exclude_indices=group)
-            if new_z is None:
-                continue
-
-            new_anchor = np.array([xy[0], xy[1], new_z], dtype=float)
+            new_anchor = np.array([xy[0], xy[1], suggested_z], dtype=float)
             trial_positions = new_anchor + relative
             if not self._group_positions_are_valid(group, trial_positions):
+                continue
+            if not self._group_clears_terminations(group, trial_positions):
                 continue
 
             atoms_new = self.atoms.copy()
@@ -887,6 +1096,8 @@ class AdsorbateCMC(SurfaceMCBase):
             trial_relative = relative @ rotation.T
             trial_positions = anchor_pos + trial_relative
             if not self._group_positions_are_valid(group, trial_positions):
+                continue
+            if not self._group_clears_terminations(group, trial_positions):
                 continue
 
             atoms_new = self.atoms.copy()
@@ -939,6 +1150,8 @@ class AdsorbateCMC(SurfaceMCBase):
         self.n_samples = 0
         self.accepted_moves = 0
         self.total_moves = 0
+        self.md_attempted_moves = 0
+        self.md_accepted_moves = 0
 
         if len(self.ads_groups) == 0:
             logger.warning("AdsorbateCMC run started with no adsorbates present.")
@@ -949,6 +1162,48 @@ class AdsorbateCMC(SurfaceMCBase):
 
             for i in range(moves_this_sweep):
                 self.total_moves += 1
+                do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
+                if do_md:
+                    self.md_attempted_moves += 1
+                    atoms_trial, delta_e, delta_h = self._propose_md_move()
+                    if atoms_trial is None:
+                        continue
+
+                    if attempted_writer is not None:
+                        attempted_writer.write(atoms_trial)
+
+                    if self.has_detached_functional_groups(
+                        atoms_trial, detach_tol=self.detach_tol
+                    ):
+                        if rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    if self.has_afloat_adsorbates(
+                        atoms_trial,
+                        support_xy_tol=self.support_xy_tol,
+                        z_max_support=self.z_max_support,
+                    ):
+                        if rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    md_delta = (
+                        delta_h if self.md_accept_mode == "hamiltonian" else delta_e
+                    )
+                    if self._metropolis_accept(md_delta, beta=beta):
+                        self.e_old += delta_e
+                        self.accepted_moves += 1
+                        self.md_accepted_moves += 1
+                        self.atoms.positions = atoms_trial.positions
+                        self.atoms.cell = atoms_trial.cell
+                        self._site_registry = None
+                        if accepted_writer is not None:
+                            accepted_writer.write(self.atoms)
+                    elif rejected_writer is not None:
+                        rejected_writer.write(atoms_trial)
+                    continue
+
                 atoms_trial = self._propose_move()
                 if atoms_trial is None:
                     continue
@@ -987,7 +1242,7 @@ class AdsorbateCMC(SurfaceMCBase):
                     self.e_old = e_new
                     self.accepted_moves += 1
                     if self.relax:
-                        self._site_xy = None
+                        self._site_registry = None
                     if accepted_writer is not None:
                         accepted_writer.write(self.atoms)
                 elif rejected_writer is not None:
@@ -1020,6 +1275,17 @@ class AdsorbateCMC(SurfaceMCBase):
                     f"T={self.T:4.0f}K | {self.sweep:6d} | "
                     f"E: {self.e_old:10.4f} | Avg: {avg:10.4f} | "
                     f"Cv: {cv:8.4f} | Acc: {acc:4.1f}% | Nads: {len(self.ads_groups):4d}"
+                    + (
+                        ""
+                        if not self.enable_hybrid_md
+                        else (
+                            f" | MD: {self.md_accepted_moves}/{self.md_attempted_moves}"
+                            f" ({((self.md_accepted_moves / self.md_attempted_moves) * 100.0) if self.md_attempted_moves else 0.0:4.1f}%)"
+                            f" | MD_frac: {((self.md_attempted_moves / self.total_moves) * 100.0) if self.total_moves else 0.0:4.1f}%"
+                            f" | MD_accept: {self.md_accept_mode}"
+                            f" | planar: {self.md_planar}"
+                        )
+                    )
                 )
 
             if (
@@ -1050,4 +1316,7 @@ class AdsorbateCMC(SurfaceMCBase):
                 else 0.0
             ),
             "n_adsorbates": len(self.ads_groups),
+            "md_attempted": self.md_attempted_moves,
+            "md_accepted": self.md_accepted_moves,
+            "md_accept_mode": self.md_accept_mode,
         }

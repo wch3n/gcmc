@@ -394,16 +394,15 @@ class SurfaceMCBase(BaseMC):
         func_pos = atoms.get_positions()[self.func_indices]
         cell = atoms.get_cell()
         pbc = atoms.get_pbc()
-
-        for i, fpos in enumerate(func_pos):
-            f_xyz = fpos.reshape(1, 3)
-            dists = get_distances(f_xyz, sub_pos, cell=cell, pbc=pbc)[1].flatten()
-            min_d = np.min(dists)
-            if min_d > detach_tol:
-                logger.debug(
-                    f"Functional group atom {self.func_indices[i]} detached: dist {min_d:.2f} A"
-                )
-                return True
+        dists = get_distances(func_pos, sub_pos, cell=cell, pbc=pbc)[1]
+        min_dists = np.min(dists, axis=1)
+        detached = np.where(min_dists > detach_tol)[0]
+        if detached.size > 0:
+            idx = int(detached[0])
+            logger.debug(
+                f"Functional group atom {self.func_indices[idx]} detached: dist {min_dists[idx]:.2f} A"
+            )
+            return True
         return False
 
     def get_non_buried_adsorbate_indices(

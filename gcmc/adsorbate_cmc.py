@@ -891,26 +891,32 @@ class AdsorbateCMC(SurfaceMCBase):
         if len(groups) == 0:
             return False
 
+        ads_mask = np.zeros(len(atoms), dtype=bool)
+        anchor_indices = []
         for group in groups:
-            anchor_idx = int(group[self._group_anchor_local_index(group, atoms=atoms)])
-            anchor_pos = pos[anchor_idx]
-            support_indices = [i for i in range(len(atoms)) if i not in set(group.tolist())]
-            if not support_indices:
-                continue
-            support_pos = pos[support_indices]
-            deltas, _ = get_distances(anchor_pos, support_pos, cell=cell, pbc=pbc)
-            dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
-            dz = anchor_pos[2] - support_pos[:, 2]
-
-            lateral_mask = dxy < support_xy_tol
-            dz_lateral = dz[lateral_mask]
-            side_sign = 1.0 if self.surface_side == "top" else -1.0
-            support_mask = ((side_sign * dz_lateral) > 0) & (
-                (side_sign * dz_lateral) < z_max_support
+            group_arr = np.asarray(group, dtype=int)
+            ads_mask[group_arr] = True
+            anchor_indices.append(
+                int(group_arr[self._group_anchor_local_index(group_arr, atoms=atoms)])
             )
-            if not np.any(support_mask):
-                return True
-        return False
+
+        support_indices = np.where(~ads_mask)[0]
+        if support_indices.size == 0:
+            return True
+
+        anchor_pos = pos[np.asarray(anchor_indices, dtype=int)]
+        support_pos = pos[support_indices]
+        deltas = get_distances(anchor_pos, support_pos, cell=cell, pbc=pbc)[0]
+        dxy = np.linalg.norm(deltas[:, :, :2], axis=2)
+        dz = anchor_pos[:, None, 2] - support_pos[None, :, 2]
+
+        side_sign = 1.0 if self.surface_side == "top" else -1.0
+        support_mask = (
+            (dxy < support_xy_tol)
+            & ((side_sign * dz) > 0)
+            & ((side_sign * dz) < z_max_support)
+        )
+        return bool(np.any(np.sum(support_mask, axis=1) == 0))
 
     def _build_site_registry(self) -> list[dict[str, object]]:
         return build_surface_site_registry(
@@ -946,17 +952,14 @@ class AdsorbateCMC(SurfaceMCBase):
         if not self.functional_elements:
             return True
 
-        term_indices = np.asarray(
-            [
-                i
-                for i, atom in enumerate(atoms)
-                if atom.symbol in set(self.functional_elements)
-                and i not in set(np.asarray(group, dtype=int).tolist())
-            ],
-            dtype=int,
-        )
+        term_indices = np.asarray(self.func_indices, dtype=int)
         if term_indices.size == 0:
             return True
+        group = np.asarray(group, dtype=int)
+        if group.size > 0:
+            term_indices = term_indices[~np.isin(term_indices, group)]
+            if term_indices.size == 0:
+                return True
 
         dists = get_distances(
             np.asarray(trial_positions, dtype=float),

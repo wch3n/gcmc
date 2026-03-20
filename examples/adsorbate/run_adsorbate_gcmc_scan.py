@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from gcmc import AdsorbateGCMC
@@ -63,6 +65,7 @@ CONFIG = SimpleNamespace(
     ray_log_to_driver=False,
     ray_num_cpus_per_task=1,
     ray_num_gpus_per_task=None,
+    worker_log_to_stdout=False,
     output_dir="adsorbate_gcmc_scan",
 )
 
@@ -71,12 +74,34 @@ def _format_mu(mu: float) -> str:
     return f"{mu:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
 
 
+def _configure_mc_logging(log_file: Path, stream: bool = False) -> None:
+    logger = logging.getLogger("mc")
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    if stream:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+
 def _run_one(task: dict) -> dict:
     run_dir = Path(task["run_dir"])
     run_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = SimpleNamespace(**task["config"])
     cfg.device = task["device"]
+    stem = task["stem"]
+    _configure_mc_logging(
+        run_dir / f"{stem}.log",
+        stream=bool(getattr(cfg, "worker_log_to_stdout", False)),
+    )
 
     atoms = load_snapshot(Path(cfg.snapshot), int(cfg.frame))
     if tuple(cfg.repeat) != (1, 1, 1):
@@ -89,7 +114,6 @@ def _run_one(task: dict) -> dict:
         atoms, substrate_elements, cfg.functional_elements
     )
 
-    stem = task["stem"]
     sim = AdsorbateGCMC(
         atoms=atoms,
         calculator=calculator,

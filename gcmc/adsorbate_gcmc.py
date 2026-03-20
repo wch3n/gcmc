@@ -522,12 +522,12 @@ class AdsorbateGCMC(AdsorbateCMC):
                         )
                         if not converged:
                             continue
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
-                    ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
+                        if self.has_detached_functional_groups(
+                            atoms_trial, detach_tol=self.detach_tol
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
                     if self.has_afloat_adsorbates(
                         atoms_trial,
                         support_xy_tol=self.support_xy_tol,
@@ -566,12 +566,12 @@ class AdsorbateGCMC(AdsorbateCMC):
                         )
                         if not converged:
                             continue
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
-                    ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
+                        if self.has_detached_functional_groups(
+                            atoms_trial, detach_tol=self.detach_tol
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
                     if self.has_afloat_adsorbates(
                         atoms_trial,
                         support_xy_tol=self.support_xy_tol,

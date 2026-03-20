@@ -18,7 +18,8 @@ dependencies = [
     "scipy",
     "networkx",
     "matplotlib",
-    "mace-torch"
+    "mace-torch",
+    "PyYAML",
 ]
 
 [project.optional-dependencies]

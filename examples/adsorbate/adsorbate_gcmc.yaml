@@ -1,0 +1,58 @@
+system:
+  snapshot: ../alloy/POSCAR.Ti2CO2
+  frame: 0
+  repeat: [2, 2, 1]
+  fix_below_z:
+  adsorbate_element: H
+  site_elements: [Ti]
+  surface_side: top
+  site_type: [atop, bridge]
+  substrate_elements: [Ti, C]
+  functional_elements:
+  vertical_offset: 1.8
+
+gcmc:
+  temperature: 300.0
+  chemical_potential: 0.0
+  move_mode: hybrid
+  site_hop_prob: 0.25
+  displacement_sigma: 0.25
+  max_displacement_trials: 20
+  min_clearance: 0.9
+  site_match_tol: 0.6
+  surface_layer_tol: 0.5
+  termination_clearance: 0.8
+  w_insert: 1.0
+  w_delete: 1.0
+  w_canonical: 1.0
+  max_n_adsorbates:
+  relax: false
+  relax_steps: 10
+  fmax: 0.05
+  enable_hybrid_md: false
+  md_move_prob: 0.0
+  md_steps: 0
+  md_timestep_fs: 1.0
+  md_ensemble: nve
+  md_accept_mode: potential
+  md_friction: 0.01
+  md_planar: false
+  md_planar_axis: 2
+  md_init_momenta: true
+  md_remove_drift: true
+  nsweeps: 200
+  write_interval: 10
+  sample_interval: 2
+  equilibration: 40
+  seed: 81
+
+calculator:
+  calculator: lj
+  lj_cutoff: 6.0
+  device: cuda
+  model:
+  model_file:
+  use_kokkos: true
+
+output:
+  output_prefix: adsorbate_gcmc

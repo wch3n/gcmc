@@ -1,115 +1,27 @@
-from pathlib import Path
-from types import SimpleNamespace
+from __future__ import annotations
 
-from gcmc import AdsorbateCMC
-from common import (
-    build_adsorbate_template,
-    build_calculator,
-    infer_functional_elements,
-    load_snapshot,
-    maybe_fix_bottom,
-    parse_symbols,
-)
+import argparse
+from pathlib import Path
+
+from gcmc.workflows import AdsorbateCMCWorkflow
 
 
 THIS_DIR = Path(__file__).resolve().parent
-CONFIG = SimpleNamespace(
-    snapshot=THIS_DIR.parent / "alloy" / "POSCAR.Ti2CO2",
-    frame=0,
-    repeat=(2, 2, 1),
-    calculator="lj",
-    model=None,
-    device="cuda",
-    lj_cutoff=6.0,
-    adsorbate="OH",
-    temperature=600.0,
-    coverage=0.25,
-    site_type="atop",
-    site_elements="Ti",
-    substrate_elements="Ti C",
-    functional_elements=None,
-    fix_below_z=None,
-    move_mode="hybrid",
-    site_hop_prob=0.35,
-    reorientation_prob=0.35,
-    rotation_max_angle_deg=25.0,
-    displacement_sigma=0.6,
-    max_displacement_trials=20,
-    max_reorientation_trials=20,
-    min_clearance=0.9,
-    site_match_tol=0.6,
-    surface_layer_tol=0.5,
-    termination_clearance=0.8,
-    vertical_offset=1.8,
-    relax=False,
-    relax_steps=20,
-    fmax=0.05,
-    nsweeps=200,
-    interval=10,
-    sample_interval=2,
-    equilibration=40,
-    seed=81,
-    output_prefix="adsorbate_cmc",
-)
+DEFAULT_CONFIG = THIS_DIR / "adsorbate_cmc.yaml"
 
 
 def main() -> None:
-    atoms = load_snapshot(CONFIG.snapshot, CONFIG.frame)
-    if tuple(CONFIG.repeat) != (1, 1, 1):
-        atoms = atoms.repeat(tuple(CONFIG.repeat))
-    maybe_fix_bottom(atoms, CONFIG.fix_below_z)
-    calculator = build_calculator(CONFIG)
-
-    substrate_elements = parse_symbols(CONFIG.substrate_elements)
-    functional_elements = infer_functional_elements(
-        atoms, substrate_elements, CONFIG.functional_elements
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="Path to the canonical adsorbate CMC YAML config.",
     )
-    adsorbate_template, adsorbate_anchor_index = build_adsorbate_template(
-        CONFIG.adsorbate
-    )
+    args = parser.parse_args()
 
-    cmc = AdsorbateCMC.from_clean_surface(
-        atoms=atoms,
-        calculator=calculator,
-        T=CONFIG.temperature,
-        adsorbate=adsorbate_template,
-        adsorbate_anchor_index=adsorbate_anchor_index,
-        substrate_elements=substrate_elements,
-        functional_elements=functional_elements,
-        site_elements=parse_symbols(CONFIG.site_elements),
-        coverage=CONFIG.coverage,
-        site_type=CONFIG.site_type,
-        move_mode=CONFIG.move_mode,
-        site_hop_prob=CONFIG.site_hop_prob,
-        reorientation_prob=CONFIG.reorientation_prob,
-        rotation_max_angle_deg=CONFIG.rotation_max_angle_deg,
-        displacement_sigma=CONFIG.displacement_sigma,
-        max_displacement_trials=CONFIG.max_displacement_trials,
-        max_reorientation_trials=CONFIG.max_reorientation_trials,
-        min_clearance=CONFIG.min_clearance,
-        site_match_tol=CONFIG.site_match_tol,
-        surface_layer_tol=CONFIG.surface_layer_tol,
-        termination_clearance=CONFIG.termination_clearance,
-        vertical_offset=CONFIG.vertical_offset,
-        relax=CONFIG.relax,
-        relax_steps=CONFIG.relax_steps,
-        fmax=CONFIG.fmax,
-        traj_file=f"{CONFIG.output_prefix}.traj",
-        thermo_file=f"{CONFIG.output_prefix}.dat",
-        checkpoint_file=f"{CONFIG.output_prefix}.pkl",
-        initial_traj_file=f"{CONFIG.output_prefix}_initial.traj",
-        seed=CONFIG.seed,
-    )
-
-    stats = cmc.run(
-        nsweeps=CONFIG.nsweeps,
-        traj_file=f"{CONFIG.output_prefix}.traj",
-        interval=CONFIG.interval,
-        sample_interval=CONFIG.sample_interval,
-        equilibration=CONFIG.equilibration,
-    )
-
-    print("Final AdsorbateCMC stats:", stats)
+    workflow = AdsorbateCMCWorkflow.from_yaml(args.config)
+    workflow.run()
 
 
 if __name__ == "__main__":

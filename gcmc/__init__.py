@@ -6,6 +6,12 @@ Exports:
 - SurfaceMCBase: Slab/adsorbate-specific MC infrastructure.
 - GCMC: Legacy Grand Canonical Monte Carlo.
 - AdsorbateGCMC: Site-based grand-canonical MC for adsorbates.
+- AdsorbateGCMCScanWorkflow: Scan runner for parallel adsorbate GCMC jobs.
+- load_adsorbate_gcmc_scan_config: YAML/flat config loader for adsorbate GCMC scans.
+- AdsorbateCMCWorkflow: YAML-driven canonical adsorbate CMC runner.
+- AdsorbateGCMCWorkflow: YAML-driven single-run adsorbate GCMC runner.
+- load_adsorbate_cmc_config: YAML/flat config loader for canonical adsorbate CMC.
+- load_adsorbate_gcmc_config: YAML/flat config loader for single-run adsorbate GCMC.
 - AdsorbateCMC: Replica-compatible canonical MC for fixed-loading adsorbates.
 - AlloyCMC: Canonical Monte Carlo for solids.
 - SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids.
@@ -20,6 +26,14 @@ from .adsorbate_gcmc import AdsorbateGCMC
 from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
+from .workflows import (
+    AdsorbateCMCWorkflow,
+    AdsorbateGCMCWorkflow,
+    AdsorbateGCMCScanWorkflow,
+    load_adsorbate_cmc_config,
+    load_adsorbate_gcmc_config,
+    load_adsorbate_gcmc_scan_config,
+)
 from .cluster_analysis import analyze_and_plot, find_cu_clusters
 from .analysis import (
     MXeneAdsorptionSiteAnalyzer,
@@ -38,6 +52,12 @@ __all__ = [
     "AlloyCMC",
     "SemiGrandAlloyMC",
     "ReplicaExchange",
+    "AdsorbateCMCWorkflow",
+    "AdsorbateGCMCWorkflow",
+    "AdsorbateGCMCScanWorkflow",
+    "load_adsorbate_cmc_config",
+    "load_adsorbate_gcmc_config",
+    "load_adsorbate_gcmc_scan_config",
     "MXeneAdsorptionSiteAnalyzer",
     "MXeneOrderingAnalyzer",
     "MXeneSROAnalyzer",

@@ -6,10 +6,12 @@ The codebase supports:
 
 - canonical alloy Monte Carlo on substitutional sublattices
 - fixed-loading canonical adsorbate Monte Carlo with replica exchange support
-- grand-canonical adsorbate MC (`GCMC`)
+- site-based grand-canonical adsorbate MC (`AdsorbateGCMC`)
+- legacy grand-canonical adsorbate MC (`GCMC`)
 - semi-grand alloy MC (`SemiGrandAlloyMC`)
 - local relaxation and short hybrid MC/MD proposals
 - local multiprocessing and Ray-backed distributed replica exchange
+- YAML-driven workflow wrappers for alloy and adsorbate runs
 - MXene-oriented analysis utilities for ordering, adsorption sites, surface motifs, and SRO
 
 ## Installation
@@ -53,8 +55,13 @@ Notes:
   - optional hybrid MC/MD proposals
   - instantaneous site registry for `atop`, `bridge`, `fcc`, and `hcp` sites on distorted MXene surfaces
 
+- `AdsorbateGCMC`
+  - site-based grand-canonical MC for monoatomic adsorbates
+  - insertion / deletion / canonical moves on an instantaneous site registry
+  - single-run and `mu`-scan workflow wrappers
+
 - `GCMC`
-  - variable-loading grand-canonical adsorbate MC
+  - legacy variable-loading grand-canonical adsorbate MC
 
 - `SemiGrandAlloyMC`
   - semi-grand alloy MC for composition control through chemical-potential differences
@@ -85,9 +92,11 @@ Notes:
 gcmc/
   alloy_cmc.py
   adsorbate_cmc.py
+  adsorbate_gcmc.py
   gcmc.py
   sgcmc.py
   replica.py
+  workflows.py
   execution_backends.py
   analysis/
 examples/
@@ -95,7 +104,33 @@ examples/
   adsorbate/
 ```
 
-The examples are regular Python scripts with editable `CONFIG` blocks. They are intended to be copied and adapted rather than used as rigid CLIs.
+The example entrypoints are now thin `--config` wrappers around YAML files. In practice, you edit the YAML and keep the Python launcher unchanged.
+
+## YAML-Driven Workflows
+
+The recommended frontends are:
+
+- `examples/alloy/run_cmc_alloy.py --config examples/alloy/alloy_cmc.yaml`
+- `examples/alloy/run_pt_cmc_alloy.py --config examples/alloy/alloy_pt.yaml`
+- `examples/alloy/run_pt_cmc_alloy_ray.py --config examples/alloy/alloy_pt_ray.yaml`
+- `examples/adsorbate/run_adsorbate_cmc.py --config examples/adsorbate/adsorbate_cmc.yaml`
+- `examples/adsorbate/run_adsorbate_gcmc.py --config examples/adsorbate/adsorbate_gcmc.yaml`
+- `examples/adsorbate/run_adsorbate_gcmc_scan.py --config examples/adsorbate/adsorbate_gcmc_scan.yaml`
+
+The YAML files are grouped by section:
+
+- `system`
+  - input structure, frame selection, supercell/repeat, alloy initialization, adsorbate setup
+- `cmc` / `gcmc` / `pt`
+  - engine-specific Monte Carlo settings
+- `backend`
+  - multiprocessing or Ray execution settings
+- `calculator`
+  - calculator type and model/device settings
+- `output`
+  - output prefix or output directory
+
+The workflow loaders also accept the older `interval` key and map it to `write_interval`.
 
 ## Alloy Workflows
 
@@ -104,8 +139,26 @@ The examples are regular Python scripts with editable `CONFIG` blocks. They are 
 See:
 
 - `examples/alloy/run_cmc_alloy.py`
+- `examples/alloy/alloy_cmc.yaml`
 
-Typical setup:
+Typical invocation:
+
+```bash
+python3 examples/alloy/run_cmc_alloy.py --config examples/alloy/alloy_cmc.yaml
+```
+
+Core YAML sections:
+
+- `system`
+  - `snapshot`, `frame`, `site_element`, `composition`, `initialization_seed`
+- `cmc`
+  - `temperature`, `swap_elements`, `swap_mode`, relaxation / MD controls, `nsweeps`, `write_interval`
+- `calculator`
+  - `calculator`, `model_file`, `device`
+- `output`
+  - `output_prefix`
+
+Underlying engine construction remains equivalent to:
 
 ```python
 from ase.build import make_supercell
@@ -142,7 +195,9 @@ stats = mc.run(nsweeps=200, traj_file="alloy.traj")
 See:
 
 - `examples/alloy/run_pt_cmc_alloy.py`
+- `examples/alloy/alloy_pt.yaml`
 - `examples/alloy/run_pt_cmc_alloy_ray.py`
+- `examples/alloy/alloy_pt_ray.yaml`
 - `examples/alloy/run_pt_cmc_alloy_ray.slurm`
 
 The Ray example demonstrates:
@@ -151,6 +206,28 @@ The Ray example demonstrates:
 - multi-node GPU resource partitioning
 - placement groups for actor spreading
 
+Typical invocations:
+
+```bash
+python3 examples/alloy/run_pt_cmc_alloy.py --config examples/alloy/alloy_pt.yaml
+python3 examples/alloy/run_pt_cmc_alloy_ray.py --config examples/alloy/alloy_pt_ray.yaml
+```
+
+The PT YAML is split into:
+
+- `system`
+  - reference snapshot, frame, optional `repeat` or `supercell_matrix`, alloy initialization
+- `pt`
+  - temperature ladder, swap/report/checkpoint cadence, cycle counts
+- `mc`
+  - per-replica `AlloyCMC` settings
+- `backend`
+  - `backend`, `n_gpus`, `workers_per_gpu`, and Ray-specific options
+- `calculator`
+  - calculator type and model
+- `output`
+  - `output_dir`, stats/results/checkpoint files
+
 ## Adsorbate Workflows
 
 ### Canonical fixed-loading adsorbate MC
@@ -158,8 +235,15 @@ The Ray example demonstrates:
 See:
 
 - `examples/adsorbate/run_adsorbate_cmc.py`
+- `examples/adsorbate/adsorbate_cmc.yaml`
 
 The recommended initialization path is `AdsorbateCMC.from_clean_surface(...)`. It builds an instantaneous site registry from the current slab geometry and places adsorbates on allowed sites.
+
+Typical invocation:
+
+```bash
+python3 examples/adsorbate/run_adsorbate_cmc.py --config examples/adsorbate/adsorbate_cmc.yaml
+```
 
 Example:
 
@@ -250,9 +334,37 @@ It is not a grand-canonical adsorption/desorption workflow. For variable loading
 
 See:
 
-- `examples/adsorbate/run_gcmc.py`
+- `examples/adsorbate/run_adsorbate_gcmc.py`
+- `examples/adsorbate/adsorbate_gcmc.yaml`
+- `examples/adsorbate/run_adsorbate_gcmc_scan.py`
+- `examples/adsorbate/adsorbate_gcmc_scan.yaml`
 
-This remains the variable-loading workflow for insertion/deletion moves.
+Recommended single-run invocation:
+
+```bash
+python3 examples/adsorbate/run_adsorbate_gcmc.py --config examples/adsorbate/adsorbate_gcmc.yaml
+```
+
+Recommended `mu`-scan invocation:
+
+```bash
+python3 examples/adsorbate/run_adsorbate_gcmc_scan.py --config examples/adsorbate/adsorbate_gcmc_scan.yaml
+```
+
+The scan workflow supports:
+
+- multiprocessing scans via:
+  - `backend.n_workers`
+  - `backend.devices`
+  - optional `backend.gpu_ids`
+- Ray scans via:
+  - `backend.ray_address`
+  - `backend.ray_log_to_driver`
+  - `backend.ray_num_cpus_per_task`
+  - `backend.ray_num_gpus_per_task`
+- per-task output directories and `summary.csv` aggregation
+
+The legacy `examples/adsorbate/run_gcmc.py` script remains in the repository, but the site-based `AdsorbateGCMC` workflows are the preferred route for current adsorbate free-energy work.
 
 ## Hybrid MC/MD
 

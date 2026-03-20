@@ -1,0 +1,65 @@
+system:
+  snapshot: POSCAR.Ti2CO2
+  frame: 0
+  supercell_matrix:
+    - [8, 0, 0]
+    - [5, 10, 0]
+    - [0, 0, 1]
+  site_element: Ti
+  composition:
+    Ti: 0.5
+    Mo: 0.5
+  initialization_seed: 67
+
+pt:
+  T_start: 800.0
+  T_end: 50.0
+  T_step: 50.0
+  n_replicas: 16
+  fine_grid_temps: [650.0, 300.0]
+  fine_grid_weights: [1.0, 1.5]
+  fine_grid_strength: 5.0
+  fine_grid_width: 80.0
+  grid_space: beta
+  swap_stride: 1
+  swap_interval: 20
+  report_interval: 5
+  sampling_interval: 5
+  local_eq_fraction: 0.0
+  checkpoint_interval: 5
+  resume: true
+  n_cycles: 2
+  equilibration_cycles: 0
+
+mc:
+  swap_elements: [Ti, Mo]
+  swap_mode: hybrid
+  hybrid_neighbor_prob: 0.8
+  neighbor_cutoff: 5.0
+  neighbor_backend: auto
+  neighbor_cache: true
+  relax: false
+  relax_steps: 10
+  fmax: 0.2
+  enable_hybrid_md: false
+
+backend:
+  backend: ray
+  n_gpus: 8
+  workers_per_gpu: 2
+  ray_address: auto
+  ray_log_to_driver: true
+  ray_num_cpus_per_task: 1
+  use_placement_group: true
+  placement_group_strategy: SPREAD
+
+calculator:
+  calculator: symmetrix
+  model_file: /gpfs/scratch/acad/htbase/wchen/mxene/mlip/pbe0-rvv10_8/Ti-Zr-Mo/models/ft-omat_0_sm_multi-00_stagetwo-1-22-40-42-6-8.json
+  use_kokkos: true
+
+output:
+  output_dir: alloy_pt_ray
+  stats_file: replica_stats.csv
+  results_file: results.csv
+  checkpoint_file: pt_state.pkl

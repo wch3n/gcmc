@@ -10,8 +10,12 @@ Exports:
 - load_adsorbate_gcmc_scan_config: YAML/flat config loader for adsorbate GCMC scans.
 - AdsorbateCMCWorkflow: YAML-driven canonical adsorbate CMC runner.
 - AdsorbateGCMCWorkflow: YAML-driven single-run adsorbate GCMC runner.
+- AlloyCMCWorkflow: YAML-driven canonical alloy CMC runner.
+- AlloyReplicaExchangeWorkflow: YAML-driven alloy replica-exchange runner.
 - load_adsorbate_cmc_config: YAML/flat config loader for canonical adsorbate CMC.
 - load_adsorbate_gcmc_config: YAML/flat config loader for single-run adsorbate GCMC.
+- load_alloy_cmc_config: YAML/flat config loader for canonical alloy CMC.
+- load_alloy_pt_config: YAML/flat config loader for alloy replica exchange.
 - AdsorbateCMC: Replica-compatible canonical MC for fixed-loading adsorbates.
 - AlloyCMC: Canonical Monte Carlo for solids.
 - SemiGrandAlloyMC: Semi-Grand Canonical Monte Carlo for solids.
@@ -27,9 +31,13 @@ from .alloy_cmc import AlloyCMC
 from .sgcmc import SemiGrandAlloyMC
 from .replica import ReplicaExchange
 from .workflows import (
+    AlloyCMCWorkflow,
+    AlloyReplicaExchangeWorkflow,
     AdsorbateCMCWorkflow,
     AdsorbateGCMCWorkflow,
     AdsorbateGCMCScanWorkflow,
+    load_alloy_cmc_config,
+    load_alloy_pt_config,
     load_adsorbate_cmc_config,
     load_adsorbate_gcmc_config,
     load_adsorbate_gcmc_scan_config,
@@ -52,9 +60,13 @@ __all__ = [
     "AlloyCMC",
     "SemiGrandAlloyMC",
     "ReplicaExchange",
+    "AlloyCMCWorkflow",
+    "AlloyReplicaExchangeWorkflow",
     "AdsorbateCMCWorkflow",
     "AdsorbateGCMCWorkflow",
     "AdsorbateGCMCScanWorkflow",
+    "load_alloy_cmc_config",
+    "load_alloy_pt_config",
     "load_adsorbate_cmc_config",
     "load_adsorbate_gcmc_config",
     "load_adsorbate_gcmc_scan_config",

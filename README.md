@@ -403,4 +403,4 @@ When using GPU-backed calculators under Ray:
 
 `pyproject.toml` currently declares:
 
-- version `0.8.0`
+- version `0.9.0`

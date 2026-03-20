@@ -1,0 +1,44 @@
+system:
+  snapshot: POSCAR.Ti2CO2
+  frame: 0
+  site_element: Ti
+  composition:
+    Ti: 0.4
+    Mo: 0.3
+    Zr: 0.3
+  initialization_seed: 67
+
+cmc:
+  temperature: 600.0
+  swap_elements: [Ti, Mo, Zr]
+  swap_mode: hybrid
+  hybrid_neighbor_prob: 0.5
+  neighbor_cutoff: 3.5
+  neighbor_backend: auto
+  neighbor_cache: true
+  relax: true
+  relax_steps: 10
+  local_relax: false
+  relax_radius: 4.0
+  fmax: 0.05
+  enable_hybrid_md: false
+  md_move_prob: 0.2
+  md_ensemble: nve
+  md_steps: 50
+  md_timestep_fs: 1.0
+  md_friction: 0.01
+  nsweeps: 200
+  write_interval: 10
+  sample_interval: 1
+  equilibration: 20
+  seed: 67
+  resume: false
+  checkpoint_interval: 100
+
+calculator:
+  calculator: mace
+  model_file: mxene.model
+  device: cuda
+
+output:
+  output_prefix: alloy_cmc

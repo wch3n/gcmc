@@ -12,12 +12,17 @@ from types import SimpleNamespace
 from typing import Callable
 
 from ase import Atoms
+from ase.build import make_supercell
 from ase.constraints import FixAtoms
 from ase.io import read, write
 
 from .adsorbate_cmc import AdsorbateCMC
 from .adsorbate_gcmc import AdsorbateGCMC
+from .alloy_cmc import AlloyCMC
+from .replica import ReplicaExchange
 from .utils import initialize_surface_adsorbates
+from .utils import initialize_alloy_sublattice
+from .utils import generate_nonuniform_temperature_grid
 
 
 TaskRunner = Callable[[dict], dict]
@@ -220,6 +225,129 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "output_prefix": "adsorbate_cmc",
 }
 
+_DEFAULT_ALLOY_CMC_CONFIG = {
+    "snapshot": None,
+    "frame": 0,
+    "repeat": [1, 1, 1],
+    "supercell_matrix": None,
+    "fix_below_z": None,
+    "calculator": "lj",
+    "model": None,
+    "model_file": None,
+    "use_kokkos": True,
+    "device": "cuda",
+    "lj_cutoff": 6.0,
+    "site_element": None,
+    "composition": None,
+    "initialization_seed": 67,
+    "temperature": 300.0,
+    "swap_elements": [],
+    "swap_mode": "hybrid",
+    "hybrid_neighbor_prob": 0.5,
+    "neighbor_cutoff": 3.5,
+    "neighbor_backend": "auto",
+    "neighbor_cache": True,
+    "relax": False,
+    "relax_steps": 10,
+    "local_relax": False,
+    "relax_radius": 4.0,
+    "fmax": 0.05,
+    "enable_hybrid_md": False,
+    "md_move_prob": 0.1,
+    "md_steps": 50,
+    "md_timestep_fs": 1.0,
+    "md_ensemble": "nve",
+    "md_accept_mode": "potential",
+    "md_friction": 0.01,
+    "md_planar": False,
+    "md_planar_axis": 2,
+    "md_init_momenta": True,
+    "md_remove_drift": True,
+    "nsweeps": 200,
+    "write_interval": 10,
+    "sample_interval": 1,
+    "equilibration": 0,
+    "seed": 67,
+    "resume": False,
+    "checkpoint_interval": 100,
+    "output_prefix": "alloy_cmc",
+}
+
+_DEFAULT_ALLOY_PT_CONFIG = {
+    "snapshot": None,
+    "frame": 0,
+    "repeat": [1, 1, 1],
+    "supercell_matrix": None,
+    "fix_below_z": None,
+    "calculator": "lj",
+    "model": None,
+    "model_file": None,
+    "use_kokkos": True,
+    "device": "cuda",
+    "default_dtype": None,
+    "lj_cutoff": 6.0,
+    "site_element": None,
+    "composition": None,
+    "initialization_seed": 67,
+    "swap_elements": [],
+    "swap_mode": "hybrid",
+    "hybrid_neighbor_prob": 0.5,
+    "neighbor_cutoff": 3.5,
+    "neighbor_backend": "auto",
+    "neighbor_cache": True,
+    "relax": False,
+    "relax_steps": 10,
+    "local_relax": False,
+    "relax_radius": 4.0,
+    "fmax": 0.05,
+    "enable_hybrid_md": False,
+    "md_move_prob": 0.1,
+    "md_steps": 50,
+    "md_timestep_fs": 1.0,
+    "md_ensemble": "nve",
+    "md_accept_mode": "potential",
+    "md_friction": 0.01,
+    "md_planar": False,
+    "md_planar_axis": 2,
+    "md_init_momenta": True,
+    "md_remove_drift": True,
+    "T_start": 800.0,
+    "T_end": 50.0,
+    "T_step": 50.0,
+    "n_replicas": None,
+    "fine_grid_temps": [],
+    "fine_grid_weights": [],
+    "fine_grid_strength": 4.0,
+    "fine_grid_width": None,
+    "grid_space": "temperature",
+    "swap_stride": 1,
+    "swap_interval": 20,
+    "report_interval": 5,
+    "sampling_interval": 1,
+    "local_eq_fraction": 0.2,
+    "checkpoint_interval": 10,
+    "resume": False,
+    "track_composition": [],
+    "seed_nonce": 0,
+    "n_cycles": 2,
+    "equilibration_cycles": 0,
+    "backend": "multiprocessing",
+    "n_gpus": 1,
+    "workers_per_gpu": 1,
+    "ray_address": None,
+    "ray_log_to_driver": False,
+    "ray_num_cpus_per_task": 1,
+    "ray_num_gpus_per_task": None,
+    "use_placement_group": False,
+    "placement_group_strategy": "SPREAD",
+    "remove_placement_group_on_stop": True,
+    "shutdown_on_stop": False,
+    "stats_file": "replica_stats.csv",
+    "results_file": "results.csv",
+    "checkpoint_file": "pt_state.pkl",
+    "output_dir": "alloy_pt",
+}
+
 
 def format_mu_label(mu: float) -> str:
     return f"{mu:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
@@ -315,6 +443,23 @@ def _prepare_adsorbate_scan_atoms(atoms, cfg: SimpleNamespace, _task: dict):
     return atoms
 
 
+def _prepare_alloy_atoms(atoms, cfg: SimpleNamespace):
+    supercell_matrix = getattr(cfg, "supercell_matrix", None)
+    if supercell_matrix is not None:
+        atoms = make_supercell(atoms, np.asarray(supercell_matrix, dtype=int))
+
+    repeat = tuple(getattr(cfg, "repeat", (1, 1, 1)))
+    if repeat != (1, 1, 1):
+        atoms = atoms.repeat(repeat)
+
+    fix_below_z = getattr(cfg, "fix_below_z", None)
+    if fix_below_z is not None:
+        fixed_indices = [atom.index for atom in atoms if atom.position[2] < fix_below_z]
+        if fixed_indices:
+            atoms.set_constraint(FixAtoms(indices=fixed_indices))
+    return atoms
+
+
 def build_adsorbate_gcmc_calculator(cfg: SimpleNamespace, task: dict):
     calculator = str(getattr(cfg, "calculator", "lj")).lower()
     if calculator == "lj":
@@ -341,6 +486,45 @@ def build_adsorbate_gcmc_calculator(cfg: SimpleNamespace, task: dict):
             model_file=str(model_file),
             use_kokkos=bool(getattr(cfg, "use_kokkos", True)),
         )
+
+    raise ValueError(f"Unsupported calculator '{cfg.calculator}'.")
+
+
+def build_replica_calculator_spec(
+    cfg: SimpleNamespace,
+) -> tuple[type, dict]:
+    calculator = str(getattr(cfg, "calculator", "lj")).lower()
+
+    if calculator == "lj":
+        from ase.calculators.lj import LennardJones
+
+        return LennardJones, {"rc": float(cfg.lj_cutoff)}
+
+    if calculator == "mace":
+        from mace.calculators import MACECalculator
+
+        model_path = getattr(cfg, "model", None) or getattr(cfg, "model_file", None)
+        if not model_path:
+            raise ValueError("MACE calculator requires 'model' or 'model_file'.")
+        calc_kwargs = {
+            "model_paths": [str(model_path)],
+            "device": getattr(cfg, "device", "cuda"),
+        }
+        default_dtype = getattr(cfg, "default_dtype", None)
+        if default_dtype is not None:
+            calc_kwargs["default_dtype"] = str(default_dtype)
+        return MACECalculator, calc_kwargs
+
+    if calculator == "symmetrix":
+        from symmetrix import Symmetrix
+
+        model_file = getattr(cfg, "model_file", None) or getattr(cfg, "model", None)
+        if not model_file:
+            raise ValueError("Symmetrix calculator requires 'model_file' or 'model'.")
+        return Symmetrix, {
+            "model_file": str(model_file),
+            "use_kokkos": bool(getattr(cfg, "use_kokkos", True)),
+        }
 
     raise ValueError(f"Unsupported calculator '{cfg.calculator}'.")
 
@@ -498,6 +682,92 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
     return SimpleNamespace(**flat_config)
 
 
+def load_alloy_cmc_config(config_path: str | Path) -> SimpleNamespace:
+    import yaml
+
+    config_path = Path(config_path).resolve()
+    raw = yaml.safe_load(config_path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Alloy CMC config must be a mapping.")
+
+    if any(key in raw for key in ("system", "cmc", "calculator", "output")):
+        merged = _deep_update(
+            {
+                "system": {},
+                "cmc": {},
+                "calculator": {},
+                "output": {},
+            },
+            raw,
+        )
+        flat_config = dict(_DEFAULT_ALLOY_CMC_CONFIG)
+        for section in ("system", "cmc", "calculator", "output"):
+            flat_config.update(merged.get(section, {}))
+    else:
+        flat_config = dict(_DEFAULT_ALLOY_CMC_CONFIG)
+        flat_config.update(raw)
+
+    if "interval" in flat_config:
+        flat_config["write_interval"] = flat_config.pop("interval")
+    flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    output_prefix = flat_config.get("output_prefix")
+    if output_prefix is not None:
+        output_prefix_path = Path(output_prefix)
+        if not output_prefix_path.is_absolute():
+            flat_config["output_prefix"] = str(
+                (config_path.parent / output_prefix_path).resolve()
+            )
+        else:
+            flat_config["output_prefix"] = str(output_prefix_path)
+    return SimpleNamespace(**flat_config)
+
+
+def load_alloy_pt_config(config_path: str | Path) -> SimpleNamespace:
+    import yaml
+
+    config_path = Path(config_path).resolve()
+    raw = yaml.safe_load(config_path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Alloy PT config must be a mapping.")
+
+    if any(
+        key in raw
+        for key in ("system", "pt", "mc", "calculator", "backend", "output")
+    ):
+        merged = _deep_update(
+            {
+                "system": {},
+                "pt": {},
+                "mc": {},
+                "calculator": {},
+                "backend": {},
+                "output": {},
+            },
+            raw,
+        )
+        flat_config = dict(_DEFAULT_ALLOY_PT_CONFIG)
+        for section in ("system", "pt", "mc", "calculator", "backend", "output"):
+            flat_config.update(merged.get(section, {}))
+    else:
+        flat_config = dict(_DEFAULT_ALLOY_PT_CONFIG)
+        flat_config.update(raw)
+
+    flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    output_dir = Path(flat_config["output_dir"])
+    for key in ("stats_file", "results_file", "checkpoint_file", "output_dir"):
+        value = flat_config.get(key)
+        if value is None:
+            continue
+        path = Path(value)
+        if key == "output_dir":
+            continue
+        if not path.is_absolute():
+            flat_config[key] = str((output_dir / path).resolve())
+        else:
+            flat_config[key] = str(path)
+    return SimpleNamespace(**flat_config)
+
+
 def run_tasks_with_multiprocessing(
     tasks: list[dict],
     run_one: TaskRunner,
@@ -524,6 +794,10 @@ def run_tasks_with_multiprocessing(
     return results
 
 
+def _ray_run_one(task: dict, run_one: TaskRunner) -> dict:
+    return run_one(task)
+
+
 def run_tasks_with_ray(
     tasks: list[dict],
     run_one: TaskRunner,
@@ -541,12 +815,12 @@ def run_tasks_with_ray(
         init_kwargs["address"] = address
 
     ray.init(**init_kwargs)
-    remote_run_one = ray.remote(num_cpus=float(num_cpus), num_gpus=float(num_gpus))(
-        run_one
-    )
+    remote_run_one = ray.remote(
+        num_cpus=float(num_cpus), num_gpus=float(num_gpus)
+    )(_ray_run_one)
 
     results = []
-    pending = [remote_run_one.remote(task) for task in tasks]
+    pending = [remote_run_one.remote(task, run_one) for task in tasks]
     while pending:
         ready, pending = ray.wait(pending, num_returns=1)
         result = ray.get(ready[0])
@@ -626,6 +900,18 @@ def format_adsorbate_gcmc_run_status(stats: dict) -> str:
         f"E={stats['energy']:.6f} eV "
         f"Navg={stats['n_adsorbates_avg']:.3f}"
     )
+
+
+def format_alloy_cmc_status(stats: dict) -> str:
+    return (
+        f"acc={stats['acceptance']:.2f}% "
+        f"E={stats['energy']:.6f} eV "
+        f"Cv={stats['cv']:.6f} eV/K"
+    )
+
+
+def format_alloy_pt_status(temps: list[float]) -> str:
+    return "PT temperatures [K]: " + np.array2string(np.asarray(temps), precision=1)
 
 
 class AdsorbateGCMCScanWorkflow:
@@ -1188,3 +1474,327 @@ class AdsorbateGCMCWorkflow:
         print(f"Final AdsorbateGCMC stats: {stats}")
         print(self.status_formatter(stats))
         return stats
+
+
+class AlloyCMCWorkflow:
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> "AlloyCMCWorkflow":
+        config = load_alloy_cmc_config(config_path)
+        return cls(config, calculator_factory=build_adsorbate_gcmc_calculator)
+
+    def __init__(
+        self,
+        config,
+        *,
+        calculator_factory: CalculatorFactory,
+        snapshot_loader=load_snapshot_default,
+        status_formatter: Callable[[dict], str] = format_alloy_cmc_status,
+    ) -> None:
+        self.config = config
+        self.calculator_factory = calculator_factory
+        self.snapshot_loader = snapshot_loader
+        self.status_formatter = status_formatter
+
+    def _load_atoms(self):
+        atoms = self.snapshot_loader(Path(self.config.snapshot), int(self.config.frame))
+        return _prepare_alloy_atoms(atoms, self.config)
+
+    def _build_output_paths(self) -> dict[str, str]:
+        prefix = Path(self.config.output_prefix)
+        prefix.parent.mkdir(parents=True, exist_ok=True)
+        return {
+            "traj_file": str(prefix.with_suffix(".traj")),
+            "accepted_traj_file": str(prefix.parent / f"{prefix.name}_accepted.traj"),
+            "thermo_file": str(prefix.with_suffix(".dat")),
+            "checkpoint_file": str(prefix.with_suffix(".pkl")),
+        }
+
+    def _build_simulation(self):
+        cfg = self.config
+        atoms = self._load_atoms()
+        init_summary = {
+            "snapshot": str(cfg.snapshot),
+            "frame": int(cfg.frame),
+            "initialized_alloy": False,
+        }
+
+        site_element = getattr(cfg, "site_element", None)
+        composition = getattr(cfg, "composition", None)
+        if site_element is not None and composition:
+            init_seed = int(getattr(cfg, "initialization_seed", cfg.seed))
+            atoms = initialize_alloy_sublattice(
+                atoms=atoms,
+                site_element=str(site_element),
+                composition=dict(composition),
+                seed=init_seed,
+            )
+            init_summary.update(
+                {
+                    "initialized_alloy": True,
+                    "site_element": str(site_element),
+                    "composition": dict(composition),
+                    "initialization_seed": init_seed,
+                }
+            )
+
+        calculator = self.calculator_factory(cfg, {"device": getattr(cfg, "device", None)})
+        output_paths = self._build_output_paths()
+        swap_elements = _parse_symbols(getattr(cfg, "swap_elements", ()))
+
+        mc = AlloyCMC(
+            atoms=atoms,
+            calculator=calculator,
+            T=float(cfg.temperature),
+            swap_elements=list(swap_elements) if swap_elements else None,
+            swap_mode=str(cfg.swap_mode),
+            hybrid_neighbor_prob=float(cfg.hybrid_neighbor_prob),
+            neighbor_cutoff=float(cfg.neighbor_cutoff),
+            neighbor_backend=str(cfg.neighbor_backend),
+            neighbor_cache=bool(cfg.neighbor_cache),
+            relax=bool(cfg.relax),
+            relax_steps=int(cfg.relax_steps),
+            local_relax=bool(getattr(cfg, "local_relax", False)),
+            relax_radius=float(getattr(cfg, "relax_radius", 4.0)),
+            fmax=float(cfg.fmax),
+            traj_file=output_paths["traj_file"],
+            accepted_traj_file=output_paths["accepted_traj_file"],
+            thermo_file=output_paths["thermo_file"],
+            checkpoint_file=output_paths["checkpoint_file"],
+            checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
+            seed=int(cfg.seed),
+            resume=bool(getattr(cfg, "resume", False)),
+            enable_hybrid_md=bool(getattr(cfg, "enable_hybrid_md", False)),
+            md_move_prob=float(getattr(cfg, "md_move_prob", 0.1)),
+            md_steps=int(getattr(cfg, "md_steps", 50)),
+            md_timestep_fs=float(getattr(cfg, "md_timestep_fs", 1.0)),
+            md_ensemble=str(getattr(cfg, "md_ensemble", "nve")),
+            md_accept_mode=str(getattr(cfg, "md_accept_mode", "potential")),
+            md_friction=float(getattr(cfg, "md_friction", 0.01)),
+            md_planar=bool(getattr(cfg, "md_planar", False)),
+            md_planar_axis=int(getattr(cfg, "md_planar_axis", 2)),
+            md_init_momenta=bool(getattr(cfg, "md_init_momenta", True)),
+            md_remove_drift=bool(getattr(cfg, "md_remove_drift", True)),
+        )
+        return mc, output_paths, init_summary
+
+    def run(self) -> dict:
+        mc, output_paths, init_summary = self._build_simulation()
+        print(f"Loaded snapshot: {init_summary['snapshot']}")
+        print(f"Frame: {init_summary['frame']}")
+        if init_summary["initialized_alloy"]:
+            print(
+                "Initialized alloy sublattice: "
+                f"{init_summary['site_element']} -> {init_summary['composition']}"
+            )
+            print(f"Initialization seed: {init_summary['initialization_seed']}")
+        print(f"T = {float(self.config.temperature):.1f} K")
+        print(f"Swap mode: {self.config.swap_mode}")
+        print(
+            "Hybrid MD:",
+            bool(getattr(self.config, "enable_hybrid_md", False)),
+            (
+                f"(prob={getattr(self.config, 'md_move_prob', 0.0)}, "
+                f"steps={getattr(self.config, 'md_steps', 0)}, "
+                f"dt_fs={getattr(self.config, 'md_timestep_fs', 1.0)}, "
+                f"planar={getattr(self.config, 'md_planar', False)})"
+            ),
+        )
+
+        stats = mc.run(
+            nsweeps=int(self.config.nsweeps),
+            traj_file=output_paths["traj_file"],
+            interval=int(self.config.write_interval),
+            sample_interval=int(self.config.sample_interval),
+            equilibration=int(self.config.equilibration),
+        )
+        print(f"Final AlloyCMC stats: {stats}")
+        print(self.status_formatter(stats))
+        return stats
+
+
+class AlloyReplicaExchangeWorkflow:
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> "AlloyReplicaExchangeWorkflow":
+        config = load_alloy_pt_config(config_path)
+        return cls(config)
+
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def _load_atoms(self):
+        atoms = load_snapshot_default(Path(self.config.snapshot), int(self.config.frame))
+        atoms = _prepare_alloy_atoms(atoms, self.config)
+        site_element = getattr(self.config, "site_element", None)
+        composition = getattr(self.config, "composition", None)
+        init_summary = {
+            "snapshot": str(self.config.snapshot),
+            "frame": int(self.config.frame),
+            "initialized_alloy": False,
+        }
+        if site_element is not None and composition:
+            init_seed = int(getattr(self.config, "initialization_seed", 67))
+            atoms = initialize_alloy_sublattice(
+                atoms=atoms,
+                site_element=str(site_element),
+                composition=dict(composition),
+                seed=init_seed,
+            )
+            init_summary.update(
+                {
+                    "initialized_alloy": True,
+                    "site_element": str(site_element),
+                    "composition": dict(composition),
+                    "initialization_seed": init_seed,
+                }
+            )
+        return atoms, init_summary
+
+    def _mc_kwargs(self) -> dict:
+        cfg = self.config
+        swap_elements = _parse_symbols(getattr(cfg, "swap_elements", ()))
+        kwargs = {
+            "swap_elements": list(swap_elements) if swap_elements else None,
+            "swap_mode": str(cfg.swap_mode),
+            "hybrid_neighbor_prob": float(cfg.hybrid_neighbor_prob),
+            "neighbor_cutoff": float(cfg.neighbor_cutoff),
+            "neighbor_backend": str(cfg.neighbor_backend),
+            "neighbor_cache": bool(cfg.neighbor_cache),
+            "relax": bool(cfg.relax),
+            "relax_steps": int(cfg.relax_steps),
+            "local_relax": bool(getattr(cfg, "local_relax", False)),
+            "relax_radius": float(getattr(cfg, "relax_radius", 4.0)),
+            "fmax": float(cfg.fmax),
+            "checkpoint_interval": int(getattr(cfg, "checkpoint_interval", 10)),
+            "enable_hybrid_md": bool(getattr(cfg, "enable_hybrid_md", False)),
+            "md_move_prob": float(getattr(cfg, "md_move_prob", 0.1)),
+            "md_steps": int(getattr(cfg, "md_steps", 50)),
+            "md_timestep_fs": float(getattr(cfg, "md_timestep_fs", 1.0)),
+            "md_ensemble": str(getattr(cfg, "md_ensemble", "nve")),
+            "md_accept_mode": str(getattr(cfg, "md_accept_mode", "potential")),
+            "md_friction": float(getattr(cfg, "md_friction", 0.01)),
+            "md_planar": bool(getattr(cfg, "md_planar", False)),
+            "md_planar_axis": int(getattr(cfg, "md_planar_axis", 2)),
+            "md_init_momenta": bool(getattr(cfg, "md_init_momenta", True)),
+            "md_remove_drift": bool(getattr(cfg, "md_remove_drift", True)),
+        }
+        return kwargs
+
+    def _backend_kwargs(self) -> dict | None:
+        if str(self.config.backend).lower() != "ray":
+            return None
+
+        actor_options = {
+            "num_cpus": float(getattr(self.config, "ray_num_cpus_per_task", 1)),
+        }
+        num_gpus = getattr(self.config, "ray_num_gpus_per_task", None)
+        if num_gpus is not None:
+            actor_options["num_gpus"] = float(num_gpus)
+
+        return {
+            "init_kwargs": {
+                "address": getattr(self.config, "ray_address", None) or "auto",
+                "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
+            },
+            "actor_options": actor_options,
+            "use_placement_group": bool(
+                getattr(self.config, "use_placement_group", False)
+            ),
+            "placement_group_strategy": str(
+                getattr(self.config, "placement_group_strategy", "SPREAD")
+            ),
+            "remove_placement_group_on_stop": bool(
+                getattr(self.config, "remove_placement_group_on_stop", True)
+            ),
+            "shutdown_on_stop": bool(
+                getattr(self.config, "shutdown_on_stop", False)
+            ),
+        }
+
+    def _temperatures(self) -> list[float]:
+        cfg = self.config
+        if getattr(cfg, "n_replicas", None) is not None:
+            return generate_nonuniform_temperature_grid(
+                T_start=float(cfg.T_start),
+                T_end=float(cfg.T_end),
+                n_replicas=int(cfg.n_replicas),
+                focus_temps=list(getattr(cfg, "fine_grid_temps", []) or []),
+                focus_weights=list(getattr(cfg, "fine_grid_weights", []) or []),
+                focus_strength=float(getattr(cfg, "fine_grid_strength", 4.0)),
+                focus_width=getattr(cfg, "fine_grid_width", None),
+                grid_space=str(getattr(cfg, "grid_space", "temperature")),
+            )
+
+        T_step = getattr(cfg, "T_step", None)
+        if T_step is None or np.isclose(float(T_step), 0.0):
+            raise ValueError("T_step must be non-zero when n_replicas is not set.")
+        step = abs(float(T_step))
+        if float(cfg.T_start) > float(cfg.T_end):
+            return np.arange(float(cfg.T_start), float(cfg.T_end) - step / 2.0, -step).tolist()
+        return np.arange(float(cfg.T_start), float(cfg.T_end) + step / 2.0, step).tolist()
+
+    def _relocate_replica_outputs(self, pt: ReplicaExchange, out_dir: Path) -> None:
+        for state in pt.replica_states:
+            state["traj_file"] = str(out_dir / Path(state["traj_file"]).name)
+            state["thermo_file"] = str(out_dir / Path(state["thermo_file"]).name)
+            state["checkpoint_file"] = str(out_dir / Path(state["checkpoint_file"]).name)
+
+    def run(self) -> ReplicaExchange:
+        cfg = self.config
+        atoms, init_summary = self._load_atoms()
+        calculator_class, calc_kwargs = build_replica_calculator_spec(cfg)
+        mc_kwargs = self._mc_kwargs()
+        out_dir = Path(cfg.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Loaded snapshot: {init_summary['snapshot']}")
+        print(f"Frame: {init_summary['frame']}")
+        if init_summary["initialized_alloy"]:
+            print(
+                "Initialized alloy sublattice: "
+                f"{init_summary['site_element']} -> {init_summary['composition']}"
+            )
+            print(f"Initialization seed: {init_summary['initialization_seed']}")
+
+        temps = self._temperatures()
+        print(format_alloy_pt_status(temps))
+        print(f"Backend: {cfg.backend}")
+        print(f"GPUs: {int(cfg.n_gpus)} | Workers/GPU: {int(cfg.workers_per_gpu)}")
+
+        pt = ReplicaExchange.from_auto_config(
+            atoms_template=atoms,
+            T_start=float(cfg.T_start),
+            T_end=float(cfg.T_end),
+            T_step=None if getattr(cfg, "n_replicas", None) is not None else float(cfg.T_step),
+            calculator_class=calculator_class,
+            mc_class=AlloyCMC,
+            calc_kwargs=calc_kwargs,
+            mc_kwargs=mc_kwargs,
+            n_gpus=int(cfg.n_gpus),
+            workers_per_gpu=int(cfg.workers_per_gpu),
+            swap_stride=int(cfg.swap_stride),
+            resume=bool(cfg.resume),
+            results_file=str(cfg.results_file),
+            stats_file=str(cfg.stats_file),
+            checkpoint_file=str(cfg.checkpoint_file),
+            track_composition=list(getattr(cfg, "track_composition", []) or []),
+            seed_nonce=int(getattr(cfg, "seed_nonce", 0)),
+            n_replicas=getattr(cfg, "n_replicas", None),
+            fine_grid_temps=list(getattr(cfg, "fine_grid_temps", []) or []),
+            fine_grid_weights=list(getattr(cfg, "fine_grid_weights", []) or []),
+            fine_grid_strength=float(getattr(cfg, "fine_grid_strength", 4.0)),
+            fine_grid_width=getattr(cfg, "fine_grid_width", None),
+            grid_space=str(getattr(cfg, "grid_space", "temperature")),
+            execution_backend=str(cfg.backend),
+            backend_kwargs=self._backend_kwargs(),
+            swap_interval=int(cfg.swap_interval),
+            report_interval=int(cfg.report_interval),
+            sampling_interval=int(cfg.sampling_interval),
+            local_eq_fraction=float(cfg.local_eq_fraction),
+            checkpoint_interval=int(cfg.checkpoint_interval),
+        )
+        self._relocate_replica_outputs(pt, out_dir)
+        pt.run(
+            n_cycles=int(cfg.n_cycles),
+            equilibration_cycles=int(getattr(cfg, "equilibration_cycles", 0)),
+        )
+        return pt

@@ -387,6 +387,8 @@ class AdsorbateGCMC(AdsorbateCMC):
         n_ads_new = int(info["n_ads"]) + 1
         probs_old = self._move_probabilities(int(info["n_ads"]), int(info["n_sites"]))
         probs_new = self._move_probabilities(n_ads_new, int(info["n_sites"]))
+        if "insert" not in probs_old or "delete" not in probs_new:
+            return -np.inf
         return (
             np.log(probs_new["delete"])
             - np.log(probs_old["insert"])
@@ -399,6 +401,8 @@ class AdsorbateGCMC(AdsorbateCMC):
         n_ads_new = n_ads_old - 1
         probs_old = self._move_probabilities(n_ads_old, int(info["n_sites"]))
         probs_new = self._move_probabilities(n_ads_new, int(info["n_sites"]))
+        if "delete" not in probs_old or "insert" not in probs_new:
+            return -np.inf
         return (
             np.log(probs_new["insert"])
             - np.log(probs_old["delete"])

@@ -56,6 +56,8 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "use_kokkos": True,
     "devices": ["cuda:0"],
     "lj_cutoff": 6.0,
+    "adsorbate": None,
+    "adsorbate_anchor_index": 0,
     "adsorbate_element": "H",
     "temperature": 300.0,
     "mu_values": [-3.0, -2.0, -1.0, 0.0, 1.0],
@@ -118,6 +120,8 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "use_kokkos": True,
     "device": "cuda",
     "lj_cutoff": 6.0,
+    "adsorbate": None,
+    "adsorbate_anchor_index": 0,
     "adsorbate_element": "H",
     "temperature": 300.0,
     "chemical_potential": 0.0,
@@ -584,6 +588,19 @@ def load_adsorbate_gcmc_scan_config(config_path: str | Path) -> SimpleNamespace:
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    adsorbate_value = flat_config.get("adsorbate")
+    if isinstance(adsorbate_value, str):
+        adsorbate_path = config_path.parent / adsorbate_value
+        if (
+            Path(adsorbate_value).is_absolute()
+            or adsorbate_path.exists()
+            or Path(adsorbate_value).suffix
+        ):
+            path = Path(adsorbate_value)
+            if not path.is_absolute():
+                flat_config["adsorbate"] = str(adsorbate_path.resolve())
+            else:
+                flat_config["adsorbate"] = str(path)
     return SimpleNamespace(**flat_config)
 
 
@@ -615,6 +632,19 @@ def load_adsorbate_gcmc_config(config_path: str | Path) -> SimpleNamespace:
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    adsorbate_value = flat_config.get("adsorbate")
+    if isinstance(adsorbate_value, str):
+        adsorbate_path = config_path.parent / adsorbate_value
+        if (
+            Path(adsorbate_value).is_absolute()
+            or adsorbate_path.exists()
+            or Path(adsorbate_value).suffix
+        ):
+            path = Path(adsorbate_value)
+            if not path.is_absolute():
+                flat_config["adsorbate"] = str(adsorbate_path.resolve())
+            else:
+                flat_config["adsorbate"] = str(path)
     output_prefix = flat_config.get("output_prefix")
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
@@ -946,6 +976,16 @@ class AdsorbateGCMCScanWorkflow:
         self.summary_writer = summary_writer
         self.extra_reserved_keys = set(extra_reserved_keys)
 
+    def _build_adsorbate_template(self) -> tuple[Atoms, int]:
+        adsorbate_value = getattr(self.config, "adsorbate", None)
+        if adsorbate_value is None:
+            adsorbate_value = getattr(self.config, "adsorbate_element", "H")
+        template, default_anchor_index = build_adsorbate_template(adsorbate_value)
+        anchor_index = int(
+            getattr(self.config, "adsorbate_anchor_index", default_anchor_index)
+        )
+        return template, anchor_index
+
     def _ray_num_gpus_per_task(self) -> float:
         value = getattr(self.config, "ray_num_gpus_per_task", None)
         if value is not None:
@@ -1026,13 +1066,17 @@ class AdsorbateGCMCScanWorkflow:
                 getattr(cfg, "functional_elements", ())
             )
 
+        adsorbate_template, anchor_index = self._build_adsorbate_template()
+
         sim = AdsorbateGCMC(
             atoms=atoms,
             calculator=calculator,
             mu=float(task["mu"]),
             T=cfg.temperature,
             nsteps=cfg.nsweeps,
-            adsorbate_element=cfg.adsorbate_element,
+            adsorbate_element=adsorbate_template[anchor_index].symbol,
+            adsorbate=adsorbate_template,
+            adsorbate_anchor_index=anchor_index,
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
             site_elements=_parse_symbols(getattr(cfg, "site_elements", ())),
@@ -1070,6 +1114,7 @@ class AdsorbateGCMCScanWorkflow:
             checkpoint_file=str(run_dir / f"{stem}.pkl"),
             checkpoint_interval=0,
             seed=int(task["seed"]),
+            allow_ambiguous_empty_adsorbates=True,
         )
 
         stats = sim.run(
@@ -1394,6 +1439,16 @@ class AdsorbateGCMCWorkflow:
             "checkpoint_file": str(prefix.with_suffix(".pkl")),
         }
 
+    def _build_adsorbate_template(self) -> tuple[Atoms, int]:
+        adsorbate_value = getattr(self.config, "adsorbate", None)
+        if adsorbate_value is None:
+            adsorbate_value = getattr(self.config, "adsorbate_element", "H")
+        template, default_anchor_index = build_adsorbate_template(adsorbate_value)
+        anchor_index = int(
+            getattr(self.config, "adsorbate_anchor_index", default_anchor_index)
+        )
+        return template, anchor_index
+
     def run(self) -> dict:
         cfg = self.config
         atoms = self._load_atoms()
@@ -1401,6 +1456,7 @@ class AdsorbateGCMCWorkflow:
         output_paths = self._build_output_paths()
         substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
         functional_elements = _infer_functional_elements_from_config(atoms, cfg, {})
+        adsorbate_template, anchor_index = self._build_adsorbate_template()
 
         sim = AdsorbateGCMC(
             atoms=atoms,
@@ -1408,7 +1464,9 @@ class AdsorbateGCMCWorkflow:
             mu=float(cfg.chemical_potential),
             T=cfg.temperature,
             nsteps=cfg.nsweeps,
-            adsorbate_element=cfg.adsorbate_element,
+            adsorbate_element=adsorbate_template[anchor_index].symbol,
+            adsorbate=adsorbate_template,
+            adsorbate_anchor_index=anchor_index,
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
             site_elements=_parse_symbols(getattr(cfg, "site_elements", ())),
@@ -1446,6 +1504,7 @@ class AdsorbateGCMCWorkflow:
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=0,
             seed=int(cfg.seed),
+            allow_ambiguous_empty_adsorbates=True,
         )
 
         print(f"Loaded snapshot: {cfg.snapshot}")

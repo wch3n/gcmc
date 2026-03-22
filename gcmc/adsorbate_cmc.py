@@ -200,6 +200,7 @@ class AdsorbateCMC(SurfaceMCBase):
         checkpoint_interval: int = 100,
         seed: int = 81,
         resume: bool = False,
+        allow_ambiguous_empty_adsorbates: bool = False,
         enable_hybrid_md: bool = False,
         md_move_prob: float = 0.1,
         md_steps: int = 50,
@@ -231,6 +232,9 @@ class AdsorbateCMC(SurfaceMCBase):
         ].symbol
         self.adsorbate_symbols = tuple(self.adsorbate_template.get_chemical_symbols())
         self._adsorbate_symbol_signature = tuple(sorted(self.adsorbate_symbols))
+        self.allow_ambiguous_empty_adsorbates = bool(
+            allow_ambiguous_empty_adsorbates
+        )
         initial_tags = np.asarray(self.atoms.get_tags(), dtype=int)
         if len(initial_tags) != len(self.atoms):
             initial_tags = np.zeros(len(self.atoms), dtype=int)
@@ -514,10 +518,14 @@ class AdsorbateCMC(SurfaceMCBase):
                 groups.append(group)
             return groups
 
+        if self.allow_ambiguous_empty_adsorbates:
+            return []
+
         raise ValueError(
             "Could not infer adsorbate groups automatically. For molecular adsorbates "
-            "with species overlapping the slab/functionals, use a tagged structure or "
-            "AdsorbateCMC.from_clean_surface(...)."
+            "with species overlapping the slab/functionals, use a tagged structure, "
+            "AdsorbateCMC.from_clean_surface(...), or allow_ambiguous_empty_adsorbates=True "
+            "when starting from a known clean surface."
         )
 
     def _tag_adsorbate_groups(self, groups: list[np.ndarray]) -> None:

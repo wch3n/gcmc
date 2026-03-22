@@ -17,10 +17,10 @@ logger = logging.getLogger("mc")
 
 class AdsorbateGCMC(AdsorbateCMC):
     """
-    Site-based grand-canonical MC for monoatomic adsorbates.
+    Site-based grand-canonical MC for rigid adsorbates.
 
     Current scope:
-    - monoatomic adsorbates only
+    - rigid adsorbates with a designated anchor atom
     - insertion/deletion on the instantaneous high-symmetry site registry
     - canonical within-N moves reuse ``AdsorbateCMC``
     - optional hybrid MD/local relaxation reuse ``AdsorbateCMC``
@@ -55,6 +55,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         checkpoint_interval: int = 100,
         seed: int = 81,
         resume: bool = False,
+        allow_ambiguous_empty_adsorbates: bool = False,
         **kwargs,
     ):
         if element is not None:
@@ -67,10 +68,8 @@ class AdsorbateGCMC(AdsorbateCMC):
             template_size = 1
         else:
             template_size = len(_load_adsorbate_template(adsorbate, adsorbate_element))
-        if template_size != 1:
-            raise NotImplementedError(
-                "AdsorbateGCMC currently supports monoatomic adsorbates only."
-            )
+        if template_size < 1:
+            raise ValueError("adsorbate template must contain at least one atom.")
 
         self.mu = float(mu)
         self.nsteps = int(nsteps)
@@ -104,6 +103,7 @@ class AdsorbateGCMC(AdsorbateCMC):
             checkpoint_interval=checkpoint_interval,
             seed=seed,
             resume=resume,
+            allow_ambiguous_empty_adsorbates=allow_ambiguous_empty_adsorbates,
             **kwargs,
         )
 

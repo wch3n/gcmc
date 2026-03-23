@@ -5,7 +5,6 @@ system:
   fix_below_z:
   adsorbate: H
   adsorbate_anchor_index: 0
-  adsorbate_element: H
   site_elements: [Ti]
   surface_side: top
   site_type: [atop, bridge]

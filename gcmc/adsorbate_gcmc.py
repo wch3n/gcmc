@@ -481,7 +481,7 @@ class AdsorbateGCMC(AdsorbateCMC):
                         if rejected_writer is not None:
                             rejected_writer.write(atoms_trial)
                         continue
-                    if self.has_afloat_adsorbates(
+                    if int(proposal_info["n_ads"]) > 1 and self.has_afloat_adsorbates(
                         atoms_trial,
                         support_xy_tol=self.support_xy_tol,
                         z_max_support=self.z_max_support,
@@ -576,14 +576,17 @@ class AdsorbateGCMC(AdsorbateCMC):
                             if rejected_writer is not None:
                                 rejected_writer.write(atoms_trial)
                             continue
-                    if self.has_afloat_adsorbates(
-                        atoms_trial,
-                        support_xy_tol=self.support_xy_tol,
-                        z_max_support=self.z_max_support,
-                    ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
+                    # A deletion that removes the last adsorbate leaves a clean slab.
+                    # In that case there is no adsorbate support geometry to validate.
+                    if int(proposal_info["n_ads"]) > 1:
+                        if self.has_afloat_adsorbates(
+                            atoms_trial,
+                            support_xy_tol=self.support_xy_tol,
+                            z_max_support=self.z_max_support,
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
                     e_new = self.get_potential_energy(atoms_trial)
                     delta_e = e_new - self.e_old
                     log_q_ratio = self._deletion_log_q_ratio(proposal_info)

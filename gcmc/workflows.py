@@ -33,6 +33,8 @@ FunctionalElementsFactory = Callable[[object, SimpleNamespace, dict], tuple[str,
 
 _RESERVED_CONFIG_KEYS = {
     "mu_values",
+    "mu_range",
+    "n_mu_points",
     "seeds",
     "devices",
     "n_workers",
@@ -49,6 +51,7 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "snapshot": None,
     "frame": 0,
     "repeat": [1, 1, 1],
+    "supercell_matrix": None,
     "fix_below_z": None,
     "calculator": "lj",
     "model": None,
@@ -60,6 +63,8 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "adsorbate_anchor_index": 0,
     "temperature": 300.0,
     "mu_values": [-3.0, -2.0, -1.0, 0.0, 1.0],
+    "mu_range": None,
+    "n_mu_points": None,
     "seeds": [81, 82],
     "site_type": ["atop", "bridge"],
     "site_elements": [],
@@ -68,6 +73,7 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "functional_elements": None,
     "move_mode": "hybrid",
     "site_hop_prob": 0.25,
+    "reorientation_prob": 0.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
     "min_clearance": 0.9,
@@ -93,10 +99,13 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "md_planar_axis": 2,
     "md_init_momenta": True,
     "md_remove_drift": True,
+    "md_without_adsorbate": False,
     "nsweeps": 200,
     "write_interval": 10,
+    "progress_interval_moves": 0,
     "sample_interval": 2,
     "equilibration": 40,
+    "write_attempted_traj": False,
     "backend": "multiprocessing",
     "n_workers": 1,
     "gpu_ids": [],
@@ -112,6 +121,7 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "snapshot": None,
     "frame": 0,
     "repeat": [1, 1, 1],
+    "supercell_matrix": None,
     "fix_below_z": None,
     "calculator": "lj",
     "model": None,
@@ -130,6 +140,7 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "functional_elements": None,
     "move_mode": "hybrid",
     "site_hop_prob": 0.25,
+    "reorientation_prob": 0.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
     "min_clearance": 0.9,
@@ -155,10 +166,13 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "md_planar_axis": 2,
     "md_init_momenta": True,
     "md_remove_drift": True,
+    "md_without_adsorbate": False,
     "nsweeps": 200,
     "write_interval": 10,
+    "progress_interval_moves": 0,
     "sample_interval": 2,
     "equilibration": 40,
+    "write_attempted_traj": False,
     "seed": 81,
     "output_prefix": "adsorbate_gcmc",
 }
@@ -167,6 +181,7 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "snapshot": None,
     "frame": 0,
     "repeat": [1, 1, 1],
+    "supercell_matrix": None,
     "fix_below_z": None,
     "calculator": "lj",
     "model": None,
@@ -334,8 +349,8 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "n_cycles": 2,
     "equilibration_cycles": 0,
     "backend": "multiprocessing",
-    "n_gpus": 1,
-    "workers_per_gpu": 1,
+    "n_gpus": None,
+    "workers_per_gpu": None,
     "ray_address": None,
     "ray_log_to_driver": False,
     "ray_num_cpus_per_task": 1,
@@ -353,6 +368,36 @@ _DEFAULT_ALLOY_PT_CONFIG = {
 
 def format_mu_label(mu: float) -> str:
     return f"{mu:+.3f}".replace("+", "p").replace("-", "m").replace(".", "p")
+
+
+def _env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _infer_total_gpus_from_environment() -> int | None:
+    total = _env_int("SLURM_GPUS")
+    if total is not None and total > 0:
+        return total
+
+    per_node = _env_int("SLURM_GPUS_ON_NODE")
+    n_nodes = _env_int("SLURM_NNODES")
+    if n_nodes is None:
+        n_nodes = _env_int("SLURM_JOB_NUM_NODES")
+    if per_node is not None and per_node > 0 and n_nodes is not None and n_nodes > 0:
+        return per_node * n_nodes
+
+    visible = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible:
+        tokens = [tok.strip() for tok in visible.split(",") if tok.strip()]
+        if tokens and tokens != ["NoDevFiles"]:
+            return len(tokens)
+    return None
 
 
 def configure_mc_logger(log_file: Path, stream: bool = False) -> None:
@@ -433,6 +478,10 @@ def _infer_functional_elements_from_config(
 
 
 def _prepare_adsorbate_scan_atoms(atoms, cfg: SimpleNamespace, _task: dict):
+    supercell_matrix = getattr(cfg, "supercell_matrix", None)
+    if supercell_matrix is not None:
+        atoms = make_supercell(atoms, np.asarray(supercell_matrix, dtype=int))
+
     repeat = tuple(getattr(cfg, "repeat", (1, 1, 1)))
     if repeat != (1, 1, 1):
         atoms = atoms.repeat(repeat)
@@ -554,6 +603,33 @@ def _resolve_path_fields(flat_config: dict, base_dir: Path) -> dict:
     return flat_config
 
 
+def _resolve_mu_scan_values(flat_config: dict) -> dict:
+    mu_range = flat_config.get("mu_range")
+    n_mu_points = flat_config.get("n_mu_points")
+    if mu_range is None and n_mu_points is None:
+        mu_values = flat_config.get("mu_values")
+        flat_config["mu_values"] = [float(mu) for mu in mu_values]
+        return flat_config
+
+    if mu_range is None or n_mu_points is None:
+        raise ValueError(
+            "Adsorbate GCMC scan config requires both 'mu_range' and "
+            "'n_mu_points' when using range-based mu generation."
+        )
+
+    if not isinstance(mu_range, (list, tuple)) or len(mu_range) != 2:
+        raise ValueError("'mu_range' must be a 2-element sequence [mu_min, mu_max].")
+
+    n_mu_points = int(n_mu_points)
+    if n_mu_points < 1:
+        raise ValueError("'n_mu_points' must be >= 1.")
+
+    mu_min = float(mu_range[0])
+    mu_max = float(mu_range[1])
+    flat_config["mu_values"] = np.linspace(mu_min, mu_max, n_mu_points).tolist()
+    return flat_config
+
+
 def load_adsorbate_gcmc_scan_config(config_path: str | Path) -> SimpleNamespace:
     import yaml
 
@@ -586,6 +662,7 @@ def load_adsorbate_gcmc_scan_config(config_path: str | Path) -> SimpleNamespace:
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    flat_config = _resolve_mu_scan_values(flat_config)
     adsorbate_value = flat_config.get("adsorbate")
     if isinstance(adsorbate_value, str):
         adsorbate_path = config_path.parent / adsorbate_value
@@ -883,6 +960,7 @@ def write_adsorbate_gcmc_scan_summary(results: list[dict], summary_file: Path) -
                 "n_hist_json",
                 "run_dir",
                 "traj_file",
+                "attempted_traj_file",
                 "thermo_file",
                 "checkpoint_file",
             ]
@@ -908,6 +986,7 @@ def write_adsorbate_gcmc_scan_summary(results: list[dict], summary_file: Path) -
                     json.dumps(row["n_hist"], sort_keys=True),
                     row["run_dir"],
                     row["traj_file"],
+                    row.get("attempted_traj_file", ""),
                     row["thermo_file"],
                     row["checkpoint_file"],
                 ]
@@ -1065,6 +1144,11 @@ class AdsorbateGCMCScanWorkflow:
             )
 
         adsorbate_template, anchor_index = self._build_adsorbate_template()
+        attempted_traj_file = (
+            str(run_dir / f"{stem}_attempted.traj")
+            if bool(getattr(cfg, "write_attempted_traj", False))
+            else None
+        )
 
         sim = AdsorbateGCMC(
             atoms=atoms,
@@ -1082,6 +1166,11 @@ class AdsorbateGCMCScanWorkflow:
             site_type=cfg.site_type,
             move_mode=cfg.move_mode,
             site_hop_prob=cfg.site_hop_prob,
+            reorientation_prob=getattr(
+                cfg,
+                "reorientation_prob",
+                0.0 if len(adsorbate_template) == 1 else 0.2,
+            ),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
             min_clearance=cfg.min_clearance,
@@ -1107,7 +1196,9 @@ class AdsorbateGCMCScanWorkflow:
             md_planar_axis=getattr(cfg, "md_planar_axis", 2),
             md_init_momenta=getattr(cfg, "md_init_momenta", True),
             md_remove_drift=getattr(cfg, "md_remove_drift", True),
+            md_without_adsorbate=getattr(cfg, "md_without_adsorbate", False),
             traj_file=str(run_dir / f"{stem}.traj"),
+            attempted_traj_file=attempted_traj_file,
             thermo_file=str(run_dir / f"{stem}.dat"),
             checkpoint_file=str(run_dir / f"{stem}.pkl"),
             checkpoint_interval=0,
@@ -1119,6 +1210,7 @@ class AdsorbateGCMCScanWorkflow:
             nsweeps=cfg.nsweeps,
             traj_file=str(run_dir / f"{stem}.traj"),
             interval=cfg.write_interval,
+            progress_interval_moves=getattr(cfg, "progress_interval_moves", 0),
             sample_interval=cfg.sample_interval,
             equilibration=cfg.equilibration,
         )
@@ -1132,6 +1224,7 @@ class AdsorbateGCMCScanWorkflow:
             ),
             "run_dir": str(run_dir),
             "traj_file": str(run_dir / f"{stem}.traj"),
+            "attempted_traj_file": attempted_traj_file or "",
             "thermo_file": str(run_dir / f"{stem}.dat"),
             "checkpoint_file": str(run_dir / f"{stem}.pkl"),
             **stats,
@@ -1323,6 +1416,7 @@ class AdsorbateCMCWorkflow:
                     adsorbate=adsorbate_template,
                     n_adsorbates=int(n_adsorbates),
                     site_elements=_parse_symbols(getattr(cfg, "site_elements", ())),
+                    substrate_elements=substrate_elements,
                     surface_side=getattr(cfg, "surface_side", "top"),
                     site_types=cfg.site_type,
                     layer_tol=cfg.surface_layer_tol,
@@ -1431,11 +1525,16 @@ class AdsorbateGCMCWorkflow:
     def _build_output_paths(self) -> dict[str, str]:
         prefix = Path(self.config.output_prefix)
         prefix.parent.mkdir(parents=True, exist_ok=True)
-        return {
+        output_paths = {
             "traj_file": str(prefix.with_suffix(".traj")),
             "thermo_file": str(prefix.with_suffix(".dat")),
             "checkpoint_file": str(prefix.with_suffix(".pkl")),
         }
+        if bool(getattr(self.config, "write_attempted_traj", False)):
+            output_paths["attempted_traj_file"] = str(
+                prefix.parent / f"{prefix.name}_attempted.traj"
+            )
+        return output_paths
 
     def _build_adsorbate_template(self) -> tuple[Atoms, int]:
         adsorbate_value = getattr(self.config, "adsorbate", None)
@@ -1472,6 +1571,11 @@ class AdsorbateGCMCWorkflow:
             site_type=cfg.site_type,
             move_mode=cfg.move_mode,
             site_hop_prob=cfg.site_hop_prob,
+            reorientation_prob=getattr(
+                cfg,
+                "reorientation_prob",
+                0.0 if len(adsorbate_template) == 1 else 0.2,
+            ),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
             min_clearance=cfg.min_clearance,
@@ -1497,7 +1601,9 @@ class AdsorbateGCMCWorkflow:
             md_planar_axis=getattr(cfg, "md_planar_axis", 2),
             md_init_momenta=getattr(cfg, "md_init_momenta", True),
             md_remove_drift=getattr(cfg, "md_remove_drift", True),
+            md_without_adsorbate=getattr(cfg, "md_without_adsorbate", False),
             traj_file=output_paths["traj_file"],
+            attempted_traj_file=output_paths.get("attempted_traj_file"),
             thermo_file=output_paths["thermo_file"],
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=0,
@@ -1517,7 +1623,8 @@ class AdsorbateGCMCWorkflow:
                 f"(prob={getattr(cfg, 'md_move_prob', 0.0)}, "
                 f"steps={getattr(cfg, 'md_steps', 0)}, "
                 f"dt_fs={getattr(cfg, 'md_timestep_fs', 1.0)}, "
-                f"planar={getattr(cfg, 'md_planar', False)})"
+                f"planar={getattr(cfg, 'md_planar', False)}, "
+                f"without_adsorbate={getattr(cfg, 'md_without_adsorbate', False)})"
             ),
         )
 
@@ -1525,6 +1632,7 @@ class AdsorbateGCMCWorkflow:
             nsweeps=int(cfg.nsweeps),
             traj_file=output_paths["traj_file"],
             interval=int(cfg.write_interval),
+            progress_interval_moves=int(getattr(cfg, "progress_interval_moves", 0)),
             sample_interval=int(cfg.sample_interval),
             equilibration=int(cfg.equilibration),
         )
@@ -1736,6 +1844,43 @@ class AlloyReplicaExchangeWorkflow:
         }
         return kwargs
 
+    def _ray_num_gpus_per_task(self) -> float | None:
+        value = getattr(self.config, "ray_num_gpus_per_task", None)
+        if value is None:
+            return None
+        return float(value)
+
+    def _replica_pool_config(self) -> tuple[int, int]:
+        cfg = self.config
+        backend = str(cfg.backend).lower()
+
+        n_gpus = getattr(cfg, "n_gpus", None)
+        workers_per_gpu = getattr(cfg, "workers_per_gpu", None)
+
+        if backend == "ray":
+            if n_gpus is None:
+                n_gpus = _infer_total_gpus_from_environment()
+            if n_gpus is None or int(n_gpus) < 1:
+                raise ValueError(
+                    "For backend='ray', n_gpus could not be inferred from the environment. "
+                    "Set backend.n_gpus explicitly or run under Slurm with GPU environment variables."
+                )
+            if workers_per_gpu is None:
+                num_gpus_per_task = self._ray_num_gpus_per_task()
+                if num_gpus_per_task is None or num_gpus_per_task <= 0.0:
+                    workers_per_gpu = 1
+                else:
+                    workers_per_gpu = max(
+                        1, int(np.floor((1.0 / float(num_gpus_per_task)) + 1.0e-8))
+                    )
+        else:
+            if n_gpus is None:
+                n_gpus = 1
+            if workers_per_gpu is None:
+                workers_per_gpu = 1
+
+        return int(n_gpus), int(workers_per_gpu)
+
     def _backend_kwargs(self) -> dict | None:
         if str(self.config.backend).lower() != "ray":
             return None
@@ -1743,9 +1888,9 @@ class AlloyReplicaExchangeWorkflow:
         actor_options = {
             "num_cpus": float(getattr(self.config, "ray_num_cpus_per_task", 1)),
         }
-        num_gpus = getattr(self.config, "ray_num_gpus_per_task", None)
+        num_gpus = self._ray_num_gpus_per_task()
         if num_gpus is not None:
-            actor_options["num_gpus"] = float(num_gpus)
+            actor_options["num_gpus"] = num_gpus
 
         return {
             "init_kwargs": {
@@ -1813,9 +1958,13 @@ class AlloyReplicaExchangeWorkflow:
             print(f"Initialization seed: {init_summary['initialization_seed']}")
 
         temps = self._temperatures()
+        n_gpus, workers_per_gpu = self._replica_pool_config()
         print(format_alloy_pt_status(temps))
         print(f"Backend: {cfg.backend}")
-        print(f"GPUs: {int(cfg.n_gpus)} | Workers/GPU: {int(cfg.workers_per_gpu)}")
+        print(f"GPUs: {n_gpus} | Workers/GPU: {workers_per_gpu}")
+        if str(cfg.backend).lower() == "ray":
+            print(f"Ray task CPUs: {float(getattr(cfg, 'ray_num_cpus_per_task', 1))}")
+            print(f"Ray task GPUs: {self._ray_num_gpus_per_task()}")
 
         pt = ReplicaExchange.from_auto_config(
             atoms_template=atoms,
@@ -1826,8 +1975,8 @@ class AlloyReplicaExchangeWorkflow:
             mc_class=AlloyCMC,
             calc_kwargs=calc_kwargs,
             mc_kwargs=mc_kwargs,
-            n_gpus=int(cfg.n_gpus),
-            workers_per_gpu=int(cfg.workers_per_gpu),
+            n_gpus=n_gpus,
+            workers_per_gpu=workers_per_gpu,
             swap_stride=int(cfg.swap_stride),
             resume=bool(cfg.resume),
             results_file=str(cfg.results_file),

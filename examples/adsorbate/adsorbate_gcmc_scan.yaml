@@ -15,6 +15,9 @@ system:
 gcmc:
   temperature: 300.0
   mu_values: [-3.0, -2.0, -1.0, 0.0, 1.0]
+  # Alternative:
+  # mu_range: [-3.0, 1.0]
+  # n_mu_points: 5
   seeds: [81, 82]
   move_mode: hybrid
   site_hop_prob: 0.25

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from ase import Atoms
 from ase import units
+from ase.build import make_supercell
 from ase.constraints import FixCartesian
 from ase.geometry import get_distances
 from ase.io import Trajectory, read, write
@@ -170,6 +171,8 @@ class AdsorbateCMC(SurfaceMCBase):
         site_elements: Optional[Union[str, Sequence[str]]] = None,
         surface_side: str = "top",
         coverage: Optional[float] = None,
+        repeat: Sequence[int] = (1, 1, 1),
+        supercell_matrix: Optional[Sequence[Sequence[int]]] = None,
         site_type: Union[str, Sequence[str]] = "fcc",
         move_mode: str = "displacement",
         site_hop_prob: float = 0.5,
@@ -218,6 +221,17 @@ class AdsorbateCMC(SurfaceMCBase):
             self.atoms = read(atoms)
         else:
             self.atoms = atoms.copy()
+
+        if supercell_matrix is not None:
+            self.atoms = make_supercell(
+                self.atoms, np.asarray(supercell_matrix, dtype=int)
+            )
+
+        repeat = tuple(int(value) for value in repeat)
+        if len(repeat) != 3:
+            raise ValueError("repeat must be a 3-element sequence.")
+        if repeat != (1, 1, 1):
+            self.atoms = self.atoms.repeat(repeat)
 
         self.adsorbate_template = _load_adsorbate_template(adsorbate, adsorbate_element)
         if len(self.adsorbate_template) == 0:
@@ -613,6 +627,7 @@ class AdsorbateCMC(SurfaceMCBase):
                 if site_elements is not None
                 else ((top_layer_element,) if top_layer_element is not None else ())
             ),
+            substrate_elements=substrate_elements,
             surface_side=surface_side,
             site_types=site_type,
             layer_tol=surface_layer_tol,
@@ -930,6 +945,7 @@ class AdsorbateCMC(SurfaceMCBase):
         return build_surface_site_registry(
             self.atoms,
             site_elements=self.site_elements,
+            substrate_elements=self.substrate_elements,
             surface_side=self.surface_side,
             site_types=self.site_types,
             layer_tol=self.surface_layer_tol,

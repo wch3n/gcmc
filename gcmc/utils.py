@@ -295,6 +295,44 @@ def _xy_distances(
     return np.linalg.norm(disp_mic[:, :2], axis=1)
 
 
+def _ordered_layer_indices_by_cluster(
+    atoms: Atoms,
+    elements: Union[str, Sequence[str]],
+    *,
+    surface_side: Literal["top", "bottom"] = "top",
+    layer_tol: float = 0.5,
+) -> List[np.ndarray]:
+    """
+    Return global atom indices grouped into z layers ordered from the chosen surface.
+
+    For MXenes and other rumpled slabs, callers can pass a larger ``layer_tol`` than
+    the site-matching tolerance so physically equivalent planes are not spuriously
+    split into several pseudo-layers.
+    """
+    side = str(surface_side).lower()
+    if side not in {"top", "bottom"}:
+        raise ValueError("surface_side must be 'top' or 'bottom'.")
+    symbols = _normalize_symbol_list(elements)
+    symbol_set = set(symbols)
+    indices = np.array(
+        [atom.index for atom in atoms if atom.symbol in symbol_set],
+        dtype=int,
+    )
+    if indices.size == 0:
+        raise ValueError(f"No atoms with symbols {symbols} found.")
+
+    zvals = atoms.positions[indices, 2]
+    clusters = _cluster_axis_values(zvals, tol=layer_tol)
+    if not clusters:
+        raise RuntimeError("Could not identify any surface layers.")
+    clusters = sorted(
+        clusters,
+        key=lambda cluster: float(np.mean(zvals[np.asarray(cluster, dtype=int)])),
+        reverse=(side == "top"),
+    )
+    return [np.sort(indices[np.asarray(cluster, dtype=int)].astype(int)) for cluster in clusters]
+
+
 def _midpoint_xy(
     pos_i: np.ndarray,
     pos_j: np.ndarray,
@@ -314,31 +352,43 @@ def _select_surface_atom_indices_by_cluster(
     *,
     surface_side: Literal["top", "bottom"] = "top",
     layer_tol: float = 0.5,
+    reference_elements: Optional[Union[str, Sequence[str]]] = None,
+    reference_layer_tol: Optional[float] = None,
 ) -> np.ndarray:
     """
     Select one exposed alloy/support layer from a layered slab using z-clustering.
     """
-    side = str(surface_side).lower()
-    if side not in {"top", "bottom"}:
-        raise ValueError("surface_side must be 'top' or 'bottom'.")
-    symbols = _normalize_symbol_list(elements)
-    indices = np.array(
-        [atom.index for atom in atoms if atom.symbol in set(symbols)],
-        dtype=int,
-    )
-    if indices.size == 0:
-        raise ValueError(f"No atoms with symbols {symbols} found.")
+    site_symbols = set(_normalize_symbol_list(elements))
+    if reference_elements is not None:
+        ref_layers = _ordered_layer_indices_by_cluster(
+            atoms,
+            reference_elements,
+            surface_side=surface_side,
+            layer_tol=(
+                float(reference_layer_tol)
+                if reference_layer_tol is not None
+                else float(layer_tol)
+            ),
+        )
+        outer_layer = np.asarray(ref_layers[0], dtype=int)
+        selected = np.asarray(
+            [idx for idx in outer_layer if atoms[int(idx)].symbol in site_symbols],
+            dtype=int,
+        )
+        if selected.size > 0:
+            return np.sort(selected.astype(int))
 
-    zvals = atoms.positions[indices, 2]
-    clusters = _cluster_axis_values(zvals, tol=layer_tol)
-    if not clusters:
-        raise RuntimeError("Could not identify any surface layers.")
-    clusters = sorted(
-        clusters,
-        key=lambda cluster: float(np.mean(zvals[np.asarray(cluster, dtype=int)])),
-        reverse=(side == "top"),
+    return np.sort(
+        np.asarray(
+            _ordered_layer_indices_by_cluster(
+                atoms,
+                elements,
+                surface_side=surface_side,
+                layer_tol=layer_tol,
+            )[0],
+            dtype=int,
+        )
     )
-    return np.sort(indices[np.asarray(clusters[0], dtype=int)].astype(int))
 
 
 def classify_hollow_sites_on_surface(
@@ -350,42 +400,44 @@ def classify_hollow_sites_on_surface(
     stacking: Literal["fcc", "hcp"] = "fcc",
     layer_tol: float = 0.5,
     surface_side: Literal["top", "bottom"] = "top",
+    reference_layers: Optional[Sequence[np.ndarray]] = None,
 ) -> np.ndarray:
     """
-    Classify hollow sites against the second/third subsurface alloy layer on a
-    chosen slab side.
+    Classify hollow sites against the first/second subsurface layer on a chosen
+    slab side.
+
+    ``hcp`` refers to hollows above the first subsurface layer beneath the exposed
+    surface layer. ``fcc`` refers to hollows above the second subsurface layer.
+    If the requested subsurface layer is unavailable, an empty array is returned.
     """
     side = str(surface_side).lower()
     if side not in {"top", "bottom"}:
         raise ValueError("surface_side must be 'top' or 'bottom'.")
-    symbols = set(_normalize_symbol_list(elements))
-    subs = [atom for atom in atoms if atom.symbol in symbols]
-    if not subs:
-        raise ValueError(f"No atoms with symbols {tuple(sorted(symbols))} found.")
+    if reference_layers is None:
+        reference_layers = _ordered_layer_indices_by_cluster(
+            atoms,
+            elements,
+            surface_side=side,
+            layer_tol=layer_tol,
+        )
 
-    zvals = np.array([atom.position[2] for atom in subs], dtype=float)
-    layer_clusters = _cluster_axis_values(zvals, tol=layer_tol)
-    layer_clusters = sorted(
-        layer_clusters,
-        key=lambda cluster: float(np.mean(zvals[np.asarray(cluster, dtype=int)])),
-        reverse=(side == "top"),
-    )
-    if len(layer_clusters) < 3:
-        raise RuntimeError("Not enough substrate layers to classify hollows.")
-    idx = 2 if stacking == "fcc" else 1
-    ref_atoms = [subs[int(i)] for i in np.asarray(layer_clusters[idx], dtype=int)]
+    ref_layer_idx = 2 if stacking == "fcc" else 1
+    if len(reference_layers) <= ref_layer_idx:
+        return np.empty((0, 2), dtype=float)
+    ref_indices = np.asarray(reference_layers[ref_layer_idx], dtype=int)
+    if ref_indices.size == 0:
+        return np.empty((0, 2), dtype=float)
 
     cell = atoms.cell.array
     pbc = atoms.pbc
+    ref_xy = atoms.positions[ref_indices, :2]
     selected_hollows = []
     for xy in np.asarray(hollow_xy, dtype=float):
-        for atom in ref_atoms:
-            dxyz = np.zeros((1, 3), dtype=float)
-            dxyz[0, :2] = atom.position[:2] - xy
-            dxyz_mic, _ = find_mic(dxyz, cell, pbc)
-            if np.linalg.norm(dxyz_mic[0][:2]) < xy_tol:
-                selected_hollows.append(_wrap_xy(xy, cell))
-                break
+        dxyz = np.zeros((len(ref_xy), 3), dtype=float)
+        dxyz[:, :2] = ref_xy - xy[None, :]
+        dxyz_mic, _ = find_mic(dxyz, cell, pbc)
+        if np.any(np.linalg.norm(dxyz_mic[:, :2], axis=1) < xy_tol):
+            selected_hollows.append(_wrap_xy(xy, cell))
     if not selected_hollows:
         return np.empty((0, 2), dtype=float)
     unique = []
@@ -416,6 +468,7 @@ def build_surface_site_registry(
     atoms: Atoms,
     *,
     site_elements: Union[str, Sequence[str]],
+    substrate_elements: Optional[Union[str, Sequence[str]]] = None,
     surface_side: Literal["top", "bottom"] = "top",
     site_types: Union[str, Sequence[str]] = ("atop", "bridge", "fcc", "hcp"),
     layer_tol: float = 0.5,
@@ -441,12 +494,24 @@ def build_surface_site_registry(
     if side not in {"top", "bottom"}:
         raise ValueError("surface_side must be 'top' or 'bottom'.")
     normalized_site_types = _normalize_site_types(site_types)
-
+    physical_layer_tol = max(float(layer_tol), 0.9) if substrate_elements is not None else float(layer_tol)
+    reference_layers = (
+        _ordered_layer_indices_by_cluster(
+            atoms,
+            substrate_elements,
+            surface_side=side,
+            layer_tol=physical_layer_tol,
+        )
+        if substrate_elements is not None
+        else None
+    )
     surface_indices = _select_surface_atom_indices_by_cluster(
         atoms,
         site_elements,
         surface_side=side,
         layer_tol=layer_tol,
+        reference_elements=substrate_elements,
+        reference_layer_tol=physical_layer_tol if substrate_elements is not None else None,
     )
     surface_positions = atoms.positions[surface_indices]
     if len(surface_indices) == 0:
@@ -544,17 +609,19 @@ def build_surface_site_registry(
 
     if any(site in normalized_site_types for site in ("fcc", "hcp")) and len(surface_indices) >= 3:
         hollow_xy = get_hollow_xy(surface_positions[:, :2], atoms.cell.array)
+        hollow_elements = substrate_elements if substrate_elements is not None else site_elements
         for site_type in ("fcc", "hcp"):
             if site_type not in normalized_site_types:
                 continue
             selected_xy = classify_hollow_sites_on_surface(
                 atoms,
                 hollow_xy,
-                elements=site_elements,
+                elements=hollow_elements,
                 xy_tol=xy_tol,
                 stacking=site_type,
-                layer_tol=layer_tol,
+                layer_tol=physical_layer_tol,
                 surface_side=side,
+                reference_layers=reference_layers,
             )
             for xy in np.asarray(selected_xy, dtype=float):
                 distances_xy = _xy_distances(
@@ -789,6 +856,7 @@ def initialize_surface_adsorbates(
     n_adsorbates: int,
     support_element: Optional[str] = None,
     site_elements: Optional[Union[str, Sequence[str]]] = None,
+    substrate_elements: Optional[Union[str, Sequence[str]]] = None,
     surface_side: Literal["top", "bottom"] = "top",
     site_types: Union[str, Sequence[str]] = "atop",
     layer_tol: float = 0.5,
@@ -825,6 +893,7 @@ def initialize_surface_adsorbates(
     registry = build_surface_site_registry(
         atoms,
         site_elements=site_elements,
+        substrate_elements=substrate_elements,
         surface_side=surface_side,
         site_types=site_types,
         layer_tol=layer_tol,

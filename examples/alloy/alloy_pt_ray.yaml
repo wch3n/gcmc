@@ -45,11 +45,10 @@ mc:
 
 backend:
   backend: ray
-  n_gpus: 8
-  workers_per_gpu: 2
   ray_address: auto
   ray_log_to_driver: true
   ray_num_cpus_per_task: 1
+  ray_num_gpus_per_task: 0.5
   use_placement_group: true
   placement_group_strategy: SPREAD
 

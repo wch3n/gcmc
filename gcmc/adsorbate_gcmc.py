@@ -46,6 +46,8 @@ class AdsorbateGCMC(AdsorbateCMC):
         w_delete: float = 1.0,
         w_canonical: float = 1.0,
         max_n_adsorbates: Optional[int] = None,
+        repeat: Sequence[int] = (1, 1, 1),
+        supercell_matrix: Optional[Sequence[Sequence[int]]] = None,
         element: Optional[str] = None,
         adsorbate_element: str = "H",
         adsorbate: Optional[Union[str, Atoms]] = None,
@@ -56,6 +58,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         seed: int = 81,
         resume: bool = False,
         allow_ambiguous_empty_adsorbates: bool = False,
+        md_without_adsorbate: bool = False,
         **kwargs,
     ):
         if element is not None:
@@ -90,6 +93,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         self._eligible_site_xy: Optional[np.ndarray] = None
         self._eligible_site_z: Optional[np.ndarray] = None
         self._single_site_occupancy_fast_path = max_n_adsorbates == 1
+        self.md_without_adsorbate = bool(md_without_adsorbate)
 
         super().__init__(
             atoms=atoms,
@@ -97,6 +101,8 @@ class AdsorbateGCMC(AdsorbateCMC):
             T=T,
             adsorbate_element=adsorbate_element,
             adsorbate=adsorbate,
+            repeat=repeat,
+            supercell_matrix=supercell_matrix,
             traj_file=traj_file,
             thermo_file=thermo_file,
             checkpoint_file=checkpoint_file,
@@ -422,6 +428,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         equilibration: int = 0,
         max_moves: Optional[int] = None,
         log_every: Optional[int] = None,
+        progress_interval_moves: Optional[int] = None,
     ) -> Dict[str, float]:
         if nsweeps is None:
             nsweeps = self.nsteps
@@ -453,6 +460,23 @@ class AdsorbateGCMC(AdsorbateCMC):
         self.accepted_deletions = 0
         self.attempted_canonical = 0
         self.accepted_canonical = 0
+        progress_every = (
+            None
+            if progress_interval_moves is None or int(progress_interval_moves) <= 0
+            else int(progress_interval_moves)
+        )
+
+        logger.info(
+            f"Start adsorbate GCMC | T={self.T:.0f}K | nsweeps={int(nsweeps)} | "
+            f"eligible_sites={self._eligible_site_count()} | moves_per_sweep={self._moves_per_sweep()} | "
+            f"write_interval={int(interval)} | sample_interval={int(sample_interval)} | "
+            f"equilibration={int(equilibration)}"
+            + (
+                ""
+                if progress_every is None
+                else f" | progress_interval_moves={progress_every}"
+            )
+        )
 
         for sweep in range(int(nsweeps)):
             beta = 1.0 / (KB_EV_PER_K * self.T)
@@ -462,62 +486,168 @@ class AdsorbateGCMC(AdsorbateCMC):
 
             for move_idx in range(moves_this_sweep):
                 self.total_moves += 1
-                n_ads = len(self.ads_groups)
-                do_md = (
-                    self.enable_hybrid_md
-                    and n_ads > 0
-                    and self.rng.random() < self.md_move_prob
-                )
-                if do_md:
-                    self.md_attempted_moves += 1
-                    atoms_trial, delta_e, delta_h = self._propose_md_move()
+                try:
+                    n_ads = len(self.ads_groups)
+                    do_md = (
+                        self.enable_hybrid_md
+                        and (n_ads > 0 or self.md_without_adsorbate)
+                        and self.rng.random() < self.md_move_prob
+                    )
+                    if do_md:
+                        self.md_attempted_moves += 1
+                        atoms_trial, delta_e, delta_h = self._propose_md_move()
+                        if atoms_trial is None:
+                            continue
+                        if attempted_writer is not None:
+                            attempted_writer.write(atoms_trial)
+                        if self.has_detached_functional_groups(
+                            atoms_trial, detach_tol=self.detach_tol
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
+                        if self.has_afloat_adsorbates(
+                            atoms_trial,
+                            support_xy_tol=self.support_xy_tol,
+                            z_max_support=self.z_max_support,
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
+                        md_delta = (
+                            delta_h if self.md_accept_mode == "hamiltonian" else delta_e
+                        )
+                        if self._metropolis_accept(md_delta, beta=beta):
+                            self.e_old += delta_e
+                            self.accepted_moves += 1
+                            self.md_accepted_moves += 1
+                            self.atoms.positions = atoms_trial.positions
+                            self.atoms.cell = atoms_trial.cell
+                            self._invalidate_gc_site_cache(clear_registry=True)
+                            if accepted_writer is not None:
+                                accepted_writer.write(self.atoms)
+                        elif rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    move_probs = self._move_probabilities(
+                        len(self.ads_groups), self._eligible_site_count()
+                    )
+                    if not move_probs:
+                        continue
+                    move_types = tuple(move_probs.keys())
+                    move_weights = np.asarray(
+                        [move_probs[key] for key in move_types], dtype=float
+                    )
+                    move_type = str(
+                        self.rng.choice(
+                            move_types, p=move_weights / move_weights.sum()
+                        )
+                    )
+
+                    if move_type == "insert":
+                        self.attempted_insertions += 1
+                        proposal = self._propose_insertion()
+                        if proposal is None:
+                            continue
+                        atoms_trial, proposal_info = proposal
+                        if attempted_writer is not None:
+                            attempted_writer.write(atoms_trial)
+                        if self.relax:
+                            atoms_trial, converged = self.relax_structure(
+                                atoms_trial, move_ind=[self.sweep, move_idx]
+                            )
+                            if not converged:
+                                continue
+                            if self.has_detached_functional_groups(
+                                atoms_trial, detach_tol=self.detach_tol
+                            ):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
+                        if self.has_afloat_adsorbates(
+                            atoms_trial,
+                            support_xy_tol=self.support_xy_tol,
+                            z_max_support=self.z_max_support,
+                        ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
+                        e_new = self.get_potential_energy(atoms_trial)
+                        delta_e = e_new - self.e_old
+                        log_q_ratio = self._insertion_log_q_ratio(proposal_info)
+                        if self._grand_accept(
+                            delta_e, delta_n=1, log_q_ratio=log_q_ratio, beta=beta
+                        ):
+                            self.atoms = atoms_trial
+                            self.atoms.calc = self.calculator
+                            self.e_old = e_new
+                            self.accepted_moves += 1
+                            self.accepted_insertions += 1
+                            self._refresh_after_adsorbate_move(
+                                invalidate_site_registry=self.relax
+                            )
+                            if accepted_writer is not None:
+                                accepted_writer.write(self.atoms)
+                        elif rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    if move_type == "delete":
+                        self.attempted_deletions += 1
+                        proposal = self._propose_deletion()
+                        if proposal is None:
+                            continue
+                        atoms_trial, proposal_info = proposal
+                        if attempted_writer is not None:
+                            attempted_writer.write(atoms_trial)
+                        if self.relax:
+                            atoms_trial, converged = self.relax_structure(
+                                atoms_trial, move_ind=[self.sweep, move_idx]
+                            )
+                            if not converged:
+                                continue
+                            if self.has_detached_functional_groups(
+                                atoms_trial, detach_tol=self.detach_tol
+                            ):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
+                        # A deletion that removes the last adsorbate leaves a clean slab.
+                        # In that case there is no adsorbate support geometry to validate.
+                        if int(proposal_info["n_ads"]) > 1:
+                            if self.has_afloat_adsorbates(
+                                atoms_trial,
+                                support_xy_tol=self.support_xy_tol,
+                                z_max_support=self.z_max_support,
+                            ):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
+                        e_new = self.get_potential_energy(atoms_trial)
+                        delta_e = e_new - self.e_old
+                        log_q_ratio = self._deletion_log_q_ratio(proposal_info)
+                        if self._grand_accept(
+                            delta_e, delta_n=-1, log_q_ratio=log_q_ratio, beta=beta
+                        ):
+                            self.atoms = atoms_trial
+                            self.atoms.calc = self.calculator
+                            self.e_old = e_new
+                            self.accepted_moves += 1
+                            self.accepted_deletions += 1
+                            self._refresh_after_adsorbate_move(
+                                invalidate_site_registry=self.relax
+                            )
+                            if accepted_writer is not None:
+                                accepted_writer.write(self.atoms)
+                        elif rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    self.attempted_canonical += 1
+                    atoms_trial = self._propose_move()
                     if atoms_trial is None:
                         continue
-                    if attempted_writer is not None:
-                        attempted_writer.write(atoms_trial)
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
-                    ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
-                    if int(proposal_info["n_ads"]) > 1 and self.has_afloat_adsorbates(
-                        atoms_trial,
-                        support_xy_tol=self.support_xy_tol,
-                        z_max_support=self.z_max_support,
-                    ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
-                    md_delta = delta_h if self.md_accept_mode == "hamiltonian" else delta_e
-                    if self._metropolis_accept(md_delta, beta=beta):
-                        self.e_old += delta_e
-                        self.accepted_moves += 1
-                        self.md_accepted_moves += 1
-                        self.atoms.positions = atoms_trial.positions
-                        self.atoms.cell = atoms_trial.cell
-                        self._invalidate_gc_site_cache(clear_registry=True)
-                        if accepted_writer is not None:
-                            accepted_writer.write(self.atoms)
-                    elif rejected_writer is not None:
-                        rejected_writer.write(atoms_trial)
-                    continue
-
-                move_probs = self._move_probabilities(
-                    len(self.ads_groups), self._eligible_site_count()
-                )
-                if not move_probs:
-                    continue
-                move_types = tuple(move_probs.keys())
-                move_weights = np.asarray([move_probs[key] for key in move_types], dtype=float)
-                move_type = str(self.rng.choice(move_types, p=move_weights / move_weights.sum()))
-
-                if move_type == "insert":
-                    self.attempted_insertions += 1
-                    proposal = self._propose_insertion()
-                    if proposal is None:
-                        continue
-                    atoms_trial, proposal_info = proposal
                     if attempted_writer is not None:
                         attempted_writer.write(atoms_trial)
                     if self.relax:
@@ -542,106 +672,36 @@ class AdsorbateGCMC(AdsorbateCMC):
                         continue
                     e_new = self.get_potential_energy(atoms_trial)
                     delta_e = e_new - self.e_old
-                    log_q_ratio = self._insertion_log_q_ratio(proposal_info)
-                    if self._grand_accept(delta_e, delta_n=1, log_q_ratio=log_q_ratio, beta=beta):
+                    if self._metropolis_accept(delta_e, beta=beta):
                         self.atoms = atoms_trial
                         self.atoms.calc = self.calculator
                         self.e_old = e_new
                         self.accepted_moves += 1
-                        self.accepted_insertions += 1
-                        self._refresh_after_adsorbate_move(invalidate_site_registry=self.relax)
-                        if accepted_writer is not None:
-                            accepted_writer.write(self.atoms)
-                    elif rejected_writer is not None:
-                        rejected_writer.write(atoms_trial)
-                    continue
-
-                if move_type == "delete":
-                    self.attempted_deletions += 1
-                    proposal = self._propose_deletion()
-                    if proposal is None:
-                        continue
-                    atoms_trial, proposal_info = proposal
-                    if attempted_writer is not None:
-                        attempted_writer.write(atoms_trial)
-                    if self.relax:
-                        atoms_trial, converged = self.relax_structure(
-                            atoms_trial, move_ind=[self.sweep, move_idx]
+                        self.accepted_canonical += 1
+                        self._refresh_after_adsorbate_move(
+                            invalidate_site_registry=self.relax
                         )
-                        if not converged:
-                            continue
-                        if self.has_detached_functional_groups(
-                            atoms_trial, detach_tol=self.detach_tol
-                        ):
-                            if rejected_writer is not None:
-                                rejected_writer.write(atoms_trial)
-                            continue
-                    # A deletion that removes the last adsorbate leaves a clean slab.
-                    # In that case there is no adsorbate support geometry to validate.
-                    if int(proposal_info["n_ads"]) > 1:
-                        if self.has_afloat_adsorbates(
-                            atoms_trial,
-                            support_xy_tol=self.support_xy_tol,
-                            z_max_support=self.z_max_support,
-                        ):
-                            if rejected_writer is not None:
-                                rejected_writer.write(atoms_trial)
-                            continue
-                    e_new = self.get_potential_energy(atoms_trial)
-                    delta_e = e_new - self.e_old
-                    log_q_ratio = self._deletion_log_q_ratio(proposal_info)
-                    if self._grand_accept(delta_e, delta_n=-1, log_q_ratio=log_q_ratio, beta=beta):
-                        self.atoms = atoms_trial
-                        self.atoms.calc = self.calculator
-                        self.e_old = e_new
-                        self.accepted_moves += 1
-                        self.accepted_deletions += 1
-                        self._refresh_after_adsorbate_move(invalidate_site_registry=self.relax)
                         if accepted_writer is not None:
                             accepted_writer.write(self.atoms)
                     elif rejected_writer is not None:
                         rejected_writer.write(atoms_trial)
-                    continue
-
-                self.attempted_canonical += 1
-                atoms_trial = self._propose_move()
-                if atoms_trial is None:
-                    continue
-                if attempted_writer is not None:
-                    attempted_writer.write(atoms_trial)
-                if self.relax:
-                    atoms_trial, converged = self.relax_structure(
-                        atoms_trial, move_ind=[self.sweep, move_idx]
-                    )
-                    if not converged:
-                        continue
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
+                finally:
+                    if (
+                        progress_every is not None
+                        and (move_idx + 1) % progress_every == 0
+                        and (move_idx + 1) < moves_this_sweep
                     ):
-                        if rejected_writer is not None:
-                            rejected_writer.write(atoms_trial)
-                        continue
-                if self.has_afloat_adsorbates(
-                    atoms_trial,
-                    support_xy_tol=self.support_xy_tol,
-                    z_max_support=self.z_max_support,
-                ):
-                    if rejected_writer is not None:
-                        rejected_writer.write(atoms_trial)
-                    continue
-                e_new = self.get_potential_energy(atoms_trial)
-                delta_e = e_new - self.e_old
-                if self._metropolis_accept(delta_e, beta=beta):
-                    self.atoms = atoms_trial
-                    self.atoms.calc = self.calculator
-                    self.e_old = e_new
-                    self.accepted_moves += 1
-                    self.accepted_canonical += 1
-                    self._refresh_after_adsorbate_move(invalidate_site_registry=self.relax)
-                    if accepted_writer is not None:
-                        accepted_writer.write(self.atoms)
-                elif rejected_writer is not None:
-                    rejected_writer.write(atoms_trial)
+                        acc = (
+                            self.accepted_moves / self.total_moves * 100.0
+                            if self.total_moves
+                            else 0.0
+                        )
+                        logger.info(
+                            f"T={self.T:4.0f}K | sweep {sweep + 1:6d}/{int(nsweeps):6d} | "
+                            f"move {move_idx + 1:4d}/{moves_this_sweep:4d} | "
+                            f"E: {self.e_old:10.4f} | Nads: {len(self.ads_groups):4d} | "
+                            f"Acc: {acc:4.1f}%"
+                        )
 
             self.sweep += 1
 

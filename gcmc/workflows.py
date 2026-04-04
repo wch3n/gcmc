@@ -105,6 +105,8 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "progress_interval_moves": 0,
     "sample_interval": 2,
     "equilibration": 40,
+    "resume": False,
+    "checkpoint_interval": 100,
     "write_attempted_traj": False,
     "backend": "multiprocessing",
     "n_workers": 1,
@@ -172,6 +174,8 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "progress_interval_moves": 0,
     "sample_interval": 2,
     "equilibration": 40,
+    "resume": False,
+    "checkpoint_interval": 100,
     "write_attempted_traj": False,
     "seed": 81,
     "output_prefix": "adsorbate_gcmc",
@@ -1201,8 +1205,9 @@ class AdsorbateGCMCScanWorkflow:
             attempted_traj_file=attempted_traj_file,
             thermo_file=str(run_dir / f"{stem}.dat"),
             checkpoint_file=str(run_dir / f"{stem}.pkl"),
-            checkpoint_interval=0,
+            checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
             seed=int(task["seed"]),
+            resume=bool(getattr(cfg, "resume", False)),
             allow_ambiguous_empty_adsorbates=True,
         )
 
@@ -1606,8 +1611,9 @@ class AdsorbateGCMCWorkflow:
             attempted_traj_file=output_paths.get("attempted_traj_file"),
             thermo_file=output_paths["thermo_file"],
             checkpoint_file=output_paths["checkpoint_file"],
-            checkpoint_interval=0,
+            checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
             seed=int(cfg.seed),
+            resume=bool(getattr(cfg, "resume", False)),
             allow_ambiguous_empty_adsorbates=True,
         )
 

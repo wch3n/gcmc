@@ -10,7 +10,7 @@ from ase.io import Trajectory
 
 from .adsorbate_cmc import AdsorbateCMC, _load_adsorbate_template
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
-from .utils import place_adsorbate_on_site
+from .utils import build_surface_site_registry, place_adsorbate_on_site
 
 logger = logging.getLogger("mc")
 
@@ -94,6 +94,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         self._eligible_site_z: Optional[np.ndarray] = None
         self._single_site_occupancy_fast_path = max_n_adsorbates == 1
         self.md_without_adsorbate = bool(md_without_adsorbate)
+        self._resumed_from_checkpoint = False
 
         super().__init__(
             atoms=atoms,
@@ -203,6 +204,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         self.attempted_canonical = state.get("attempted_canonical", 0)
         self.accepted_canonical = state.get("accepted_canonical", 0)
         self._refresh_cached_state()
+        self._resumed_from_checkpoint = True
         logger.info(f"[{self.T:.0f}K] Resumed adsorbate GCMC from checkpoint.")
 
     def _eligible_site_data(
@@ -242,23 +244,109 @@ class AdsorbateGCMC(AdsorbateCMC):
     def _eligible_site_count(self) -> int:
         return len(self._eligible_site_data()[0])
 
+    def _eligible_sites_for_atoms(self, atoms: Atoms) -> list[dict[str, object]]:
+        if atoms is self.atoms:
+            return self._eligible_sites()
+
+        groups = self._adsorbate_groups_for_atoms(atoms)
+        slab_atoms = atoms.copy()
+        for group in sorted(
+            (np.asarray(group, dtype=int) for group in groups),
+            key=lambda group: int(np.min(group)),
+            reverse=True,
+        ):
+            for idx in np.sort(group)[::-1]:
+                del slab_atoms[int(idx)]
+
+        rows: list[dict[str, object]] = []
+        for row in build_surface_site_registry(
+            slab_atoms,
+            site_elements=self.site_elements,
+            substrate_elements=self.substrate_elements,
+            surface_side=self.surface_side,
+            site_types=self.site_types,
+            layer_tol=self.surface_layer_tol,
+            xy_tol=self.site_match_tol,
+            bridge_cutoff=self.bridge_cutoff,
+            bridge_cutoff_scale=self.bridge_cutoff_scale,
+            support_xy_tol=self.support_xy_tol,
+            vertical_offset=self.vertical_offset,
+            termination_elements=self.functional_elements,
+            min_termination_dist=self.termination_clearance,
+        ):
+            z_val = float(row.get("suggested_z_A", np.nan))
+            if not np.isfinite(z_val):
+                continue
+            if bool(row.get("blocked_by_termination", False)):
+                continue
+            rows.append(row)
+        return rows
+
     def _assign_groups_to_sites(
         self,
         candidate_sites: Optional[Sequence[Dict[str, object]]] = None,
+        atoms: Optional[Atoms] = None,
     ) -> Dict[int, int]:
-        if candidate_sites is None:
-            candidate_sites, site_xy, _ = self._eligible_site_data()
-        else:
-            site_xy = np.asarray(
-                [np.asarray(site["xy"], dtype=float) for site in candidate_sites],
-                dtype=float,
-            )
-        if not candidate_sites or not self.ads_groups:
-            return {}
+        return self._assign_groups_to_sites_with_distances(
+            candidate_sites=candidate_sites, atoms=atoms
+        )[0]
 
-        cell = self.atoms.get_cell()
-        pbc = self.atoms.get_pbc()
-        anchor_xy = self.atoms.positions[np.asarray(self.ads_anchor_indices, dtype=int), :2]
+    def _site_assignment_is_valid(
+        self,
+        candidate_sites: Optional[Sequence[Dict[str, object]]] = None,
+        atoms: Optional[Atoms] = None,
+    ) -> bool:
+        if self._single_site_occupancy_fast_path:
+            return True
+
+        if atoms is None:
+            atoms = self.atoms
+        groups = self._adsorbate_groups_for_atoms(atoms)
+        if not groups:
+            return True
+        if candidate_sites is None:
+            candidate_sites = self._eligible_sites_for_atoms(atoms)
+        if len(candidate_sites) < len(groups):
+            return False
+
+        mapping, distances = self._assign_groups_to_sites_with_distances(
+            candidate_sites=candidate_sites, atoms=atoms
+        )
+        if len(mapping) != len(groups):
+            return False
+        return all(
+            np.isfinite(distances.get(group_id, np.inf))
+            and float(distances[group_id]) <= float(self.site_match_tol)
+            for group_id in range(len(groups))
+        )
+
+    def _assign_groups_to_sites_with_distances(
+        self,
+        candidate_sites: Optional[Sequence[Dict[str, object]]] = None,
+        atoms: Optional[Atoms] = None,
+    ) -> tuple[Dict[int, int], Dict[int, float]]:
+        if atoms is None:
+            atoms = self.atoms
+        groups = self._adsorbate_groups_for_atoms(atoms)
+        if candidate_sites is None:
+            candidate_sites = self._eligible_sites_for_atoms(atoms)
+        if not candidate_sites or not groups:
+            return {}, {}
+
+        site_xy = np.asarray(
+            [np.asarray(site["xy"], dtype=float) for site in candidate_sites],
+            dtype=float,
+        )
+
+        cell = atoms.get_cell()
+        pbc = atoms.get_pbc()
+        anchor_xy = atoms.positions[
+            np.asarray(
+                [self._anchor_index_for_group(group, atoms=atoms) for group in groups],
+                dtype=int,
+            ),
+            :2,
+        ]
         anchor_xyz = np.zeros((len(anchor_xy), 3), dtype=float)
         site_xyz = np.zeros((len(site_xy), 3), dtype=float)
         anchor_xyz[:, :2] = anchor_xy
@@ -269,6 +357,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         assigned_groups = set()
         assigned_sites = set()
         mapping: Dict[int, int] = {}
+        distances: Dict[int, float] = {}
         n_sites = len(candidate_sites)
         for flat_idx in order.tolist():
             group_id = int(flat_idx // n_sites)
@@ -276,11 +365,12 @@ class AdsorbateGCMC(AdsorbateCMC):
             if group_id in assigned_groups or site_id in assigned_sites:
                 continue
             mapping[group_id] = site_id
+            distances[group_id] = float(pair_distances[group_id, site_id])
             assigned_groups.add(group_id)
             assigned_sites.add(site_id)
-            if len(assigned_groups) == len(self.ads_groups):
+            if len(assigned_groups) == len(groups):
                 break
-        return mapping
+        return mapping, distances
 
     def _move_probabilities(self, n_ads: int, n_sites: int) -> Dict[str, float]:
         weights: Dict[str, float] = {}
@@ -319,10 +409,16 @@ class AdsorbateGCMC(AdsorbateCMC):
                 return None
             empty_site_ids = None
         else:
+            if not self._site_assignment_is_valid(
+                candidate_sites=candidate_sites, atoms=self.atoms
+            ):
+                return None
             # Greedy nearest-pair matching is sufficient for the dilute site occupancies
             # we target here. If dense coverages become important, replace this with an
             # exact assignment algorithm before relying on n_empty_before.
-            occupancy_map = self._assign_groups_to_sites(candidate_sites)
+            occupancy_map = self._assign_groups_to_sites(
+                candidate_sites, atoms=self.atoms
+            )
             occupied_sites = set(occupancy_map.values())
             empty_site_ids = [i for i in range(n_sites) if i not in occupied_sites]
             if not empty_site_ids:
@@ -365,6 +461,10 @@ class AdsorbateGCMC(AdsorbateCMC):
         candidate_sites = self._eligible_sites()
         n_sites = len(candidate_sites)
         if n_sites == 0:
+            return None
+        if not self._single_site_occupancy_fast_path and not self._site_assignment_is_valid(
+            candidate_sites=candidate_sites, atoms=self.atoms
+        ):
             return None
 
         if self._single_site_occupancy_fast_path:
@@ -444,22 +544,24 @@ class AdsorbateGCMC(AdsorbateCMC):
         rejected_writer = self._open_optional_traj(self.rejected_traj_file)
         attempted_writer = self._open_optional_traj(self.attempted_traj_file)
 
-        self.sum_E = 0.0
-        self.sum_E_sq = 0.0
-        self.sum_N = 0.0
-        self.sum_N_sq = 0.0
-        self.n_samples = 0
-        self.n_hist = {}
-        self.accepted_moves = 0
-        self.total_moves = 0
-        self.md_attempted_moves = 0
-        self.md_accepted_moves = 0
-        self.attempted_insertions = 0
-        self.accepted_insertions = 0
-        self.attempted_deletions = 0
-        self.accepted_deletions = 0
-        self.attempted_canonical = 0
-        self.accepted_canonical = 0
+        if not self._resumed_from_checkpoint:
+            self.sum_E = 0.0
+            self.sum_E_sq = 0.0
+            self.sum_N = 0.0
+            self.sum_N_sq = 0.0
+            self.n_samples = 0
+            self.n_hist = {}
+            self.accepted_moves = 0
+            self.total_moves = 0
+            self.md_attempted_moves = 0
+            self.md_accepted_moves = 0
+            self.attempted_insertions = 0
+            self.accepted_insertions = 0
+            self.attempted_deletions = 0
+            self.accepted_deletions = 0
+            self.attempted_canonical = 0
+            self.accepted_canonical = 0
+        self._resumed_from_checkpoint = False
         progress_every = (
             None
             if progress_interval_moves is None or int(progress_interval_moves) <= 0
@@ -511,6 +613,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                             support_xy_tol=self.support_xy_tol,
                             z_max_support=self.z_max_support,
                         ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
+                        if not self._site_assignment_is_valid(atoms=atoms_trial):
                             if rejected_writer is not None:
                                 rejected_writer.write(atoms_trial)
                             continue
@@ -573,6 +679,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                             if rejected_writer is not None:
                                 rejected_writer.write(atoms_trial)
                             continue
+                        if not self._site_assignment_is_valid(atoms=atoms_trial):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
                         e_new = self.get_potential_energy(atoms_trial)
                         delta_e = e_new - self.e_old
                         log_q_ratio = self._insertion_log_q_ratio(proposal_info)
@@ -624,6 +734,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                                 if rejected_writer is not None:
                                     rejected_writer.write(atoms_trial)
                                 continue
+                        if not self._site_assignment_is_valid(atoms=atoms_trial):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
                         e_new = self.get_potential_energy(atoms_trial)
                         delta_e = e_new - self.e_old
                         log_q_ratio = self._deletion_log_q_ratio(proposal_info)
@@ -667,6 +781,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                         support_xy_tol=self.support_xy_tol,
                         z_max_support=self.z_max_support,
                     ):
+                        if rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+                    if not self._site_assignment_is_valid(atoms=atoms_trial):
                         if rejected_writer is not None:
                             rejected_writer.write(atoms_trial)
                         continue

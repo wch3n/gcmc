@@ -1,5 +1,5 @@
 system:
-  snapshot: POSCAR.Ti2CO2
+  snapshot: ../data/POSCAR.Ti2CO2
   frame: 0
   site_element: Ti
   composition:

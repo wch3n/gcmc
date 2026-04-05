@@ -15,7 +15,7 @@ from common import (
 
 THIS_DIR = Path(__file__).resolve().parent
 CONFIG = SimpleNamespace(
-    snapshot=THIS_DIR.parent / "alloy" / "POSCAR.Ti2CO2",
+    snapshot=THIS_DIR.parent.parent / "alloy" / "data" / "POSCAR.Ti2CO2",
     frame=0,
     repeat=(2, 2, 1),
     calculator="lj",

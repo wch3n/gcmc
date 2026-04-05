@@ -1,16 +1,20 @@
+from pathlib import Path
+
 from ase.io import read
 from ase.constraints import FixAtoms
 from mace.calculators import MACECalculator
 from gcmc import GCMC, analyze_and_plot
 
+THIS_DIR = Path(__file__).resolve().parent
+
 # Read MXene structure.
-atoms = read('./POSCAR')
+atoms = read(THIS_DIR.parent / "data" / "POSCAR")
 z_cut = 13.0  # Fix bottom layers.
 fixed_indices = [atom.index for atom in atoms if atom.position[2] < z_cut]
 atoms.set_constraint(FixAtoms(indices=fixed_indices))
 
 # Set up calculator.
-mace_models = './ft-omat_0-00_stagetwo.model'
+mace_models = "./ft-omat_0-00_stagetwo.model"
 mace_calc = MACECalculator(model_paths=[mace_models], device='cuda')
 
 # Run GCMC.

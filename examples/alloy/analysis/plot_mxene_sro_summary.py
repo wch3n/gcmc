@@ -13,17 +13,18 @@ import numpy as np
 
 
 THIS_DIR = Path(__file__).resolve().parent
+EXAMPLE_DIR = THIS_DIR.parent
 CONFIG = SimpleNamespace(
-    summary_csv=THIS_DIR / "sro_analysis" / "sro_phase_summary.csv",
+    summary_csv=EXAMPLE_DIR / "outputs" / "sro_analysis" / "sro_phase_summary.csv",
     same_layer_shell_id=1,
     cross_layer_shell_id=1,
     use_unordered_pairs=True,
     use_absolute_polarization=False,
     use_canonical_polarization=True,
-    polarization_png=THIS_DIR / "sro_analysis" / "layer_polarization.png",
-    polarization_pdf=THIS_DIR / "sro_analysis" / "layer_polarization.pdf",
-    wc_png=THIS_DIR / "sro_analysis" / "wc_sro_split.png",
-    wc_pdf=THIS_DIR / "sro_analysis" / "wc_sro_split.pdf",
+    polarization_png=EXAMPLE_DIR / "outputs" / "sro_analysis" / "layer_polarization.png",
+    polarization_pdf=EXAMPLE_DIR / "outputs" / "sro_analysis" / "layer_polarization.pdf",
+    wc_png=EXAMPLE_DIR / "outputs" / "sro_analysis" / "wc_sro_split.png",
+    wc_pdf=EXAMPLE_DIR / "outputs" / "sro_analysis" / "wc_sro_split.pdf",
     polarization_figsize=(6.8, 5.0),
     wc_figsize=(13.0, 5.0),
     dpi=200,

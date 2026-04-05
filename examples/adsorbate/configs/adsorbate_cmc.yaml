@@ -1,38 +1,45 @@
 system:
-  snapshot: ../alloy/POSCAR.Ti2CO2
+  snapshot: ../../alloy/data/POSCAR.Ti2CO2
   frame: 0
   repeat: [2, 2, 1]
   fix_below_z:
-  adsorbate: H
+  adsorbate: OH
   adsorbate_anchor_index: 0
+  initialization_mode: clean_surface
+  coverage: 0.25
+  n_adsorbates:
   site_elements: [Ti]
   surface_side: top
-  site_type: [atop, bridge]
+  site_type: [atop]
   substrate_elements: [Ti, C]
   functional_elements:
+  top_layer_element:
   vertical_offset: 1.8
 
-gcmc:
-  temperature: 300.0
-  chemical_potential: 0.0
+cmc:
+  temperature: 600.0
   move_mode: hybrid
-  site_hop_prob: 0.25
-  displacement_sigma: 0.25
+  site_hop_prob: 0.35
+  reorientation_prob: 0.35
+  rotation_max_angle_deg: 25.0
+  displacement_sigma: 0.6
   max_displacement_trials: 20
+  max_reorientation_trials: 20
   min_clearance: 0.9
   site_match_tol: 0.6
   surface_layer_tol: 0.5
   termination_clearance: 0.8
-  w_insert: 1.0
-  w_delete: 1.0
-  w_canonical: 1.0
-  max_n_adsorbates:
+  bridge_cutoff:
+  z_max_support: 3.5
+  detach_tol: 3.0
   relax: false
-  relax_steps: 10
+  relax_steps: 20
+  relax_z_only: false
   fmax: 0.05
+  verbose_relax: false
   enable_hybrid_md: false
-  md_move_prob: 0.0
-  md_steps: 0
+  md_move_prob: 0.1
+  md_steps: 50
   md_timestep_fs: 1.0
   md_ensemble: nve
   md_accept_mode: potential
@@ -46,6 +53,8 @@ gcmc:
   sample_interval: 2
   equilibration: 40
   seed: 81
+  resume: false
+  checkpoint_interval: 100
 
 calculator:
   calculator: lj
@@ -56,4 +65,4 @@ calculator:
   use_kokkos: true
 
 output:
-  output_prefix: adsorbate_gcmc
+  output_prefix: adsorbate_cmc

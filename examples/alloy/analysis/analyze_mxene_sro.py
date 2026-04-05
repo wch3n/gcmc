@@ -14,10 +14,11 @@ from gcmc.analysis import MXeneSROAnalyzer
 
 
 THIS_DIR = Path(__file__).resolve().parent
+EXAMPLE_DIR = THIS_DIR.parent
 CONFIG = SimpleNamespace(
     # Use exactly one of `reference` or `primitive`.
     reference=None,
-    primitive=THIS_DIR / "POSCAR.Ti2CO2",
+    primitive=EXAMPLE_DIR / "data" / "POSCAR.Ti2CO2",
     supercell_matrix=np.array([[8, 0, 0], [5, 10, 0], [0, 0, 1]], dtype=int),
     scale_factor=None,
     site_element="Ti",
@@ -42,7 +43,7 @@ CONFIG = SimpleNamespace(
     align_translation=True,
     canonicalize_layer_flip=False,
     canonical_species=None,
-    out_dir=Path("sro_analysis"),
+    out_dir=EXAMPLE_DIR / "outputs" / "sro_analysis",
     out_prefix="mxene_sro",
 )
 

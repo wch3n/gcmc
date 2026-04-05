@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).with_name("alloy_pt.yaml"),
+        default=Path(__file__).resolve().parent.parent / "configs" / "alloy_pt.yaml",
         help="Path to YAML config file.",
     )
     args = parser.parse_args()

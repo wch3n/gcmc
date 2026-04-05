@@ -7,7 +7,7 @@ from gcmc.workflows import AdsorbateGCMCWorkflow
 
 
 THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = THIS_DIR / "adsorbate_gcmc.yaml"
+DEFAULT_CONFIG = THIS_DIR.parent / "configs" / "adsorbate_gcmc.yaml"
 
 
 def main() -> None:

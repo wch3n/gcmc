@@ -101,7 +101,15 @@ gcmc/
   analysis/
 examples/
   alloy/
+    analysis/
+    configs/
+    data/
+    runners/
   adsorbate/
+    analysis/
+    configs/
+    data/
+    runners/
 ```
 
 The example entrypoints are now thin `--config` wrappers around YAML files. In practice, you edit the YAML and keep the Python launcher unchanged.
@@ -110,12 +118,12 @@ The example entrypoints are now thin `--config` wrappers around YAML files. In p
 
 The recommended frontends are:
 
-- `examples/alloy/run_cmc_alloy.py --config examples/alloy/alloy_cmc.yaml`
-- `examples/alloy/run_pt_cmc_alloy.py --config examples/alloy/alloy_pt.yaml`
-- `examples/alloy/run_pt_cmc_alloy_ray.py --config examples/alloy/alloy_pt_ray.yaml`
-- `examples/adsorbate/run_adsorbate_cmc.py --config examples/adsorbate/adsorbate_cmc.yaml`
-- `examples/adsorbate/run_adsorbate_gcmc.py --config examples/adsorbate/adsorbate_gcmc.yaml`
-- `examples/adsorbate/run_adsorbate_gcmc_scan.py --config examples/adsorbate/adsorbate_gcmc_scan.yaml`
+- `examples/alloy/runners/run_cmc_alloy.py --config examples/alloy/configs/alloy_cmc.yaml`
+- `examples/alloy/runners/run_pt_cmc_alloy.py --config examples/alloy/configs/alloy_pt.yaml`
+- `examples/alloy/runners/run_pt_cmc_alloy_ray.py --config examples/alloy/configs/alloy_pt_ray.yaml`
+- `examples/adsorbate/runners/run_adsorbate_cmc.py --config examples/adsorbate/configs/adsorbate_cmc.yaml`
+- `examples/adsorbate/runners/run_adsorbate_gcmc.py --config examples/adsorbate/configs/adsorbate_gcmc.yaml`
+- `examples/adsorbate/runners/run_adsorbate_gcmc_scan.py --config examples/adsorbate/configs/adsorbate_gcmc_scan.yaml`
 
 The YAML files are grouped by section:
 
@@ -138,13 +146,13 @@ The workflow loaders also accept the older `interval` key and map it to `write_i
 
 See:
 
-- `examples/alloy/run_cmc_alloy.py`
-- `examples/alloy/alloy_cmc.yaml`
+- `examples/alloy/runners/run_cmc_alloy.py`
+- `examples/alloy/configs/alloy_cmc.yaml`
 
 Typical invocation:
 
 ```bash
-python3 examples/alloy/run_cmc_alloy.py --config examples/alloy/alloy_cmc.yaml
+python3 examples/alloy/runners/run_cmc_alloy.py --config examples/alloy/configs/alloy_cmc.yaml
 ```
 
 Core YAML sections:
@@ -166,7 +174,7 @@ from ase.io import read
 from gcmc import AlloyCMC
 from gcmc.utils import initialize_alloy_sublattice
 
-pristine = read("POSCAR.Ti2CO2")
+pristine = read("examples/alloy/data/POSCAR.Ti2CO2")
 atoms = make_supercell(pristine, [[8, 0, 0], [5, 10, 0], [0, 0, 1]])
 atoms = initialize_alloy_sublattice(
     atoms=atoms,
@@ -194,11 +202,11 @@ stats = mc.run(nsweeps=200, traj_file="alloy.traj")
 
 See:
 
-- `examples/alloy/run_pt_cmc_alloy.py`
-- `examples/alloy/alloy_pt.yaml`
-- `examples/alloy/run_pt_cmc_alloy_ray.py`
-- `examples/alloy/alloy_pt_ray.yaml`
-- `examples/alloy/run_pt_cmc_alloy_ray.slurm`
+- `examples/alloy/runners/run_pt_cmc_alloy.py`
+- `examples/alloy/configs/alloy_pt.yaml`
+- `examples/alloy/runners/run_pt_cmc_alloy_ray.py`
+- `examples/alloy/configs/alloy_pt_ray.yaml`
+- `examples/alloy/runners/run_pt_cmc_alloy_ray.slurm`
 
 The Ray example demonstrates:
 
@@ -209,8 +217,8 @@ The Ray example demonstrates:
 Typical invocations:
 
 ```bash
-python3 examples/alloy/run_pt_cmc_alloy.py --config examples/alloy/alloy_pt.yaml
-python3 examples/alloy/run_pt_cmc_alloy_ray.py --config examples/alloy/alloy_pt_ray.yaml
+python3 examples/alloy/runners/run_pt_cmc_alloy.py --config examples/alloy/configs/alloy_pt.yaml
+python3 examples/alloy/runners/run_pt_cmc_alloy_ray.py --config examples/alloy/configs/alloy_pt_ray.yaml
 ```
 
 The PT YAML is split into:
@@ -234,15 +242,15 @@ The PT YAML is split into:
 
 See:
 
-- `examples/adsorbate/run_adsorbate_cmc.py`
-- `examples/adsorbate/adsorbate_cmc.yaml`
+- `examples/adsorbate/runners/run_adsorbate_cmc.py`
+- `examples/adsorbate/configs/adsorbate_cmc.yaml`
 
 The recommended initialization path is `AdsorbateCMC.from_clean_surface(...)`. It builds an instantaneous site registry from the current slab geometry and places adsorbates on allowed sites.
 
 Typical invocation:
 
 ```bash
-python3 examples/adsorbate/run_adsorbate_cmc.py --config examples/adsorbate/adsorbate_cmc.yaml
+python3 examples/adsorbate/runners/run_adsorbate_cmc.py --config examples/adsorbate/configs/adsorbate_cmc.yaml
 ```
 
 Example:
@@ -251,7 +259,7 @@ Example:
 from ase.io import read
 from gcmc import AdsorbateCMC
 
-atoms = read("POSCAR.Ti2CO2")
+atoms = read("examples/alloy/data/POSCAR.Ti2CO2")
 cmc = AdsorbateCMC.from_clean_surface(
     atoms=atoms,
     calculator=calculator,
@@ -321,7 +329,7 @@ This mirrors `AlloyCMC`, where one sweep scales with the active swappable sites.
 
 See:
 
-- `examples/adsorbate/run_pt_adsorbate_cmc.py`
+- `examples/adsorbate/runners/run_pt_adsorbate_cmc.py`
 
 This is appropriate for:
 
@@ -334,21 +342,21 @@ It is not a grand-canonical adsorption/desorption workflow. For variable loading
 
 See:
 
-- `examples/adsorbate/run_adsorbate_gcmc.py`
-- `examples/adsorbate/adsorbate_gcmc.yaml`
-- `examples/adsorbate/run_adsorbate_gcmc_scan.py`
-- `examples/adsorbate/adsorbate_gcmc_scan.yaml`
+- `examples/adsorbate/runners/run_adsorbate_gcmc.py`
+- `examples/adsorbate/configs/adsorbate_gcmc.yaml`
+- `examples/adsorbate/runners/run_adsorbate_gcmc_scan.py`
+- `examples/adsorbate/configs/adsorbate_gcmc_scan.yaml`
 
 Recommended single-run invocation:
 
 ```bash
-python3 examples/adsorbate/run_adsorbate_gcmc.py --config examples/adsorbate/adsorbate_gcmc.yaml
+python3 examples/adsorbate/runners/run_adsorbate_gcmc.py --config examples/adsorbate/configs/adsorbate_gcmc.yaml
 ```
 
 Recommended `mu`-scan invocation:
 
 ```bash
-python3 examples/adsorbate/run_adsorbate_gcmc_scan.py --config examples/adsorbate/adsorbate_gcmc_scan.yaml
+python3 examples/adsorbate/runners/run_adsorbate_gcmc_scan.py --config examples/adsorbate/configs/adsorbate_gcmc_scan.yaml
 ```
 
 The scan workflow supports:
@@ -364,7 +372,7 @@ The scan workflow supports:
   - `backend.ray_num_gpus_per_task`
 - per-task output directories and `summary.csv` aggregation
 
-The legacy `examples/adsorbate/run_gcmc.py` script remains in the repository, but the site-based `AdsorbateGCMC` workflows are the preferred route for current adsorbate free-energy work.
+The legacy `examples/adsorbate/runners/run_gcmc.py` script remains in the repository, but the site-based `AdsorbateGCMC` workflows are the preferred route for current adsorbate free-energy work.
 
 ## Hybrid MC/MD
 
@@ -459,16 +467,16 @@ If placement groups are enabled and bundles are not provided, bundles are genera
 
 See:
 
-- `examples/alloy/analyze_mxene_ordering.py`
-- `examples/alloy/analyze_surface_motifs.py`
-- `examples/alloy/generate_adsorption_sites.py`
+- `examples/alloy/analysis/analyze_mxene_ordering.py`
+- `examples/alloy/analysis/analyze_surface_motifs.py`
+- `examples/alloy/analysis/generate_adsorption_sites.py`
 
 ### MXene SRO analysis
 
 See:
 
-- `examples/alloy/analyze_mxene_sro.py`
-- `examples/alloy/plot_mxene_sro_summary.py`
+- `examples/alloy/analysis/analyze_mxene_sro.py`
+- `examples/alloy/analysis/plot_mxene_sro_summary.py`
 
 The SRO workflow supports:
 

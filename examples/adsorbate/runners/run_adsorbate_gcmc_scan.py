@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from gcmc.workflows import AdsorbateCMCWorkflow
+from gcmc.workflows import AdsorbateGCMCScanWorkflow
 
 
 THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = THIS_DIR / "adsorbate_cmc.yaml"
+DEFAULT_CONFIG = THIS_DIR.parent / "configs" / "adsorbate_gcmc_scan.yaml"
 
 
 def main() -> None:
@@ -16,11 +16,11 @@ def main() -> None:
         "--config",
         type=Path,
         default=DEFAULT_CONFIG,
-        help="Path to the canonical adsorbate CMC YAML config.",
+        help="Path to the adsorbate GCMC scan YAML config.",
     )
     args = parser.parse_args()
 
-    workflow = AdsorbateCMCWorkflow.from_yaml(args.config)
+    workflow = AdsorbateGCMCScanWorkflow.from_yaml(args.config)
     workflow.run()
 
 

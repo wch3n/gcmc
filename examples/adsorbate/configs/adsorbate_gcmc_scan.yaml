@@ -1,5 +1,5 @@
 system:
-  snapshot: ../alloy/POSCAR.Ti2CO2
+  snapshot: ../../alloy/data/POSCAR.Ti2CO2
   frame: 0
   repeat: [2, 2, 1]
   fix_below_z:

@@ -56,4 +56,4 @@ export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-${SLURM_JOB_ID}"
 
 # Launch driver on head node.
 srun -N1 -n1 -w "$head_node" \
-  python examples/alloy/run_pt_cmc_alloy_ray.py --config examples/alloy/alloy_pt_ray.yaml
+  python examples/alloy/runners/run_pt_cmc_alloy_ray.py --config examples/alloy/configs/alloy_pt_ray.yaml

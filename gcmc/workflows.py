@@ -78,9 +78,13 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "max_displacement_trials": 20,
     "min_clearance": 0.9,
     "site_match_tol": 0.6,
+    "support_xy_tol": None,
+    "termination_site_xy_tol": None,
     "surface_layer_tol": 0.5,
     "termination_clearance": 0.8,
     "vertical_offset": 1.8,
+    "vertical_adjust_step": 0.25,
+    "max_vertical_adjust": 1.5,
     "w_insert": 1.0,
     "w_delete": 1.0,
     "w_canonical": 1.0,
@@ -147,9 +151,13 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "max_displacement_trials": 20,
     "min_clearance": 0.9,
     "site_match_tol": 0.6,
+    "support_xy_tol": None,
+    "termination_site_xy_tol": None,
     "surface_layer_tol": 0.5,
     "termination_clearance": 0.8,
     "vertical_offset": 1.8,
+    "vertical_adjust_step": 0.25,
+    "max_vertical_adjust": 1.5,
     "w_insert": 1.0,
     "w_delete": 1.0,
     "w_canonical": 1.0,
@@ -214,10 +222,14 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "max_reorientation_trials": None,
     "min_clearance": 0.9,
     "site_match_tol": 0.6,
+    "support_xy_tol": None,
+    "termination_site_xy_tol": None,
     "surface_layer_tol": 0.5,
     "termination_clearance": 0.8,
     "bridge_cutoff": None,
     "vertical_offset": 1.8,
+    "vertical_adjust_step": 0.25,
+    "max_vertical_adjust": 1.5,
     "detach_tol": 3.0,
     "z_max_support": 3.5,
     "relax": False,
@@ -632,6 +644,20 @@ def _resolve_mu_scan_values(flat_config: dict) -> dict:
     mu_max = float(mu_range[1])
     flat_config["mu_values"] = np.linspace(mu_min, mu_max, n_mu_points).tolist()
     return flat_config
+
+
+def _resolve_support_xy_tol(cfg) -> float:
+    value = getattr(cfg, "support_xy_tol", None)
+    if value is None:
+        return max(1.2, 2.5 * float(cfg.site_match_tol))
+    return float(value)
+
+
+def _resolve_termination_site_xy_tol(cfg) -> float:
+    value = getattr(cfg, "termination_site_xy_tol", None)
+    if value is None:
+        return _resolve_support_xy_tol(cfg)
+    return float(value)
 
 
 def load_adsorbate_gcmc_scan_config(config_path: str | Path) -> SimpleNamespace:
@@ -1179,9 +1205,13 @@ class AdsorbateGCMCScanWorkflow:
             max_displacement_trials=cfg.max_displacement_trials,
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
+            support_xy_tol=_resolve_support_xy_tol(cfg),
+            termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
             surface_layer_tol=cfg.surface_layer_tol,
             termination_clearance=cfg.termination_clearance,
             vertical_offset=cfg.vertical_offset,
+            vertical_adjust_step=getattr(cfg, "vertical_adjust_step", 0.25),
+            max_vertical_adjust=getattr(cfg, "max_vertical_adjust", 1.5),
             w_insert=cfg.w_insert,
             w_delete=cfg.w_delete,
             w_canonical=cfg.w_canonical,
@@ -1364,11 +1394,15 @@ class AdsorbateCMCWorkflow:
             max_reorientation_trials=getattr(cfg, "max_reorientation_trials", None),
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
+            support_xy_tol=_resolve_support_xy_tol(cfg),
+            termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
             surface_layer_tol=cfg.surface_layer_tol,
             termination_clearance=cfg.termination_clearance,
             bridge_cutoff=getattr(cfg, "bridge_cutoff", None),
             z_max_support=getattr(cfg, "z_max_support", 3.5),
             vertical_offset=cfg.vertical_offset,
+            vertical_adjust_step=getattr(cfg, "vertical_adjust_step", 0.25),
+            max_vertical_adjust=getattr(cfg, "max_vertical_adjust", 1.5),
             detach_tol=getattr(cfg, "detach_tol", 3.0),
             relax=cfg.relax,
             relax_steps=cfg.relax_steps,
@@ -1427,7 +1461,8 @@ class AdsorbateCMCWorkflow:
                     layer_tol=cfg.surface_layer_tol,
                     xy_tol=cfg.site_match_tol,
                     bridge_cutoff=getattr(cfg, "bridge_cutoff", None),
-                    support_xy_tol=max(1.2, 2.5 * float(cfg.site_match_tol)),
+                    support_xy_tol=_resolve_support_xy_tol(cfg),
+                    termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
                     vertical_offset=cfg.vertical_offset,
                     termination_elements=functional_elements,
                     min_termination_dist=cfg.termination_clearance,
@@ -1585,9 +1620,13 @@ class AdsorbateGCMCWorkflow:
             max_displacement_trials=cfg.max_displacement_trials,
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
+            support_xy_tol=_resolve_support_xy_tol(cfg),
+            termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
             surface_layer_tol=cfg.surface_layer_tol,
             termination_clearance=cfg.termination_clearance,
             vertical_offset=cfg.vertical_offset,
+            vertical_adjust_step=getattr(cfg, "vertical_adjust_step", 0.25),
+            max_vertical_adjust=getattr(cfg, "max_vertical_adjust", 1.5),
             w_insert=cfg.w_insert,
             w_delete=cfg.w_delete,
             w_canonical=cfg.w_canonical,

@@ -183,11 +183,15 @@ class AdsorbateCMC(SurfaceMCBase):
         rotation_max_angle_deg: float = 25.0,
         min_clearance: float = 0.8,
         site_match_tol: float = 0.6,
+        support_xy_tol: Optional[float] = None,
+        termination_site_xy_tol: Optional[float] = None,
         surface_layer_tol: float = 0.5,
         termination_clearance: float = 0.75,
         bridge_cutoff: Optional[float] = None,
         z_max_support: float = 3.5,
         vertical_offset: float = 1.8,
+        vertical_adjust_step: float = 0.25,
+        max_vertical_adjust: float = 1.5,
         detach_tol: float = 3.0,
         relax: bool = False,
         relax_steps: int = 10,
@@ -267,7 +271,10 @@ class AdsorbateCMC(SurfaceMCBase):
                     )
                 )
 
-        support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
+        if support_xy_tol is None:
+            support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
+        if termination_site_xy_tol is None:
+            termination_site_xy_tol = float(support_xy_tol)
         same_site_tol = max(0.2, 0.5 * float(site_match_tol))
 
         super().__init__(
@@ -312,10 +319,18 @@ class AdsorbateCMC(SurfaceMCBase):
             raise ValueError("min_clearance must be > 0.")
         if site_match_tol <= 0.0:
             raise ValueError("site_match_tol must be > 0.")
+        if support_xy_tol <= 0.0:
+            raise ValueError("support_xy_tol must be > 0.")
+        if termination_site_xy_tol <= 0.0:
+            raise ValueError("termination_site_xy_tol must be > 0.")
         if surface_layer_tol <= 0.0:
             raise ValueError("surface_layer_tol must be > 0.")
         if termination_clearance < 0.0:
             raise ValueError("termination_clearance must be >= 0.")
+        if vertical_adjust_step <= 0.0:
+            raise ValueError("vertical_adjust_step must be > 0.")
+        if max_vertical_adjust < 0.0:
+            raise ValueError("max_vertical_adjust must be >= 0.")
         if bridge_cutoff is not None and bridge_cutoff <= 0.0:
             raise ValueError("bridge_cutoff must be > 0 when provided.")
 
@@ -362,8 +377,11 @@ class AdsorbateCMC(SurfaceMCBase):
         self.site_match_tol = float(site_match_tol)
         self.same_site_tol = float(same_site_tol)
         self.support_xy_tol = float(support_xy_tol)
+        self.termination_site_xy_tol = float(termination_site_xy_tol)
         self.z_max_support = z_max_support
         self.vertical_offset = vertical_offset
+        self.vertical_adjust_step = float(vertical_adjust_step)
+        self.max_vertical_adjust = float(max_vertical_adjust)
         self.surface_layer_tol = float(surface_layer_tol)
         self.bridge_cutoff = bridge_cutoff
         self.bridge_cutoff_scale = 1.15
@@ -576,6 +594,23 @@ class AdsorbateCMC(SurfaceMCBase):
         self._site_registry = None
         self._update_indices()
 
+    def _slab_atoms_for_site_registry(self, atoms: Optional[Atoms] = None) -> Atoms:
+        if atoms is None:
+            atoms = self.atoms
+        groups = self._adsorbate_groups_for_atoms(atoms)
+        if not groups:
+            return atoms
+
+        slab_atoms = atoms.copy()
+        for group in sorted(
+            (np.asarray(group, dtype=int) for group in groups),
+            key=lambda group: int(np.min(group)),
+            reverse=True,
+        ):
+            for idx in np.sort(group)[::-1]:
+                del slab_atoms[int(idx)]
+        return slab_atoms
+
     @classmethod
     def from_clean_surface(
         cls,
@@ -593,6 +628,8 @@ class AdsorbateCMC(SurfaceMCBase):
         site_type: Union[str, Sequence[str]] = "fcc",
         min_clearance: float = 0.8,
         site_match_tol: float = 0.6,
+        support_xy_tol: Optional[float] = None,
+        termination_site_xy_tol: Optional[float] = None,
         surface_layer_tol: float = 0.5,
         termination_clearance: float = 0.75,
         bridge_cutoff: Optional[float] = None,
@@ -602,7 +639,10 @@ class AdsorbateCMC(SurfaceMCBase):
         initial_traj_file: str = "adsorbate_cmc_initial.traj",
         **kwargs,
     ) -> "AdsorbateCMC":
-        support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
+        if support_xy_tol is None:
+            support_xy_tol = max(1.2, 2.5 * float(site_match_tol))
+        if termination_site_xy_tol is None:
+            termination_site_xy_tol = float(support_xy_tol)
         if functional_elements is None:
             functional_elements = tuple(
                 sorted(
@@ -635,6 +675,7 @@ class AdsorbateCMC(SurfaceMCBase):
             bridge_cutoff=bridge_cutoff,
             bridge_cutoff_scale=1.15,
             support_xy_tol=support_xy_tol,
+            termination_site_xy_tol=termination_site_xy_tol,
             vertical_offset=vertical_offset,
             termination_elements=functional_elements,
             min_termination_dist=termination_clearance,
@@ -666,6 +707,8 @@ class AdsorbateCMC(SurfaceMCBase):
             site_type=site_type,
             min_clearance=min_clearance,
             site_match_tol=site_match_tol,
+            support_xy_tol=support_xy_tol,
+            termination_site_xy_tol=termination_site_xy_tol,
             surface_layer_tol=surface_layer_tol,
             termination_clearance=termination_clearance,
             vertical_offset=vertical_offset,
@@ -942,8 +985,9 @@ class AdsorbateCMC(SurfaceMCBase):
         return bool(np.any(np.sum(support_mask, axis=1) == 0))
 
     def _build_site_registry(self) -> list[dict[str, object]]:
+        slab_atoms = self._slab_atoms_for_site_registry()
         return build_surface_site_registry(
-            self.atoms,
+            slab_atoms,
             site_elements=self.site_elements,
             substrate_elements=self.substrate_elements,
             surface_side=self.surface_side,
@@ -953,6 +997,7 @@ class AdsorbateCMC(SurfaceMCBase):
             bridge_cutoff=self.bridge_cutoff,
             bridge_cutoff_scale=self.bridge_cutoff_scale,
             support_xy_tol=self.support_xy_tol,
+            termination_site_xy_tol=self.termination_site_xy_tol,
             vertical_offset=self.vertical_offset,
             termination_elements=self.functional_elements,
             min_termination_dist=self.termination_clearance,
@@ -992,6 +1037,38 @@ class AdsorbateCMC(SurfaceMCBase):
             pbc=atoms.get_pbc(),
         )[1]
         return float(np.min(dists)) >= self.termination_clearance
+
+    def _adjust_trial_positions_vertically(
+        self,
+        group: np.ndarray,
+        trial_positions: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> Optional[np.ndarray]:
+        if atoms is None:
+            atoms = self.atoms
+
+        adjusted = np.asarray(trial_positions, dtype=float).copy()
+        if adjusted.ndim != 2 or adjusted.shape[1] != 3:
+            raise ValueError("trial_positions must have shape (n_atoms, 3).")
+
+        direction = 1.0 if self.surface_side == "top" else -1.0
+        total_adjust = 0.0
+
+        while True:
+            if self._group_positions_are_valid(group, adjusted, atoms=atoms) and (
+                self._group_clears_terminations(group, adjusted, atoms=atoms)
+            ):
+                return adjusted
+
+            if total_adjust >= self.max_vertical_adjust:
+                return None
+
+            dz = min(
+                float(self.vertical_adjust_step),
+                float(self.max_vertical_adjust) - total_adjust,
+            )
+            adjusted[:, 2] += direction * dz
+            total_adjust += dz
 
     def _propose_displacement(self) -> Optional[Atoms]:
         movable_group_ids = self.get_non_buried_adsorbate_indices(
@@ -1033,9 +1110,10 @@ class AdsorbateCMC(SurfaceMCBase):
 
             new_anchor = np.array([new_xy[0], new_xy[1], new_z], dtype=float)
             trial_positions = new_anchor + relative
-            if not self._group_positions_are_valid(group, trial_positions):
-                continue
-            if not self._group_clears_terminations(group, trial_positions):
+            trial_positions = self._adjust_trial_positions_vertically(
+                group, trial_positions
+            )
+            if trial_positions is None:
                 continue
             atoms_new = self.atoms.copy()
             atoms_new.positions[group] = trial_positions
@@ -1081,9 +1159,10 @@ class AdsorbateCMC(SurfaceMCBase):
 
             new_anchor = np.array([xy[0], xy[1], suggested_z], dtype=float)
             trial_positions = new_anchor + relative
-            if not self._group_positions_are_valid(group, trial_positions):
-                continue
-            if not self._group_clears_terminations(group, trial_positions):
+            trial_positions = self._adjust_trial_positions_vertically(
+                group, trial_positions
+            )
+            if trial_positions is None:
                 continue
 
             atoms_new = self.atoms.copy()
@@ -1122,9 +1201,10 @@ class AdsorbateCMC(SurfaceMCBase):
             rotation = _rotation_matrix(axis, angle)
             trial_relative = relative @ rotation.T
             trial_positions = anchor_pos + trial_relative
-            if not self._group_positions_are_valid(group, trial_positions):
-                continue
-            if not self._group_clears_terminations(group, trial_positions):
+            trial_positions = self._adjust_trial_positions_vertically(
+                group, trial_positions
+            )
+            if trial_positions is None:
                 continue
 
             atoms_new = self.atoms.copy()

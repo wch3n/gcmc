@@ -7,6 +7,7 @@ import numpy as np
 from ase import Atoms
 from ase.geometry import get_distances
 from ase.io import Trajectory
+from scipy.optimize import linear_sum_assignment
 
 from .adsorbate_cmc import AdsorbateCMC, _load_adsorbate_template
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
@@ -270,6 +271,7 @@ class AdsorbateGCMC(AdsorbateCMC):
             bridge_cutoff=self.bridge_cutoff,
             bridge_cutoff_scale=self.bridge_cutoff_scale,
             support_xy_tol=self.support_xy_tol,
+            termination_site_xy_tol=self.termination_site_xy_tol,
             vertical_offset=self.vertical_offset,
             termination_elements=self.functional_elements,
             min_termination_dist=self.termination_clearance,
@@ -353,23 +355,12 @@ class AdsorbateGCMC(AdsorbateCMC):
         site_xyz[:, :2] = site_xy
         deltas = get_distances(anchor_xyz, site_xyz, cell=cell, pbc=pbc)[0]
         pair_distances = np.linalg.norm(deltas[:, :, :2], axis=2)
-        order = np.argsort(pair_distances, axis=None)
-        assigned_groups = set()
-        assigned_sites = set()
-        mapping: Dict[int, int] = {}
-        distances: Dict[int, float] = {}
-        n_sites = len(candidate_sites)
-        for flat_idx in order.tolist():
-            group_id = int(flat_idx // n_sites)
-            site_id = int(flat_idx % n_sites)
-            if group_id in assigned_groups or site_id in assigned_sites:
-                continue
-            mapping[group_id] = site_id
-            distances[group_id] = float(pair_distances[group_id, site_id])
-            assigned_groups.add(group_id)
-            assigned_sites.add(site_id)
-            if len(assigned_groups) == len(groups):
-                break
+        row_ind, col_ind = linear_sum_assignment(pair_distances)
+        mapping = {int(group_id): int(site_id) for group_id, site_id in zip(row_ind, col_ind)}
+        distances = {
+            int(group_id): float(pair_distances[int(group_id), int(site_id)])
+            for group_id, site_id in zip(row_ind, col_ind)
+        }
         return mapping, distances
 
     def _move_probabilities(self, n_ads: int, n_sites: int) -> Dict[str, float]:
@@ -413,9 +404,6 @@ class AdsorbateGCMC(AdsorbateCMC):
                 candidate_sites=candidate_sites, atoms=self.atoms
             ):
                 return None
-            # Greedy nearest-pair matching is sufficient for the dilute site occupancies
-            # we target here. If dense coverages become important, replace this with an
-            # exact assignment algorithm before relying on n_empty_before.
             occupancy_map = self._assign_groups_to_sites(
                 candidate_sites, atoms=self.atoms
             )
@@ -443,11 +431,14 @@ class AdsorbateGCMC(AdsorbateCMC):
             tags = np.zeros(len(atoms_trial), dtype=int)
         tags[group] = self._next_group_tag(self.atoms)
         atoms_trial.set_tags(tags)
-        trial_positions = atoms_trial.get_positions()[group]
-        if not self._group_positions_are_valid(group, trial_positions, atoms=atoms_trial):
+        trial_positions = self._adjust_trial_positions_vertically(
+            group,
+            atoms_trial.get_positions()[group],
+            atoms=atoms_trial,
+        )
+        if trial_positions is None:
             return None
-        if not self._group_clears_terminations(group, trial_positions, atoms=atoms_trial):
-            return None
+        atoms_trial.positions[group] = trial_positions
         return atoms_trial, {
             "n_sites": n_sites,
             "n_ads": n_ads,
@@ -629,7 +620,9 @@ class AdsorbateGCMC(AdsorbateCMC):
                             self.md_accepted_moves += 1
                             self.atoms.positions = atoms_trial.positions
                             self.atoms.cell = atoms_trial.cell
-                            self._invalidate_gc_site_cache(clear_registry=True)
+                            self._refresh_after_adsorbate_move(
+                                invalidate_site_registry=True
+                            )
                             if accepted_writer is not None:
                                 accepted_writer.write(self.atoms)
                         elif rejected_writer is not None:

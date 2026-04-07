@@ -12,9 +12,10 @@ import os
 import numpy as np
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 from ase import Atom, Atoms
-from ase.geometry import find_mic
+from ase.geometry import find_mic, get_distances
 from ase.io import read
 from ase.symbols import string2symbols
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial import Delaunay
 
 
@@ -356,7 +357,13 @@ def _select_surface_atom_indices_by_cluster(
     reference_layer_tol: Optional[float] = None,
 ) -> np.ndarray:
     """
-    Select one exposed alloy/support layer from a layered slab using z-clustering.
+    Select exposed surface atoms for site generation.
+
+    If ``reference_elements`` are provided and the requested ``elements`` are part of
+    the outer substrate layer, select that single physical layer. If the requested
+    ``elements`` are not part of the outer substrate layer (for example terminating O
+    atoms on an MXene), fall back to selecting all matching atoms on the requested
+    slab side rather than the outermost z-cluster of that species.
     """
     site_symbols = set(_normalize_symbol_list(elements))
     if reference_elements is not None:
@@ -378,6 +385,35 @@ def _select_surface_atom_indices_by_cluster(
         if selected.size > 0:
             return np.sort(selected.astype(int))
 
+        site_indices = np.asarray(
+            [atom.index for atom in atoms if atom.symbol in site_symbols], dtype=int
+        )
+        if site_indices.size > 0:
+            slab_midpoint = float(np.mean(atoms.positions[:, 2]))
+            if surface_side == "top":
+                side_mask = atoms.positions[site_indices, 2] >= slab_midpoint
+            else:
+                side_mask = atoms.positions[site_indices, 2] <= slab_midpoint
+            side_indices = site_indices[side_mask]
+            if side_indices.size > 0:
+                side_z = atoms.positions[side_indices, 2]
+                order = np.argsort(side_z)
+                if surface_side == "top":
+                    order = order[::-1]
+                ordered_indices = side_indices[order]
+                ordered_z = side_z[order]
+                if len(ordered_z) <= 1:
+                    return np.sort(ordered_indices.astype(int))
+
+                gaps = np.abs(np.diff(ordered_z))
+                split_tol = 0.5
+                large_gap_positions = np.where(gaps > split_tol)[0]
+                if large_gap_positions.size > 0:
+                    split_at = int(large_gap_positions[0]) + 1
+                    selected = ordered_indices[:split_at]
+                    return np.sort(selected.astype(int))
+                return np.sort(ordered_indices.astype(int))
+
     return np.sort(
         np.asarray(
             _ordered_layer_indices_by_cluster(
@@ -389,6 +425,79 @@ def _select_surface_atom_indices_by_cluster(
             dtype=int,
         )
     )
+
+
+def _select_surface_atom_indices_via_terminations(
+    atoms: Atoms,
+    elements: Union[str, Sequence[str]],
+    termination_elements: Union[str, Sequence[str]],
+    *,
+    substrate_elements: Optional[Union[str, Sequence[str]]] = None,
+    surface_side: Literal["top", "bottom"] = "top",
+    layer_tol: float = 0.5,
+    lateral_tol: float = 2.5,
+) -> np.ndarray:
+    """
+    Identify exposed substrate/site atoms by matching exposed terminations above them.
+
+    This is useful for terminated MXenes where rough thermal disorder makes pure z-layer
+    clustering of the exposed metal sublattice unreliable.
+    """
+    side = str(surface_side).lower()
+    if side not in {"top", "bottom"}:
+        raise ValueError("surface_side must be 'top' or 'bottom'.")
+
+    site_symbols = set(_normalize_symbol_list(elements))
+    term_symbols = tuple(_normalize_symbol_list(termination_elements))
+    if not site_symbols or not term_symbols:
+        return np.empty((0,), dtype=int)
+
+    termination_indices = _select_surface_atom_indices_by_cluster(
+        atoms,
+        term_symbols,
+        surface_side=side,
+        layer_tol=layer_tol,
+        reference_elements=substrate_elements,
+        reference_layer_tol=(
+            max(float(layer_tol), 0.9) if substrate_elements is not None else None
+        ),
+    )
+    if termination_indices.size == 0:
+        return np.empty((0,), dtype=int)
+
+    slab_midpoint = float(np.mean(atoms.positions[:, 2]))
+    candidate_indices = np.asarray(
+        [
+            atom.index
+            for atom in atoms
+            if atom.symbol in site_symbols
+            and (
+                atom.position[2] >= slab_midpoint
+                if side == "top"
+                else atom.position[2] <= slab_midpoint
+            )
+        ],
+        dtype=int,
+    )
+    if candidate_indices.size == 0:
+        return np.empty((0,), dtype=int)
+
+    term_pos = atoms.positions[termination_indices]
+    cand_pos = atoms.positions[candidate_indices]
+    deltas = get_distances(term_pos, cand_pos, cell=atoms.cell, pbc=atoms.pbc)[0]
+    dxy = np.linalg.norm(deltas[:, :, :2], axis=2)
+    dz = term_pos[:, None, 2] - cand_pos[None, :, 2]
+    side_sign = 1.0 if side == "top" else -1.0
+    valid = (side_sign * dz) > 0.0
+
+    large_cost = 1.0e6
+    cost = np.where(valid, dxy, large_cost)
+    row_ind, col_ind = linear_sum_assignment(cost)
+    keep = cost[row_ind, col_ind] < min(float(lateral_tol), large_cost)
+    if not np.any(keep):
+        return np.empty((0,), dtype=int)
+
+    return np.sort(np.unique(candidate_indices[col_ind[keep]]).astype(int))
 
 
 def classify_hollow_sites_on_surface(
@@ -476,6 +585,7 @@ def build_surface_site_registry(
     bridge_cutoff: Optional[float] = None,
     bridge_cutoff_scale: float = 1.15,
     support_xy_tol: float = 2.5,
+    termination_site_xy_tol: Optional[float] = None,
     vertical_offset: float = 1.8,
     termination_elements: Sequence[str] = (),
     min_termination_dist: float = 0.75,
@@ -494,6 +604,14 @@ def build_surface_site_registry(
     if side not in {"top", "bottom"}:
         raise ValueError("surface_side must be 'top' or 'bottom'.")
     normalized_site_types = _normalize_site_types(site_types)
+    normalized_site_elements = _normalize_symbol_list(site_elements)
+    normalized_substrate_elements = (
+        _normalize_symbol_list(substrate_elements)
+        if substrate_elements is not None
+        else ()
+    )
+    if termination_site_xy_tol is None:
+        termination_site_xy_tol = float(support_xy_tol)
     physical_layer_tol = max(float(layer_tol), 0.9) if substrate_elements is not None else float(layer_tol)
     reference_layers = (
         _ordered_layer_indices_by_cluster(
@@ -505,35 +623,61 @@ def build_surface_site_registry(
         if substrate_elements is not None
         else None
     )
-    surface_indices = _select_surface_atom_indices_by_cluster(
-        atoms,
-        site_elements,
-        surface_side=side,
-        layer_tol=layer_tol,
-        reference_elements=substrate_elements,
-        reference_layer_tol=physical_layer_tol if substrate_elements is not None else None,
-    )
+    surface_indices = np.empty((0,), dtype=int)
+    if (
+        substrate_elements is not None
+        and termination_elements
+        and set(normalized_site_elements).issubset(set(normalized_substrate_elements))
+    ):
+        surface_indices = _select_surface_atom_indices_via_terminations(
+            atoms,
+            normalized_site_elements,
+            termination_elements,
+            substrate_elements=normalized_substrate_elements,
+            surface_side=side,
+            layer_tol=layer_tol,
+            lateral_tol=termination_site_xy_tol,
+        )
+    if surface_indices.size == 0:
+        surface_indices = _select_surface_atom_indices_by_cluster(
+            atoms,
+            normalized_site_elements,
+            surface_side=side,
+            layer_tol=layer_tol,
+            reference_elements=substrate_elements,
+            reference_layer_tol=physical_layer_tol if substrate_elements is not None else None,
+        )
     surface_positions = atoms.positions[surface_indices]
     if len(surface_indices) == 0:
         return []
 
-    def _support_anchor(xy: np.ndarray) -> Tuple[float, float, int]:
+    def _support_anchor(
+        xy: np.ndarray,
+        support_indices_for_site: np.ndarray,
+    ) -> Tuple[float, float, int]:
         positions = atoms.positions
         slab_midpoint = float(np.mean(positions[:, 2]))
         side_mask = positions[:, 2] >= slab_midpoint if side == "top" else positions[:, 2] <= slab_midpoint
-        side_positions = positions[side_mask]
+        side_indices = np.flatnonzero(side_mask)
+        side_positions = positions[side_indices]
         distances_xy = _xy_distances(xy, side_positions[:, :2], atoms.cell.array, atoms.pbc)
         support_mask = distances_xy <= support_xy_tol
-        if not np.any(support_mask):
+        support_indices_local = side_indices[support_mask]
+        support_indices_for_site = np.asarray(support_indices_for_site, dtype=int)
+        if support_indices_for_site.size > 0:
+            support_indices_local = np.unique(
+                np.concatenate((support_indices_local, support_indices_for_site))
+            ).astype(int)
+        if support_indices_local.size == 0:
             return float("nan"), float("nan"), 0
-        support_positions = side_positions[support_mask]
+        support_positions = positions[support_indices_local]
         anchor_z = (
             float(np.max(support_positions[:, 2]))
             if side == "top"
             else float(np.min(support_positions[:, 2]))
         )
         suggested_z = anchor_z + vertical_offset if side == "top" else anchor_z - vertical_offset
-        return anchor_z, suggested_z, int(np.sum(support_mask))
+        return anchor_z, suggested_z, int(support_indices_local.size)
 
     def _termination_distance(xy: np.ndarray, suggested_z: float) -> float:
         if not termination_elements or not np.isfinite(suggested_z):
@@ -561,7 +705,10 @@ def build_surface_site_registry(
         xy_wrapped = _wrap_xy(np.asarray(xy, dtype=float), atoms.cell.array)
         if any(np.linalg.norm(xy_wrapped - other) < unique_tol for other in seen[site_type]):
             return
-        anchor_z, suggested_z, support_atom_count_local = _support_anchor(xy_wrapped)
+        anchor_z, suggested_z, support_atom_count_local = _support_anchor(
+            xy_wrapped,
+            support_indices_for_site,
+        )
         termination_dist = _termination_distance(xy_wrapped, suggested_z)
         registry.append(
             {
@@ -610,6 +757,11 @@ def build_surface_site_registry(
     if any(site in normalized_site_types for site in ("fcc", "hcp")) and len(surface_indices) >= 3:
         hollow_xy = get_hollow_xy(surface_positions[:, :2], atoms.cell.array)
         hollow_elements = substrate_elements if substrate_elements is not None else site_elements
+        hollow_match_tol = float(xy_tol)
+        if substrate_elements is not None:
+            # Rough MXene surfaces can shift the projected subsurface registry by more
+            # than the strict site-matching tolerance used for occupancy bookkeeping.
+            hollow_match_tol = max(hollow_match_tol, 0.8)
         for site_type in ("fcc", "hcp"):
             if site_type not in normalized_site_types:
                 continue
@@ -617,7 +769,7 @@ def build_surface_site_registry(
                 atoms,
                 hollow_xy,
                 elements=hollow_elements,
-                xy_tol=xy_tol,
+                xy_tol=hollow_match_tol,
                 stacking=site_type,
                 layer_tol=physical_layer_tol,
                 surface_side=side,
@@ -864,6 +1016,7 @@ def initialize_surface_adsorbates(
     bridge_cutoff: Optional[float] = None,
     bridge_cutoff_scale: float = 1.15,
     support_xy_tol: float = 2.5,
+    termination_site_xy_tol: Optional[float] = None,
     vertical_offset: float = 1.8,
     termination_elements: Sequence[str] = (),
     min_termination_dist: float = 0.75,
@@ -901,6 +1054,7 @@ def initialize_surface_adsorbates(
         bridge_cutoff=bridge_cutoff,
         bridge_cutoff_scale=bridge_cutoff_scale,
         support_xy_tol=support_xy_tol,
+        termination_site_xy_tol=termination_site_xy_tol,
         vertical_offset=vertical_offset,
         termination_elements=termination_elements,
         min_termination_dist=min_termination_dist,

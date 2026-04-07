@@ -504,6 +504,12 @@ class AdsorbateCMC(SurfaceMCBase):
                 if atom.symbol == self.adsorbate_anchor_symbol
             ]
 
+        excluded = set(self.substrate_elements) | set(self.functional_elements)
+        unique_adsorbate_symbols = set(self.adsorbate_symbols) - excluded
+        if self.allow_ambiguous_empty_adsorbates and unique_adsorbate_symbols:
+            if not any(atom.symbol in unique_adsorbate_symbols for atom in atoms):
+                return []
+
         raise ValueError(
             "Molecular adsorbate validation requires tagged adsorbate groups."
         )
@@ -1070,6 +1076,23 @@ class AdsorbateCMC(SurfaceMCBase):
             adjusted[:, 2] += direction * dz
             total_adjust += dz
 
+    def _rotate_group_about_anchor(
+        self,
+        group: np.ndarray,
+        axis: np.ndarray,
+        angle: float,
+        atoms: Optional[Atoms] = None,
+    ) -> np.ndarray:
+        if atoms is None:
+            atoms = self.atoms
+
+        group = np.asarray(group, dtype=int)
+        anchor_idx = self._anchor_index_for_group(group, atoms=atoms)
+        anchor_pos = atoms.positions[anchor_idx].copy()
+        relative = self._current_group_relative_positions(group, atoms=atoms)
+        rotation = _rotation_matrix(axis, angle)
+        return anchor_pos + relative @ rotation.T
+
     def _propose_displacement(self) -> Optional[Atoms]:
         movable_group_ids = self.get_non_buried_adsorbate_indices(
             support_xy_tol=self.support_xy_tol
@@ -1183,10 +1206,7 @@ class AdsorbateCMC(SurfaceMCBase):
 
         group_id = int(self.rng.choice(movable_group_ids))
         group = np.asarray(self.ads_groups[group_id], dtype=int)
-        anchor_idx = self.ads_anchor_indices[group_id]
-        anchor_pos = self.atoms.positions[anchor_idx].copy()
         relative = self._current_group_relative_positions(group)
-
         if np.allclose(relative, 0.0):
             return None
 
@@ -1198,13 +1218,10 @@ class AdsorbateCMC(SurfaceMCBase):
             if np.linalg.norm(axis) <= 1e-12 or abs(angle) <= 1e-12:
                 continue
 
-            rotation = _rotation_matrix(axis, angle)
-            trial_relative = relative @ rotation.T
-            trial_positions = anchor_pos + trial_relative
-            trial_positions = self._adjust_trial_positions_vertically(
-                group, trial_positions
-            )
-            if trial_positions is None:
+            trial_positions = self._rotate_group_about_anchor(group, axis, angle)
+            if not self._group_positions_are_valid(group, trial_positions):
+                continue
+            if not self._group_clears_terminations(group, trial_positions):
                 continue
 
             atoms_new = self.atoms.copy()

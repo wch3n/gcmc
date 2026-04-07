@@ -6,6 +6,7 @@ from ase.calculators.calculator import Calculator, all_changes
 
 from gcmc.adsorbate_cmc import AdsorbateCMC
 from gcmc.adsorbate_gcmc import AdsorbateGCMC
+from gcmc.constants import ADSORBATE_TAG_OFFSET
 
 
 class ZeroCalculator(Calculator):
@@ -64,6 +65,38 @@ def _make_assignment_surface() -> Atoms:
     for xy in anchors:
         atoms.append(Atom("H", (float(xy[0]), float(xy[1]), 2.0)))
     return atoms
+
+
+def _make_oh_surface() -> Atoms:
+    atoms = Atoms(
+        symbols=["Ti", "O", "H"],
+        positions=[
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 1.8),
+            (0.0, 0.0, 2.78),
+        ],
+        cell=[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 15.0]],
+        pbc=[False, False, False],
+    )
+    atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+    return atoms
+
+
+class StubRNG:
+    def __init__(self, axis, angle):
+        self.axis = np.asarray(axis, dtype=float)
+        self.angle = float(angle)
+
+    def choice(self, values):
+        return values[0]
+
+    def normal(self, size=None):
+        if size is None:
+            raise ValueError("StubRNG.normal requires size for this test.")
+        return self.axis.copy()
+
+    def uniform(self, low, high):
+        return self.angle
 
 
 class TestAdsorbateGCMCSiteAssignment(unittest.TestCase):
@@ -177,6 +210,109 @@ class TestAdsorbateCMCVerticalAdjustment(unittest.TestCase):
         self.assertTrue(
             sim._group_clears_terminations(group, adjusted, atoms=atoms_trial)
         )
+
+
+class TestAdsorbateCMCReorientation(unittest.TestCase):
+    def _make_sim(self) -> AdsorbateCMC:
+        return AdsorbateCMC(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate_element="O",
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="reorientation",
+            rotation_max_angle_deg=180.0,
+            max_reorientation_trials=1,
+            min_clearance=1.0,
+            termination_clearance=0.0,
+            vertical_adjust_step=0.25,
+            max_vertical_adjust=1.0,
+            seed=13,
+        )
+
+    def test_rotate_group_about_anchor_preserves_anchor_and_bond(self):
+        sim = self._make_sim()
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        anchor_idx = sim.ads_anchor_indices[0]
+        rotated = sim._rotate_group_about_anchor(
+            group,
+            axis=np.array([1.0, 0.0, 0.0]),
+            angle=0.5 * np.pi,
+        )
+
+        self.assertTrue(np.allclose(rotated[0], sim.atoms.positions[anchor_idx]))
+        old_bond = np.linalg.norm(
+            sim.atoms.positions[group[1]] - sim.atoms.positions[group[0]]
+        )
+        new_bond = np.linalg.norm(rotated[1] - rotated[0])
+        self.assertAlmostEqual(old_bond, new_bond, places=10)
+        self.assertFalse(np.allclose(rotated[1], sim.atoms.positions[group[1]]))
+
+    def test_reorientation_accepts_valid_rotation_without_moving_anchor(self):
+        sim = self._make_sim()
+        sim.rng = StubRNG(axis=[1.0, 0.0, 0.0], angle=0.5 * np.pi)
+        trial = sim._propose_reorientation()
+
+        self.assertIsNotNone(trial)
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        anchor_idx = sim.ads_anchor_indices[0]
+        self.assertTrue(
+            np.allclose(trial.positions[anchor_idx], sim.atoms.positions[anchor_idx])
+        )
+        old_bond = np.linalg.norm(
+            sim.atoms.positions[group[1]] - sim.atoms.positions[group[0]]
+        )
+        new_bond = np.linalg.norm(
+            trial.positions[group[1]] - trial.positions[group[0]]
+        )
+        self.assertAlmostEqual(old_bond, new_bond, places=10)
+        self.assertFalse(
+            np.allclose(trial.positions[group[1]], sim.atoms.positions[group[1]])
+        )
+
+    def test_reorientation_rejects_invalid_rotation_instead_of_lifting_anchor(self):
+        sim = self._make_sim()
+        sim.rng = StubRNG(axis=[1.0, 0.0, 0.0], angle=np.pi)
+        trial = sim._propose_reorientation()
+        self.assertIsNone(trial)
+
+
+class TestAmbiguousEmptyMolecularAdsorbates(unittest.TestCase):
+    def test_clean_trial_without_tags_is_treated_as_empty(self):
+        slab = Atoms(
+            symbols=["Ti", "O"],
+            positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 1.8)],
+            cell=[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 15.0]],
+            pbc=[False, False, False],
+        )
+        sim = AdsorbateGCMC(
+            atoms=slab,
+            calculator=ZeroCalculator(),
+            mu=-1.0,
+            T=300.0,
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            site_elements=("Ti",),
+            substrate_elements=("Ti",),
+            functional_elements=("O",),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.25,
+            enable_hybrid_md=True,
+            md_without_adsorbate=True,
+            allow_ambiguous_empty_adsorbates=True,
+            seed=17,
+        )
+
+        trial = sim.atoms.copy()
+        self.assertEqual(sim._adsorbate_groups_for_atoms(trial), [])
+        self.assertFalse(sim.has_afloat_adsorbates(trial))
 
 
 if __name__ == "__main__":

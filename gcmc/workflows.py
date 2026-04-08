@@ -6,23 +6,24 @@ import logging
 import numpy as np
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
 from ase import Atoms
 from ase.build import make_supercell
-from ase.constraints import FixAtoms
+from ase.constraints import FixAtoms, FixCartesian
 from ase.io import read, write
 
 from .adsorbate_cmc import AdsorbateCMC
 from .adsorbate_gcmc import AdsorbateGCMC
 from .alloy_cmc import AlloyCMC
-from .replica import ReplicaExchange
+from .replica import MuReplicaExchange, ReplicaExchange
 from .utils import initialize_surface_adsorbates
 from .utils import initialize_alloy_sublattice
 from .utils import generate_nonuniform_temperature_grid
+from .utils import _ordered_layer_indices_by_cluster
 
 
 TaskRunner = Callable[[dict], dict]
@@ -30,6 +31,7 @@ StatusFormatter = Callable[[dict], str]
 CalculatorFactory = Callable[[SimpleNamespace, dict], object]
 AtomsPreparer = Callable[[object, SimpleNamespace, dict], object]
 FunctionalElementsFactory = Callable[[object, SimpleNamespace, dict], tuple[str, ...]]
+logger = logging.getLogger("mc")
 
 _RESERVED_CONFIG_KEYS = {
     "mu_values",
@@ -53,6 +55,8 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
     "fix_below_z": None,
+    "fix_z_elements": [],
+    "fix_z_layers": None,
     "calculator": "lj",
     "model": None,
     "model_file": None,
@@ -74,8 +78,10 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "move_mode": "hybrid",
     "site_hop_prob": 0.25,
     "reorientation_prob": 0.0,
+    "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
+    "max_reorientation_trials": None,
     "min_clearance": 0.9,
     "site_match_tol": 0.6,
     "support_xy_tol": None,
@@ -112,6 +118,18 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "resume": False,
     "checkpoint_interval": 100,
     "write_attempted_traj": False,
+    "use_mu_exchange": False,
+    "swap_interval": 20,
+    "swap_stride": 1,
+    "exchange_report_interval": 1,
+    "mu_exchange_cycles": None,
+    "mu_exchange_equilibration_cycles": None,
+    "mu_exchange_checkpoint_interval": 10,
+    "mu_exchange_stats_file": "mu_exchange_stats.csv",
+    "mu_exchange_results_file": "mu_exchange_results.csv",
+    "mu_exchange_checkpoint_file": "mu_exchange_state.pkl",
+    "mu_exchange_parallel_seeds": False,
+    "mu_exchange_max_concurrent_seeds": None,
     "backend": "multiprocessing",
     "n_workers": 1,
     "gpu_ids": [],
@@ -129,6 +147,8 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
     "fix_below_z": None,
+    "fix_z_elements": [],
+    "fix_z_layers": None,
     "calculator": "lj",
     "model": None,
     "model_file": None,
@@ -147,8 +167,10 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "move_mode": "hybrid",
     "site_hop_prob": 0.25,
     "reorientation_prob": 0.0,
+    "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
+    "max_reorientation_trials": None,
     "min_clearance": 0.9,
     "site_match_tol": 0.6,
     "support_xy_tol": None,
@@ -195,6 +217,8 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
     "fix_below_z": None,
+    "fix_z_elements": [],
+    "fix_z_layers": None,
     "calculator": "lj",
     "model": None,
     "model_file": None,
@@ -264,6 +288,8 @@ _DEFAULT_ALLOY_CMC_CONFIG = {
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
     "fix_below_z": None,
+    "fix_z_elements": [],
+    "fix_z_layers": None,
     "calculator": "lj",
     "model": None,
     "model_file": None,
@@ -312,6 +338,8 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
     "fix_below_z": None,
+    "fix_z_elements": [],
+    "fix_z_layers": None,
     "calculator": "lj",
     "model": None,
     "model_file": None,
@@ -454,6 +482,93 @@ def _parse_symbols(value) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _append_constraint(atoms: Atoms, constraint) -> None:
+    existing = atoms.constraints
+    if existing is None:
+        atoms.set_constraint(constraint)
+        return
+    if isinstance(existing, (list, tuple)):
+        constraints = list(existing)
+    else:
+        constraints = [existing]
+    constraints.append(constraint)
+    atoms.set_constraint(constraints)
+
+
+def _normalize_layer_selection(selection) -> tuple[int, ...] | str:
+    if isinstance(selection, str):
+        token = selection.strip().lower()
+        if token == "all":
+            return "all"
+        if not token:
+            return ()
+        parts = [part for part in token.replace(",", " ").split() if part]
+        values = tuple(int(part) for part in parts)
+    elif np.isscalar(selection):
+        values = (int(selection),)
+    else:
+        values = tuple(int(value) for value in selection)
+
+    for value in values:
+        if value < 1:
+            raise ValueError("fix_z_layers entries must be >= 1.")
+    return values
+
+
+def _select_fix_z_indices(atoms: Atoms, cfg: SimpleNamespace) -> np.ndarray:
+    fix_z_elements = _parse_symbols(getattr(cfg, "fix_z_elements", ()))
+    fix_z_layers = getattr(cfg, "fix_z_layers", None)
+    if not fix_z_elements or not fix_z_layers:
+        return np.empty((0,), dtype=int)
+    if not isinstance(fix_z_layers, dict):
+        raise ValueError("fix_z_layers must be a mapping such as {top: [1], bottom: [1]}.")
+
+    layer_tol = float(
+        getattr(
+            cfg,
+            "surface_layer_tol",
+            0.5,
+        )
+    )
+    selected: list[int] = []
+    for side in ("top", "bottom"):
+        if side not in fix_z_layers:
+            continue
+        requested = _normalize_layer_selection(fix_z_layers[side])
+        if requested == ():
+            continue
+        layers = _ordered_layer_indices_by_cluster(
+            atoms,
+            fix_z_elements,
+            surface_side=side,
+            layer_tol=layer_tol,
+        )
+        if requested == "all":
+            selected.extend(int(idx) for layer in layers for idx in np.asarray(layer, dtype=int))
+            continue
+        for layer_id in requested:
+            zero_based = int(layer_id) - 1
+            if zero_based >= len(layers):
+                continue
+            selected.extend(int(idx) for idx in np.asarray(layers[zero_based], dtype=int))
+    if not selected:
+        return np.empty((0,), dtype=int)
+    return np.unique(np.asarray(selected, dtype=int))
+
+
+def _apply_workflow_constraints(atoms: Atoms, cfg: SimpleNamespace) -> Atoms:
+    fix_below_z = getattr(cfg, "fix_below_z", None)
+    if fix_below_z is not None:
+        fixed_indices = [atom.index for atom in atoms if atom.position[2] < fix_below_z]
+        if fixed_indices:
+            _append_constraint(atoms, FixAtoms(indices=fixed_indices))
+
+    fix_z_indices = _select_fix_z_indices(atoms, cfg)
+    if fix_z_indices.size:
+        _append_constraint(atoms, FixCartesian(fix_z_indices, mask=(False, False, True)))
+    return atoms
+
+
 def build_adsorbate_template(name_or_path: str | Atoms) -> tuple[Atoms, int]:
     if isinstance(name_or_path, Atoms):
         return name_or_path.copy(), 0
@@ -501,13 +616,7 @@ def _prepare_adsorbate_scan_atoms(atoms, cfg: SimpleNamespace, _task: dict):
     repeat = tuple(getattr(cfg, "repeat", (1, 1, 1)))
     if repeat != (1, 1, 1):
         atoms = atoms.repeat(repeat)
-
-    fix_below_z = getattr(cfg, "fix_below_z", None)
-    if fix_below_z is not None:
-        fixed_indices = [atom.index for atom in atoms if atom.position[2] < fix_below_z]
-        if fixed_indices:
-            atoms.set_constraint(FixAtoms(indices=fixed_indices))
-    return atoms
+    return _apply_workflow_constraints(atoms, cfg)
 
 
 def _prepare_alloy_atoms(atoms, cfg: SimpleNamespace):
@@ -518,13 +627,7 @@ def _prepare_alloy_atoms(atoms, cfg: SimpleNamespace):
     repeat = tuple(getattr(cfg, "repeat", (1, 1, 1)))
     if repeat != (1, 1, 1):
         atoms = atoms.repeat(repeat)
-
-    fix_below_z = getattr(cfg, "fix_below_z", None)
-    if fix_below_z is not None:
-        fixed_indices = [atom.index for atom in atoms if atom.position[2] < fix_below_z]
-        if fixed_indices:
-            atoms.set_constraint(FixAtoms(indices=fixed_indices))
-    return atoms
+    return _apply_workflow_constraints(atoms, cfg)
 
 
 def build_adsorbate_gcmc_calculator(cfg: SimpleNamespace, task: dict):
@@ -1201,8 +1304,10 @@ class AdsorbateGCMCScanWorkflow:
                 "reorientation_prob",
                 0.0 if len(adsorbate_template) == 1 else 0.2,
             ),
+            rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
+            max_reorientation_trials=getattr(cfg, "max_reorientation_trials", None),
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
             support_xy_tol=_resolve_support_xy_tol(cfg),
@@ -1265,6 +1370,311 @@ class AdsorbateGCMCScanWorkflow:
             **stats,
         }
 
+    def _build_mu_exchange_mc_kwargs(
+        self,
+        cfg: SimpleNamespace,
+        *,
+        adsorbate_template: Atoms,
+        anchor_index: int,
+        substrate_elements: tuple[str, ...],
+        functional_elements: tuple[str, ...],
+    ) -> dict:
+        return {
+            "adsorbate_element": adsorbate_template[anchor_index].symbol,
+            "adsorbate": adsorbate_template,
+            "adsorbate_anchor_index": anchor_index,
+            "substrate_elements": substrate_elements,
+            "functional_elements": functional_elements,
+            "site_elements": _parse_symbols(getattr(cfg, "site_elements", ())),
+            "surface_side": getattr(cfg, "surface_side", "top"),
+            "site_type": cfg.site_type,
+            "move_mode": cfg.move_mode,
+            "site_hop_prob": cfg.site_hop_prob,
+            "reorientation_prob": getattr(
+                cfg,
+                "reorientation_prob",
+                0.0 if len(adsorbate_template) == 1 else 0.2,
+            ),
+            "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
+            "displacement_sigma": cfg.displacement_sigma,
+            "max_displacement_trials": cfg.max_displacement_trials,
+            "max_reorientation_trials": getattr(cfg, "max_reorientation_trials", None),
+            "min_clearance": cfg.min_clearance,
+            "site_match_tol": cfg.site_match_tol,
+            "support_xy_tol": _resolve_support_xy_tol(cfg),
+            "termination_site_xy_tol": _resolve_termination_site_xy_tol(cfg),
+            "surface_layer_tol": cfg.surface_layer_tol,
+            "termination_clearance": cfg.termination_clearance,
+            "vertical_offset": cfg.vertical_offset,
+            "vertical_adjust_step": getattr(cfg, "vertical_adjust_step", 0.25),
+            "max_vertical_adjust": getattr(cfg, "max_vertical_adjust", 1.5),
+            "w_insert": cfg.w_insert,
+            "w_delete": cfg.w_delete,
+            "w_canonical": cfg.w_canonical,
+            "max_n_adsorbates": cfg.max_n_adsorbates,
+            "relax": cfg.relax,
+            "relax_steps": cfg.relax_steps,
+            "fmax": cfg.fmax,
+            "enable_hybrid_md": cfg.enable_hybrid_md,
+            "md_move_prob": getattr(cfg, "md_move_prob", 0.0),
+            "md_steps": getattr(cfg, "md_steps", 0),
+            "md_timestep_fs": getattr(cfg, "md_timestep_fs", 1.0),
+            "md_ensemble": getattr(cfg, "md_ensemble", "nve"),
+            "md_accept_mode": getattr(cfg, "md_accept_mode", "potential"),
+            "md_friction": getattr(cfg, "md_friction", 0.01),
+            "md_planar": getattr(cfg, "md_planar", False),
+            "md_planar_axis": getattr(cfg, "md_planar_axis", 2),
+            "md_init_momenta": getattr(cfg, "md_init_momenta", True),
+            "md_remove_drift": getattr(cfg, "md_remove_drift", True),
+            "md_without_adsorbate": getattr(cfg, "md_without_adsorbate", False),
+            "checkpoint_interval": int(getattr(cfg, "checkpoint_interval", 100)),
+            "allow_ambiguous_empty_adsorbates": True,
+        }
+
+    def _run_mu_exchange_seed(
+        self,
+        out_dir: Path,
+        *,
+        seed: int,
+        backend: str,
+    ) -> list[dict]:
+        cfg = self.config
+        seed_dir = out_dir / f"seed_{int(seed):03d}"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+
+        atoms = self.snapshot_loader(Path(cfg.snapshot), int(cfg.frame))
+        if self.atoms_preparer is not None:
+            prepared = self.atoms_preparer(atoms, cfg, {"seed": int(seed)})
+            if prepared is not None:
+                atoms = prepared
+
+        substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
+        if self.functional_elements_factory is not None:
+            functional_elements = tuple(
+                self.functional_elements_factory(atoms, cfg, {"seed": int(seed)})
+            )
+        else:
+            functional_elements = _parse_symbols(
+                getattr(cfg, "functional_elements", ())
+            )
+
+        adsorbate_template, anchor_index = self._build_adsorbate_template()
+        mc_kwargs = self._build_mu_exchange_mc_kwargs(
+            cfg,
+            adsorbate_template=adsorbate_template,
+            anchor_index=anchor_index,
+            substrate_elements=substrate_elements,
+            functional_elements=functional_elements,
+        )
+        mc_init_kwargs = dict(mc_kwargs)
+        mc_init_kwargs["mu"] = float(cfg.mu_values[0])
+        calc_class, calc_kwargs = build_replica_calculator_spec(cfg)
+
+        replica_states = []
+        for rid, mu in enumerate(cfg.mu_values):
+            mu_dir = seed_dir / f"mu_{format_mu_label(float(mu))}"
+            mu_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"mu_{format_mu_label(float(mu))}_seed_{int(seed):03d}"
+            replica_states.append(
+                {
+                    "id": rid,
+                    "mu": float(mu),
+                    "T": float(cfg.temperature),
+                    "atoms": atoms.copy(),
+                    "e_old": None,
+                    "traj_file": str(mu_dir / f"{stem}.traj"),
+                    "thermo_file": str(mu_dir / f"{stem}.dat"),
+                    "checkpoint_file": str(mu_dir / f"{stem}.pkl"),
+                    "write_interval": int(cfg.write_interval),
+                    "sample_interval": int(cfg.sample_interval),
+                    "mc_kwargs": mc_kwargs,
+                }
+            )
+
+        if backend == "ray":
+            n_gpus = len(replica_states)
+            workers_per_gpu = 1
+            backend_kwargs = {
+                "init_kwargs": {
+                    "address": cfg.ray_address or os.getenv("RAY_ADDRESS"),
+                    "log_to_driver": bool(cfg.ray_log_to_driver),
+                },
+                "actor_options": {
+                    "num_cpus": float(cfg.ray_num_cpus_per_task),
+                    "num_gpus": self._ray_num_gpus_per_task(),
+                },
+            }
+        else:
+            gpu_ids = tuple(getattr(cfg, "gpu_ids", (0,)))
+            n_gpus = max(1, len(gpu_ids))
+            workers_per_gpu = 1
+            backend_kwargs = {}
+
+        exchange = MuReplicaExchange(
+            n_gpus=n_gpus,
+            workers_per_gpu=workers_per_gpu,
+            replica_states=replica_states,
+            swap_interval=int(cfg.swap_interval),
+            swap_stride=int(cfg.swap_stride),
+            report_interval=int(getattr(cfg, "exchange_report_interval", 1)),
+            checkpoint_interval=int(
+                getattr(cfg, "mu_exchange_checkpoint_interval", 10)
+            ),
+            stats_file=str(seed_dir / getattr(cfg, "mu_exchange_stats_file")),
+            results_file=str(seed_dir / getattr(cfg, "mu_exchange_results_file")),
+            checkpoint_file=str(
+                seed_dir / getattr(cfg, "mu_exchange_checkpoint_file")
+            ),
+            resume=bool(getattr(cfg, "resume", False)),
+            worker_init_info={
+                "calculator_module": calc_class.__module__,
+                "calculator_class_name": calc_class.__name__,
+                "mc_module": AdsorbateGCMC.__module__,
+                "mc_class": AdsorbateGCMC.__name__,
+                "calc_kwargs": calc_kwargs,
+                "mc_kwargs": mc_init_kwargs,
+                "atoms_template": atoms.copy(),
+            },
+            seed=int(seed),
+            execution_backend=backend,
+            backend_kwargs=backend_kwargs,
+        )
+        total_sweeps, equilibration_sweeps = self._resolve_mu_exchange_schedule(cfg)
+        stats_rows = exchange.run(
+            total_sweeps=total_sweeps,
+            equilibration_sweeps=equilibration_sweeps,
+        )
+
+        results = []
+        for row in stats_rows:
+            mu = float(row["mu"])
+            mu_dir = seed_dir / f"mu_{format_mu_label(mu)}"
+            stem = f"mu_{format_mu_label(mu)}_seed_{int(seed):03d}"
+            results.append(
+                {
+                    "mu": mu,
+                    "seed": int(seed),
+                    "device": backend,
+                    "run_dir": str(mu_dir),
+                    "traj_file": str(mu_dir / f"{stem}.traj"),
+                    "attempted_traj_file": "",
+                    "thermo_file": str(mu_dir / f"{stem}.dat"),
+                    "checkpoint_file": str(mu_dir / f"{stem}.pkl"),
+                    **row,
+                }
+            )
+        return results
+
+    def _resolve_mu_exchange_schedule(
+        self, cfg: SimpleNamespace
+    ) -> tuple[int, int]:
+        cycles = getattr(cfg, "mu_exchange_cycles", None)
+        eq_cycles = getattr(cfg, "mu_exchange_equilibration_cycles", None)
+        swap_interval = int(cfg.swap_interval)
+
+        if cycles is None:
+            return int(cfg.nsweeps), int(cfg.equilibration)
+
+        cycles = int(cycles)
+        if cycles < 0:
+            raise ValueError("mu_exchange_cycles must be >= 0.")
+
+        total_sweeps = cycles * swap_interval
+
+        nsweeps = int(cfg.nsweeps)
+        if nsweeps != total_sweeps:
+            logger.info(
+                "mu_exchange_cycles=%d overrides nsweeps=%d -> total_sweeps=%d",
+                cycles,
+                nsweeps,
+                total_sweeps,
+            )
+
+        if eq_cycles is None:
+            return total_sweeps, int(cfg.equilibration)
+
+        eq_cycles = int(eq_cycles)
+        if eq_cycles < 0:
+            raise ValueError("mu_exchange_equilibration_cycles must be >= 0.")
+        return total_sweeps, eq_cycles * swap_interval
+
+    def _run_mu_exchange_scan(self, out_dir: Path, backend: str) -> list[dict]:
+        if backend not in {"multiprocessing", "ray"}:
+            raise ValueError("mu-exchange requires backend 'multiprocessing' or 'ray'.")
+        seeds = [int(seed) for seed in self.config.seeds]
+        parallel_seeds = bool(
+            getattr(self.config, "mu_exchange_parallel_seeds", False)
+        )
+        max_concurrent = getattr(
+            self.config, "mu_exchange_max_concurrent_seeds", None
+        )
+        if max_concurrent is not None:
+            max_concurrent = int(max_concurrent)
+            if max_concurrent < 1:
+                raise ValueError("mu_exchange_max_concurrent_seeds must be >= 1.")
+
+        if not parallel_seeds or len(seeds) <= 1:
+            results = []
+            for seed in seeds:
+                logger.info(
+                    "Starting mu-exchange ladder for seed %03d with %d mu windows",
+                    seed,
+                    len(self.config.mu_values),
+                )
+                results.extend(
+                    self._run_mu_exchange_seed(out_dir, seed=seed, backend=backend)
+                )
+            return results
+
+        if backend != "ray":
+            raise ValueError(
+                "mu_exchange_parallel_seeds currently requires backend='ray'."
+            )
+
+        import ray
+
+        init_kwargs = {"log_to_driver": bool(self.config.ray_log_to_driver)}
+        if self.config.ray_address or os.getenv("RAY_ADDRESS"):
+            init_kwargs["address"] = self.config.ray_address or os.getenv("RAY_ADDRESS")
+
+        owns_ray_runtime = False
+        if not ray.is_initialized():
+            ray.init(**init_kwargs)
+            owns_ray_runtime = True
+
+        n_workers = len(seeds) if max_concurrent is None else min(len(seeds), max_concurrent)
+        logger.info(
+            "Starting %d mu-exchange ladders concurrently across %d seeds",
+            n_workers,
+            len(seeds),
+        )
+
+        results = []
+        try:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                future_map = {
+                    pool.submit(
+                        self._run_mu_exchange_seed,
+                        out_dir,
+                        seed=seed,
+                        backend=backend,
+                    ): seed
+                    for seed in seeds
+                }
+                for future in as_completed(future_map):
+                    seed = future_map[future]
+                    seed_results = future.result()
+                    logger.info(
+                        "Completed mu-exchange ladder for seed %03d",
+                        seed,
+                    )
+                    results.extend(seed_results)
+        finally:
+            if owns_ray_runtime:
+                ray.shutdown()
+
+        return results
+
     def run(self) -> list[dict]:
         out_dir = Path(self.config.output_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1275,46 +1685,67 @@ class AdsorbateGCMCScanWorkflow:
         if backend == "multiprocessing" and int(self.config.n_workers) < 1:
             raise ValueError("CONFIG.n_workers must be >= 1.")
 
-        tasks = self._build_tasks(out_dir, backend)
-
-        print(f"Launching {len(tasks)} GCMC jobs at T={self.config.temperature:.1f} K")
         print(f"mu values: {tuple(float(mu) for mu in self.config.mu_values)}")
         print(f"seeds: {tuple(int(seed) for seed in self.config.seeds)}")
         print(f"backend: {backend}")
-        if backend == "multiprocessing":
-            if getattr(self.config, "devices", None):
-                print(f"devices: {tuple(self.config.devices)}")
-            else:
-                print(
-                    f"gpu ids: {tuple(getattr(self.config, 'gpu_ids', (None,)))}"
-                )
-            print(f"workers: {self.config.n_workers}")
-        else:
-            print(
-                "ray address: "
-                f"{self.config.ray_address or os.getenv('RAY_ADDRESS', 'local')}"
-            )
-            print(f"ray task cpus: {self.config.ray_num_cpus_per_task}")
-            print(f"ray task gpus: {self._ray_num_gpus_per_task()}")
         print(f"output dir: {out_dir}")
 
-        if backend == "ray":
-            results = run_tasks_with_ray(
-                tasks,
-                self._run_one,
-                address=self.config.ray_address or os.getenv("RAY_ADDRESS"),
-                log_to_driver=bool(self.config.ray_log_to_driver),
-                num_cpus=float(self.config.ray_num_cpus_per_task),
-                num_gpus=self._ray_num_gpus_per_task(),
-                status_formatter=self.status_formatter,
+        if bool(getattr(self.config, "use_mu_exchange", False)):
+            total_sweeps, equilibration_sweeps = self._resolve_mu_exchange_schedule(
+                self.config
             )
+            n_cycles = (
+                0
+                if int(self.config.swap_interval) <= 0
+                else int(np.ceil(total_sweeps / int(self.config.swap_interval)))
+            )
+            print(
+                f"mu-exchange: enabled | swap_interval={int(self.config.swap_interval)} "
+                f"| swap_stride={int(self.config.swap_stride)} "
+                f"| parallel_seeds={bool(getattr(self.config, 'mu_exchange_parallel_seeds', False))}"
+            )
+            print(
+                f"mu-exchange schedule: total_sweeps={total_sweeps} "
+                f"| equilibration_sweeps={equilibration_sweeps} | cycles={n_cycles}"
+            )
+            results = self._run_mu_exchange_scan(out_dir, backend)
         else:
-            results = run_tasks_with_multiprocessing(
-                tasks,
-                self._run_one,
-                n_workers=int(self.config.n_workers),
-                status_formatter=self.status_formatter,
-            )
+            tasks = self._build_tasks(out_dir, backend)
+
+            print(f"Launching {len(tasks)} GCMC jobs at T={self.config.temperature:.1f} K")
+            if backend == "multiprocessing":
+                if getattr(self.config, "devices", None):
+                    print(f"devices: {tuple(self.config.devices)}")
+                else:
+                    print(
+                        f"gpu ids: {tuple(getattr(self.config, 'gpu_ids', (None,)))}"
+                    )
+                print(f"workers: {self.config.n_workers}")
+            else:
+                print(
+                    "ray address: "
+                    f"{self.config.ray_address or os.getenv('RAY_ADDRESS', 'local')}"
+                )
+                print(f"ray task cpus: {self.config.ray_num_cpus_per_task}")
+                print(f"ray task gpus: {self._ray_num_gpus_per_task()}")
+
+            if backend == "ray":
+                results = run_tasks_with_ray(
+                    tasks,
+                    self._run_one,
+                    address=self.config.ray_address or os.getenv("RAY_ADDRESS"),
+                    log_to_driver=bool(self.config.ray_log_to_driver),
+                    num_cpus=float(self.config.ray_num_cpus_per_task),
+                    num_gpus=self._ray_num_gpus_per_task(),
+                    status_formatter=self.status_formatter,
+                )
+            else:
+                results = run_tasks_with_multiprocessing(
+                    tasks,
+                    self._run_one,
+                    n_workers=int(self.config.n_workers),
+                    status_formatter=self.status_formatter,
+                )
 
         results.sort(key=lambda row: (row["mu"], row["seed"]))
         summary_file = out_dir / "summary.csv"
@@ -1616,8 +2047,10 @@ class AdsorbateGCMCWorkflow:
                 "reorientation_prob",
                 0.0 if len(adsorbate_template) == 1 else 0.2,
             ),
+            rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
+            max_reorientation_trials=getattr(cfg, "max_reorientation_trials", None),
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
             support_xy_tol=_resolve_support_xy_tol(cfg),

@@ -6,6 +6,7 @@ import time
 from ase import Atoms
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .execution_backends import build_replica_backend
+from .process_replica import _restore_atoms_from_snapshot
 from .utils import generate_nonuniform_temperature_grid
 
 logger = logging.getLogger("mc")
@@ -561,7 +562,6 @@ class ReplicaExchange:
                     state["cum_n_samples"] = s_data["cum_n_samples"]
                     state["rng_state"] = s_data.get("rng_state")
                     if state["rng_state"] is None:
-                        # Backfill a deterministic per-replica stream for older checkpoints.
                         state["rng_state"] = np.random.default_rng(
                             self.seed + self.seed_nonce + rid
                         ).bit_generator.state
@@ -574,3 +574,492 @@ class ReplicaExchange:
 
     def stop(self):
         self.backend.stop()
+
+
+class MuReplicaExchange:
+    """
+    Fixed-temperature replica exchange in chemical-potential space for GCMC.
+
+    Notes:
+    - Each replica slot is defined by a fixed chemical potential ``mu`` and a
+      common temperature ``T``.
+    - On accepted swaps, the sampled configurations move between ``mu`` slots;
+      RNG state and output files remain attached to the slot.
+    """
+
+    def __init__(
+        self,
+        n_gpus,
+        workers_per_gpu,
+        replica_states,
+        *,
+        swap_interval=10,
+        swap_stride=1,
+        report_interval=1,
+        checkpoint_interval=10,
+        stats_file="mu_exchange_stats.csv",
+        results_file="mu_exchange_results.csv",
+        checkpoint_file="mu_exchange_state.pkl",
+        resume=False,
+        worker_init_info=None,
+        seed: int = 67,
+        seed_nonce: int = 0,
+        execution_backend: str = "multiprocessing",
+        backend_kwargs: dict = None,
+    ):
+        self.n_gpus = int(n_gpus)
+        self.workers_per_gpu = int(workers_per_gpu)
+        self.replica_states = replica_states
+        self.swap_interval = int(swap_interval)
+        self.swap_stride = int(swap_stride)
+        self.report_interval = int(report_interval)
+        self.checkpoint_interval = int(checkpoint_interval)
+        self.worker_init_info = worker_init_info
+        self.execution_backend = execution_backend
+        self.backend_kwargs = backend_kwargs or {}
+        self.stats_file = stats_file
+        self.results_file = results_file
+        self.checkpoint_file = checkpoint_file
+        self.seed = seed
+        self.seed_nonce = seed_nonce
+        self.rng = np.random.default_rng(seed)
+        self.cycle_start = 0
+
+        if self.swap_interval < 1:
+            raise ValueError("swap_interval must be >= 1.")
+        if self.swap_stride < 1:
+            raise ValueError("swap_stride must be >= 1.")
+
+        self.backend = build_replica_backend(
+            execution_backend=self.execution_backend,
+            n_gpus=self.n_gpus,
+            workers_per_gpu=self.workers_per_gpu,
+            worker_init_info=self.worker_init_info,
+            backend_kwargs=self.backend_kwargs,
+        )
+
+        for state in self.replica_states:
+            state.setdefault("cum_sum_E", 0.0)
+            state.setdefault("cum_sum_E_sq", 0.0)
+            state.setdefault("cum_sum_N", 0.0)
+            state.setdefault("cum_sum_N_sq", 0.0)
+            state.setdefault("cum_n_samples", 0)
+            state.setdefault("cum_n_hist", {})
+            state.setdefault("cum_insert_attempted", 0)
+            state.setdefault("cum_insert_accepted", 0)
+            state.setdefault("cum_delete_attempted", 0)
+            state.setdefault("cum_delete_accepted", 0)
+            state.setdefault("cum_canonical_attempted", 0)
+            state.setdefault("cum_canonical_accepted", 0)
+            state.setdefault("cum_md_attempted", 0)
+            state.setdefault("cum_md_accepted", 0)
+            state.setdefault("cum_total_attempted", 0)
+            state.setdefault("cum_total_accepted", 0)
+            state.setdefault("sweep", 0)
+            if "rng_state" not in state or state["rng_state"] is None:
+                rid = state.get("id", 0)
+                state["rng_state"] = np.random.default_rng(
+                    self.seed + self.seed_nonce + rid
+                ).bit_generator.state
+
+        if not os.path.exists(self.stats_file) and not resume:
+            with open(self.stats_file, "w") as handle:
+                handle.write("cycle,mu_i,mu_j,N_i,N_j,E_i,E_j,accepted\n")
+
+        if not os.path.exists(self.results_file) and not resume:
+            with open(self.results_file, "w") as handle:
+                handle.write(
+                    "cycle,mu_eV,n_atoms,E_eV,Cv_cycle_eV_per_K,"
+                    "Cv_cum_eV_per_K,acc_pct,n_adsorbates,n_adsorbates_avg\n"
+                )
+
+        if resume and os.path.exists(self.checkpoint_file):
+            self._load_master_checkpoint()
+
+    def _start_workers(self):
+        self.backend.start()
+
+    def stop(self):
+        self.backend.stop()
+
+    def run(self, total_sweeps: int, equilibration_sweeps: int = 0) -> list[dict]:
+        total_sweeps = int(total_sweeps)
+        equilibration_sweeps = int(equilibration_sweeps)
+        if total_sweeps < 0:
+            raise ValueError("total_sweeps must be >= 0.")
+        if equilibration_sweeps < 0:
+            raise ValueError("equilibration_sweeps must be >= 0.")
+
+        n_cycles = (
+            0 if total_sweeps == 0 else int(np.ceil(total_sweeps / self.swap_interval))
+        )
+        self._start_workers()
+        logger.info(
+            "Starting mu-exchange GCMC: cycles %d -> %d | swap_interval=%d sweeps",
+            self.cycle_start,
+            n_cycles,
+            self.swap_interval,
+        )
+
+        try:
+            for cycle in range(self.cycle_start, n_cycles):
+                cycle_start_sweep = cycle * self.swap_interval
+                nsweeps = min(self.swap_interval, total_sweeps - cycle_start_sweep)
+                if nsweeps <= 0:
+                    break
+
+                logger.info("--- Mu-Exchange Cycle %d/%d ---", cycle + 1, n_cycles)
+                t_start = time.time()
+                completed = 0
+                cycle_log_rows = []
+
+                for state in self.replica_states:
+                    eq_steps = max(
+                        0,
+                        min(nsweeps, equilibration_sweeps - cycle_start_sweep),
+                    )
+                    atoms = state["atoms"]
+                    task_data = {
+                        "T": state["T"],
+                        "mu": state["mu"],
+                        "positions": atoms.get_positions(),
+                        "numbers": atoms.get_atomic_numbers(),
+                        "tags": atoms.get_tags(),
+                        "cell": atoms.get_cell(),
+                        "pbc": atoms.get_pbc(),
+                        "e_old": state["e_old"],
+                        "rng_state": state["rng_state"],
+                        "sweep": state["sweep"],
+                        "nsweeps": nsweeps,
+                        "traj_file": state["traj_file"],
+                        "thermo_file": state["thermo_file"],
+                        "checkpoint_file": state["checkpoint_file"],
+                        "report_interval": state.get("write_interval", 10),
+                        "sample_interval": state.get("sample_interval", 1),
+                        "eq_steps": eq_steps,
+                    }
+                    target_gpu = state["id"] % self.n_gpus
+                    self.backend.submit(
+                        replica_id=state["id"],
+                        target_gpu=target_gpu,
+                        task_data=task_data,
+                    )
+
+                while completed < len(self.replica_states):
+                    res = self.backend.get_result()
+                    if isinstance(res, tuple) and res[0] == "ERROR":
+                        raise RuntimeError(f"Worker Error: {res[1]}")
+
+                    rid = res["replica_id"]
+                    state = self.replica_states[rid]
+                    if len(state["atoms"]) != len(res["positions"]):
+                        state["atoms"] = _restore_atoms_from_snapshot(
+                            self.worker_init_info["atoms_template"],
+                            res["positions"],
+                            res["numbers"],
+                            res["cell"],
+                            res["pbc"],
+                            tags=res.get("tags"),
+                        )
+                    else:
+                        state["atoms"].set_positions(res["positions"])
+                        state["atoms"].set_atomic_numbers(res["numbers"])
+                        state["atoms"].set_tags(res["tags"])
+                        state["atoms"].set_cell(res["cell"])
+                        state["atoms"].pbc = res["pbc"]
+                    state["e_old"] = res["e_old"]
+                    state["rng_state"] = res["rng_state"]
+                    state["sweep"] = res["sweep"]
+
+                    state["cum_sum_E"] += res.get("cycle_sum_E", 0.0)
+                    state["cum_sum_E_sq"] += res.get("cycle_sum_E_sq", 0.0)
+                    state["cum_sum_N"] += res.get("cycle_sum_N", 0.0)
+                    state["cum_sum_N_sq"] += res.get("cycle_sum_N_sq", 0.0)
+                    state["cum_n_samples"] += res.get("cycle_n_samples", 0)
+
+                    local_stats = res["local_stats"]
+                    for key, target in (
+                        ("insert_attempted", "cum_insert_attempted"),
+                        ("insert_accepted", "cum_insert_accepted"),
+                        ("delete_attempted", "cum_delete_attempted"),
+                        ("delete_accepted", "cum_delete_accepted"),
+                        ("canonical_attempted", "cum_canonical_attempted"),
+                        ("canonical_accepted", "cum_canonical_accepted"),
+                        ("md_attempted", "cum_md_attempted"),
+                        ("md_accepted", "cum_md_accepted"),
+                    ):
+                        state[target] += int(local_stats.get(key, 0))
+
+                    attempted_this_cycle = (
+                        int(local_stats.get("insert_attempted", 0))
+                        + int(local_stats.get("delete_attempted", 0))
+                        + int(local_stats.get("canonical_attempted", 0))
+                        + int(local_stats.get("md_attempted", 0))
+                    )
+                    accepted_this_cycle = (
+                        int(local_stats.get("insert_accepted", 0))
+                        + int(local_stats.get("delete_accepted", 0))
+                        + int(local_stats.get("canonical_accepted", 0))
+                        + int(local_stats.get("md_accepted", 0))
+                    )
+                    state["cum_total_attempted"] += attempted_this_cycle
+                    state["cum_total_accepted"] += accepted_this_cycle
+
+                    for n_key, count in dict(local_stats.get("n_hist", {})).items():
+                        bucket = int(n_key)
+                        state["cum_n_hist"][bucket] = (
+                            state["cum_n_hist"].get(bucket, 0) + int(count)
+                        )
+
+                    N = state["cum_n_samples"]
+                    if N > 1:
+                        avg_E = state["cum_sum_E"] / N
+                        var_E = (state["cum_sum_E_sq"] / N) - (avg_E**2)
+                        cum_cv = var_E / (KB_EV_PER_K * state["T"] ** 2)
+                        avg_N = state["cum_sum_N"] / N
+                    else:
+                        cum_cv = 0.0
+                        avg_N = float(local_stats.get("n_adsorbates_avg", 0.0))
+
+                    with open(self.results_file, "a") as handle:
+                        handle.write(
+                            f"{cycle + 1},"
+                            f"{state['mu']:.8f},"
+                            f"{len(state['atoms'])},"
+                            f"{float(local_stats['energy']):.10f},"
+                            f"{float(local_stats.get('cv', 0.0)):.10f},"
+                            f"{cum_cv:.10f},"
+                            f"{float(local_stats.get('acceptance', 0.0)):.6f},"
+                            f"{int(local_stats.get('n_adsorbates', 0))},"
+                            f"{avg_N:.10f}\n"
+                        )
+
+                    cycle_log_rows.append(
+                        {
+                            "mu": state["mu"],
+                            "E": float(local_stats["energy"]),
+                            "cv_cycle": float(local_stats.get("cv", 0.0)),
+                            "cv_cum": float(cum_cv),
+                            "acc": float(local_stats.get("acceptance", 0.0)),
+                            "N": int(local_stats.get("n_adsorbates", 0)),
+                            "Navg": float(avg_N),
+                        }
+                    )
+                    completed += 1
+
+                if self.report_interval > 0 and (
+                    (cycle + 1) % self.report_interval == 0
+                    or cycle == self.cycle_start
+                    or cycle == (n_cycles - 1)
+                ):
+                    for row in sorted(cycle_log_rows, key=lambda item: item["mu"]):
+                        logger.info(
+                            "[mu=%+.4f eV] E=%12.6f eV | Cv(cycle)=%10.6f | "
+                            "Cv(cum)=%10.6f | Acc=%6.2f%% | N=%3d | Navg=%6.3f",
+                            row["mu"],
+                            row["E"],
+                            row["cv_cycle"],
+                            row["cv_cum"],
+                            row["acc"],
+                            row["N"],
+                            row["Navg"],
+                        )
+
+                duration = time.time() - t_start
+                logger.info("[Timing] %.2fs per mu-exchange cycle", duration)
+                self._attempt_swaps(cycle)
+
+                if (
+                    self.checkpoint_interval > 0
+                    and (cycle + 1) % self.checkpoint_interval == 0
+                ):
+                    self._save_master_checkpoint(cycle + 1)
+
+            if (
+                self.checkpoint_interval > 0
+                and (n_cycles == 0 or n_cycles % self.checkpoint_interval != 0)
+            ):
+                self._save_master_checkpoint(n_cycles)
+        finally:
+            self.stop()
+            logger.info("Mu-exchange GCMC completed.")
+
+        return self._final_stats()
+
+    def _attempt_swaps(self, cycle):
+        beta = 1.0 / (KB_EV_PER_K * float(self.replica_states[0]["T"]))
+        stride = self.swap_stride
+        n = len(self.replica_states)
+        phase = self.rng.integers(0, stride)
+        is_odd_cycle = cycle % 2 == 1
+        start_idx = phase + (stride if is_odd_cycle else 0)
+
+        for i in range(start_idx, n - stride, 2 * stride):
+            j = i + stride
+            s_i = self.replica_states[i]
+            s_j = self.replica_states[j]
+            n_i = _count_tagged_adsorbate_groups(s_i["atoms"])
+            n_j = _count_tagged_adsorbate_groups(s_j["atoms"])
+            e_i = s_i["e_old"]
+            e_j = s_j["e_old"]
+            delta = beta * (float(s_i["mu"]) - float(s_j["mu"])) * (n_i - n_j)
+            accepted = False
+            if delta <= 0.0 or self.rng.random() < np.exp(-delta):
+                accepted = True
+                s_i["atoms"], s_j["atoms"] = s_j["atoms"], s_i["atoms"]
+                s_i["e_old"], s_j["e_old"] = s_j["e_old"], s_i["e_old"]
+                logger.info(
+                    "  [Swap] mu=%+.4f <-> mu=%+.4f | N=(%d,%d) | ACCEPTED",
+                    s_i["mu"],
+                    s_j["mu"],
+                    n_i,
+                    n_j,
+                )
+            with open(self.stats_file, "a") as handle:
+                handle.write(
+                    f"{cycle},{float(s_i['mu']):.8f},{float(s_j['mu']):.8f},"
+                    f"{n_i},{n_j},{e_i:.10f},{e_j:.10f},{accepted}\n"
+                )
+
+    def _save_master_checkpoint(self, cycle):
+        replica_snapshots = []
+        for state in self.replica_states:
+            replica_snapshots.append(
+                {
+                    "id": state["id"],
+                    "mu": state["mu"],
+                    "T": state["T"],
+                    "e_old": state["e_old"],
+                    "cum_sum_E": state["cum_sum_E"],
+                    "cum_sum_E_sq": state["cum_sum_E_sq"],
+                    "cum_sum_N": state["cum_sum_N"],
+                    "cum_sum_N_sq": state["cum_sum_N_sq"],
+                    "cum_n_samples": state["cum_n_samples"],
+                    "cum_n_hist": dict(state["cum_n_hist"]),
+                    "cum_insert_attempted": state["cum_insert_attempted"],
+                    "cum_insert_accepted": state["cum_insert_accepted"],
+                    "cum_delete_attempted": state["cum_delete_attempted"],
+                    "cum_delete_accepted": state["cum_delete_accepted"],
+                    "cum_canonical_attempted": state["cum_canonical_attempted"],
+                    "cum_canonical_accepted": state["cum_canonical_accepted"],
+                    "cum_md_attempted": state["cum_md_attempted"],
+                    "cum_md_accepted": state["cum_md_accepted"],
+                    "cum_total_attempted": state["cum_total_attempted"],
+                    "cum_total_accepted": state["cum_total_accepted"],
+                    "rng_state": state["rng_state"],
+                    "sweep": state["sweep"],
+                    "positions": state["atoms"].get_positions(),
+                    "numbers": state["atoms"].get_atomic_numbers(),
+                    "tags": state["atoms"].get_tags(),
+                    "cell": state["atoms"].get_cell(),
+                    "pbc": state["atoms"].get_pbc(),
+                }
+            )
+
+        payload = {
+            "cycle_start": cycle,
+            "rng_state": self.rng.bit_generator.state,
+            "replica_states": replica_snapshots,
+        }
+        with open(self.checkpoint_file, "wb") as handle:
+            pickle.dump(payload, handle)
+
+    def _load_master_checkpoint(self):
+        with open(self.checkpoint_file, "rb") as handle:
+            payload = pickle.load(handle)
+        self.cycle_start = int(payload.get("cycle_start", 0))
+        if payload.get("rng_state") is not None:
+            self.rng.bit_generator.state = payload["rng_state"]
+
+        snapshots = payload.get("replica_states", [])
+        state_by_id = {int(state["id"]): state for state in self.replica_states}
+        for snap in snapshots:
+            state = state_by_id[int(snap["id"])]
+            state["mu"] = float(snap["mu"])
+            state["T"] = float(snap["T"])
+            state["e_old"] = float(snap["e_old"])
+            state["cum_sum_E"] = float(snap.get("cum_sum_E", 0.0))
+            state["cum_sum_E_sq"] = float(snap.get("cum_sum_E_sq", 0.0))
+            state["cum_sum_N"] = float(snap.get("cum_sum_N", 0.0))
+            state["cum_sum_N_sq"] = float(snap.get("cum_sum_N_sq", 0.0))
+            state["cum_n_samples"] = int(snap.get("cum_n_samples", 0))
+            state["cum_n_hist"] = {
+                int(key): int(value)
+                for key, value in dict(snap.get("cum_n_hist", {})).items()
+            }
+            for key in (
+                "cum_insert_attempted",
+                "cum_insert_accepted",
+                "cum_delete_attempted",
+                "cum_delete_accepted",
+                "cum_canonical_attempted",
+                "cum_canonical_accepted",
+                "cum_md_attempted",
+                "cum_md_accepted",
+                "cum_total_attempted",
+                "cum_total_accepted",
+            ):
+                state[key] = int(snap.get(key, 0))
+            state["rng_state"] = snap.get("rng_state")
+            state["sweep"] = int(snap.get("sweep", 0))
+            if len(state["atoms"]) != len(snap["positions"]):
+                state["atoms"] = _restore_atoms_from_snapshot(
+                    self.worker_init_info["atoms_template"],
+                    snap["positions"],
+                    snap["numbers"],
+                    snap["cell"],
+                    snap["pbc"],
+                    tags=snap.get("tags"),
+                )
+            else:
+                atoms = state["atoms"]
+                atoms.set_positions(snap["positions"])
+                atoms.set_atomic_numbers(snap["numbers"])
+                atoms.set_tags(snap["tags"])
+                atoms.set_cell(snap["cell"])
+                atoms.pbc = snap["pbc"]
+
+    def _final_stats(self) -> list[dict]:
+        rows = []
+        for state in self.replica_states:
+            n_samples = int(state["cum_n_samples"])
+            current_e = 0.0 if state["e_old"] is None else float(state["e_old"])
+            avg_E = (
+                float(state["cum_sum_E"]) / n_samples if n_samples else current_e
+            )
+            avg_N = (
+                float(state["cum_sum_N"]) / n_samples
+                if n_samples
+                else float(_count_tagged_adsorbate_groups(state["atoms"]))
+            )
+            cv = 0.0
+            if n_samples > 1:
+                var_E = (state["cum_sum_E_sq"] / n_samples) - (avg_E**2)
+                cv = var_E / (KB_EV_PER_K * float(state["T"]) ** 2)
+            acceptance = (
+                100.0 * state["cum_total_accepted"] / state["cum_total_attempted"]
+                if state["cum_total_attempted"]
+                else 0.0
+            )
+            rows.append(
+                {
+                    "mu": float(state["mu"]),
+                    "T": float(state["T"]),
+                    "energy": avg_E,
+                    "cv": cv,
+                    "acceptance": acceptance,
+                    "n_adsorbates": _count_tagged_adsorbate_groups(state["atoms"]),
+                    "n_adsorbates_avg": avg_N,
+                    "n_hist": dict(sorted(state["cum_n_hist"].items())),
+                    "insert_attempted": int(state["cum_insert_attempted"]),
+                    "insert_accepted": int(state["cum_insert_accepted"]),
+                    "delete_attempted": int(state["cum_delete_attempted"]),
+                    "delete_accepted": int(state["cum_delete_accepted"]),
+                    "canonical_attempted": int(state["cum_canonical_attempted"]),
+                    "canonical_accepted": int(state["cum_canonical_accepted"]),
+                    "md_attempted": int(state["cum_md_attempted"]),
+                    "md_accepted": int(state["cum_md_accepted"]),
+                }
+            )
+        rows.sort(key=lambda row: row["mu"])
+        return rows

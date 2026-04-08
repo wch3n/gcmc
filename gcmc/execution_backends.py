@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 
 from scipy.spatial import cKDTree
 
-from .process_replica import ReplicaWorker, ctx
+from .process_replica import ReplicaWorker, ctx, _restore_atoms_from_snapshot
 
 logger = logging.getLogger("mc")
 
@@ -126,19 +126,29 @@ class _RayReplicaActor:
         try:
             sim = self.sim
             sim.T = data["T"]
+            if "mu" in data:
+                sim.mu = data["mu"]
 
             if len(sim.atoms) != len(data["positions"]):
-                sim.atoms = self.atoms_template.copy()
-
-            sim.atoms.set_positions(data["positions"])
-            sim.atoms.set_atomic_numbers(data["numbers"])
-            if "tags" in data:
-                sim.atoms.set_tags(data["tags"])
-            sim.atoms.set_cell(data["cell"])
-            sim.atoms.pbc = data["pbc"]
+                sim.atoms = _restore_atoms_from_snapshot(
+                    self.atoms_template,
+                    data["positions"],
+                    data["numbers"],
+                    data["cell"],
+                    data["pbc"],
+                    tags=data.get("tags"),
+                )
+            else:
+                sim.atoms.set_positions(data["positions"])
+                sim.atoms.set_atomic_numbers(data["numbers"])
+                if "tags" in data:
+                    sim.atoms.set_tags(data["tags"])
+                sim.atoms.set_cell(data["cell"])
+                sim.atoms.pbc = data["pbc"]
             sim._refresh_cached_state()
 
-            sim.e_old = data["e_old"]
+            if data.get("e_old") is not None:
+                sim.e_old = data["e_old"]
             if "rng_state" in data and data["rng_state"] is not None:
                 sim.rng.bit_generator.state = data["rng_state"]
             sim.sweep = data["sweep"]
@@ -170,6 +180,8 @@ class _RayReplicaActor:
                 "sweep": sim.sweep,
                 "cycle_sum_E": sim.sum_E,
                 "cycle_sum_E_sq": sim.sum_E_sq,
+                "cycle_sum_N": getattr(sim, "sum_N", 0.0),
+                "cycle_sum_N_sq": getattr(sim, "sum_N_sq", 0.0),
                 "cycle_n_samples": sim.n_samples,
                 "local_stats": stats,
             }

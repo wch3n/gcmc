@@ -42,7 +42,6 @@ from .workflows import (
     load_adsorbate_gcmc_config,
     load_adsorbate_gcmc_scan_config,
 )
-from .cluster_analysis import analyze_and_plot, find_cu_clusters
 from .analysis import (
     MXeneAdsorptionSiteAnalyzer,
     MXeneOrderingAnalyzer,
@@ -78,3 +77,14 @@ __all__ = [
     "find_cu_clusters",
     "utils",
 ]
+
+
+def __getattr__(name):
+    if name in {"analyze_and_plot", "find_cu_clusters"}:
+        from .cluster_analysis import analyze_and_plot, find_cu_clusters
+
+        return {
+            "analyze_and_plot": analyze_and_plot,
+            "find_cu_clusters": find_cu_clusters,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

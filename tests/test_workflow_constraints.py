@@ -45,11 +45,50 @@ def _constraint_of_type(atoms: Atoms, cls):
 
 
 class TestWorkflowLayerZConstraints(unittest.TestCase):
+    def test_prepare_atoms_can_clear_loaded_constraints(self):
+        atoms = _make_two_sided_mxene_like_slab()
+        atoms.set_constraint(FixAtoms(indices=[0, 1]))
+        cfg = SimpleNamespace(
+            supercell_matrix=None,
+            repeat=(1, 1, 1),
+            clear_loaded_constraints=True,
+            fix_below_z=None,
+            fix_z_elements=[],
+            fix_z_layers=None,
+            surface_layer_tol=0.5,
+        )
+
+        prepared = _prepare_alloy_atoms(atoms, cfg)
+
+        self.assertEqual(len(prepared.constraints), 0)
+
+    def test_prepare_atoms_clear_loaded_constraints_then_apply_workflow_constraints(self):
+        atoms = _make_two_sided_mxene_like_slab()
+        atoms.set_constraint(FixAtoms(indices=[0, 1]))
+        cfg = SimpleNamespace(
+            supercell_matrix=None,
+            repeat=(1, 1, 1),
+            clear_loaded_constraints=True,
+            fix_below_z=None,
+            fix_z_elements=["Ti", "Zr", "Mo"],
+            fix_z_layers={"top": [1]},
+            surface_layer_tol=0.5,
+        )
+
+        prepared = _prepare_alloy_atoms(atoms, cfg)
+        cartesian = _constraint_of_type(prepared, FixCartesian)
+        fixed = _constraint_of_type(prepared, FixAtoms)
+
+        self.assertIsNotNone(cartesian)
+        self.assertIsNone(fixed)
+        self.assertTrue(np.array_equal(np.sort(cartesian.get_indices()), np.array([4, 5])))
+
     def test_prepare_alloy_atoms_fix_z_by_layer_index(self):
         atoms = _make_two_sided_mxene_like_slab()
         cfg = SimpleNamespace(
             supercell_matrix=None,
             repeat=(1, 1, 1),
+            clear_loaded_constraints=False,
             fix_below_z=None,
             fix_z_elements=["Ti", "Zr", "Mo"],
             fix_z_layers={"top": [1], "bottom": [1]},
@@ -68,6 +107,7 @@ class TestWorkflowLayerZConstraints(unittest.TestCase):
         cfg = SimpleNamespace(
             supercell_matrix=None,
             repeat=(1, 1, 1),
+            clear_loaded_constraints=False,
             fix_below_z=None,
             fix_z_elements=["Ti", "Zr", "Mo"],
             fix_z_layers={"bottom": [1]},
@@ -85,6 +125,7 @@ class TestWorkflowLayerZConstraints(unittest.TestCase):
         cfg = SimpleNamespace(
             supercell_matrix=None,
             repeat=(1, 1, 1),
+            clear_loaded_constraints=False,
             fix_below_z=1.0,
             fix_z_elements=["Ti", "Zr", "Mo"],
             fix_z_layers={"top": [1]},

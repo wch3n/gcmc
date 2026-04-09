@@ -54,6 +54,7 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "frame": 0,
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
+    "clear_loaded_constraints": False,
     "fix_below_z": None,
     "fix_z_elements": [],
     "fix_z_layers": None,
@@ -146,6 +147,7 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "frame": 0,
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
+    "clear_loaded_constraints": False,
     "fix_below_z": None,
     "fix_z_elements": [],
     "fix_z_layers": None,
@@ -216,6 +218,7 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "frame": 0,
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
+    "clear_loaded_constraints": False,
     "fix_below_z": None,
     "fix_z_elements": [],
     "fix_z_layers": None,
@@ -287,6 +290,7 @@ _DEFAULT_ALLOY_CMC_CONFIG = {
     "frame": 0,
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
+    "clear_loaded_constraints": False,
     "fix_below_z": None,
     "fix_z_elements": [],
     "fix_z_layers": None,
@@ -337,6 +341,7 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "frame": 0,
     "repeat": [1, 1, 1],
     "supercell_matrix": None,
+    "clear_loaded_constraints": False,
     "fix_below_z": None,
     "fix_z_elements": [],
     "fix_z_layers": None,
@@ -557,6 +562,9 @@ def _select_fix_z_indices(atoms: Atoms, cfg: SimpleNamespace) -> np.ndarray:
 
 
 def _apply_workflow_constraints(atoms: Atoms, cfg: SimpleNamespace) -> Atoms:
+    if bool(getattr(cfg, "clear_loaded_constraints", False)):
+        atoms.set_constraint(None)
+
     fix_below_z = getattr(cfg, "fix_below_z", None)
     if fix_below_z is not None:
         fixed_indices = [atom.index for atom in atoms if atom.position[2] < fix_below_z]

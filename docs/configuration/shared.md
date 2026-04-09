@@ -18,6 +18,7 @@ Workflow abbreviations:
 | `frame` | all | `0` | Frame index used for trajectory-like inputs. For plain structure files the loader uses frame `0`. |
 | `repeat` | all | `[1, 1, 1]` | ASE repeat vector applied after loading the snapshot. |
 | `supercell_matrix` | all | `None` | Integer supercell matrix applied before `repeat`. |
+| `clear_loaded_constraints` | all | `False` | Drop constraints already present on the loaded `Atoms` object before any workflow constraints are applied. |
 | `fix_below_z` | all | `None` | Applies `FixAtoms` to all atoms with `z < fix_below_z`. This freezes all Cartesian components. |
 | `fix_z_elements` | all | `[]` | Element list for selective `z`-only constraints. Works together with `fix_z_layers`. |
 | `fix_z_layers` | all | `None` | Layer-index selector for `z`-only constraints, e.g. `{top: [1], bottom: [1]}` or `{bottom: all}`. |
@@ -37,6 +38,21 @@ system:
 - Layer counting starts at `1`.
 - `all` means every detected layer on that side.
 - Layer detection uses the same surface-layer clustering logic as the workflow, with `surface_layer_tol`.
+
+### `clear_loaded_constraints`
+
+Use this when the input trajectory or structure file already carries ASE constraints that you do not want to propagate into MC, relaxation, or MD:
+
+```yaml
+system:
+  clear_loaded_constraints: true
+```
+
+Semantics:
+
+- Clears only constraints already present on the loaded `Atoms`.
+- Workflow constraints such as `fix_below_z` and `fix_z_layers` are applied afterward as usual.
+- This is the clean way to ignore constraints embedded in an input trajectory without editing the structure file itself.
 
 ## `calculator`
 

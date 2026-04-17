@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from ase import Atom, Atoms
@@ -6,6 +9,7 @@ from ase.calculators.calculator import Calculator, all_changes
 
 from gcmc.adsorbate_cmc import AdsorbateCMC
 from gcmc.adsorbate_gcmc import AdsorbateGCMC
+from gcmc.alloy_cmc import AlloyCMC
 from gcmc.constants import ADSORBATE_TAG_OFFSET
 
 
@@ -80,6 +84,30 @@ def _make_oh_surface() -> Atoms:
     )
     atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
     return atoms
+
+
+def _make_wrapped_oh_surface() -> Atoms:
+    atoms = Atoms(
+        symbols=["Ti", "O", "H"],
+        positions=[
+            (5.0, 5.0, 0.0),
+            (0.1, 5.0, 1.8),
+            (9.9, 5.0, 1.8),
+        ],
+        cell=[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 15.0]],
+        pbc=[True, True, False],
+    )
+    atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+    return atoms
+
+
+def _make_ti_zr_alloy() -> Atoms:
+    return Atoms(
+        symbols=["Ti", "Zr"],
+        positions=[(0.0, 0.0, 0.0), (2.5, 0.0, 0.0)],
+        cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]],
+        pbc=[False, False, False],
+    )
 
 
 class StubRNG:
@@ -212,6 +240,230 @@ class TestAdsorbateCMCVerticalAdjustment(unittest.TestCase):
         )
 
 
+class _FakeTrajectory:
+    created = []
+
+    def __init__(self, filename, mode):
+        self.filename = filename
+        self.mode = mode
+        self.closed = False
+        self.records = []
+        _FakeTrajectory.created.append(self)
+
+    def write(self, atoms):
+        self.records.append(len(atoms))
+
+    def close(self):
+        self.closed = True
+
+
+class TestAdsorbateCMCPersistentIO(unittest.TestCase):
+    def test_reuse_io_keeps_traj_writer_open_across_chunks(self):
+        sim = AdsorbateCMC(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate=Atoms(
+                symbols=["O", "H"],
+                positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)],
+            ),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.5,
+            enable_hybrid_md=False,
+            seed=9,
+        )
+        sim._reuse_io = True
+        sim._propose_move = lambda: None
+        sim._save_checkpoint = lambda: None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            traj_file = str(Path(tmpdir) / "chunked.traj")
+            thermo_file = str(Path(tmpdir) / "chunked.dat")
+            sim.thermo_file = thermo_file
+
+            _FakeTrajectory.created = []
+            with mock.patch("gcmc.adsorbate_cmc.Trajectory", _FakeTrajectory):
+                sim.run(nsweeps=1, traj_file=traj_file, interval=1, sample_interval=1)
+                sim.run(nsweeps=2, traj_file=traj_file, interval=1, sample_interval=1)
+
+            self.assertEqual(len(_FakeTrajectory.created), 1)
+            self.assertEqual(_FakeTrajectory.created[0].filename, traj_file)
+            self.assertEqual(len(_FakeTrajectory.created[0].records), 2)
+            sim.close_persistent_io()
+
+
+class TestResumeTargets(unittest.TestCase):
+    def test_adsorbate_cmc_resume_uses_total_target_sweeps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = str(Path(tmpdir) / "ads_cmc.pkl")
+            thermo = str(Path(tmpdir) / "ads_cmc.dat")
+            traj = str(Path(tmpdir) / "ads_cmc.traj")
+
+            sim = AdsorbateCMC(
+                atoms=_make_oh_surface(),
+                calculator=ZeroCalculator(),
+                T=300.0,
+                adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+                adsorbate_anchor_index=0,
+                substrate_elements=("Ti",),
+                functional_elements=(),
+                site_elements=("Ti",),
+                site_type="atop",
+                move_mode="hybrid",
+                site_hop_prob=0.5,
+                reorientation_prob=0.5,
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                seed=31,
+            )
+            sim._moves_per_sweep = lambda: 0
+            sim.accepted_traj_file = None
+            sim.rejected_traj_file = None
+            sim.attempted_traj_file = None
+            sim.run(nsweeps=3, traj_file=traj, interval=10, sample_interval=1, equilibration=2)
+
+            resumed = AdsorbateCMC(
+                atoms=_make_oh_surface(),
+                calculator=ZeroCalculator(),
+                T=300.0,
+                adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+                adsorbate_anchor_index=0,
+                substrate_elements=("Ti",),
+                functional_elements=(),
+                site_elements=("Ti",),
+                site_type="atop",
+                move_mode="hybrid",
+                site_hop_prob=0.5,
+                reorientation_prob=0.5,
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                resume=True,
+                seed=31,
+            )
+            resumed._moves_per_sweep = lambda: 0
+            resumed.accepted_traj_file = None
+            resumed.rejected_traj_file = None
+            resumed.attempted_traj_file = None
+            resumed.run(nsweeps=5, traj_file=traj, interval=10, sample_interval=1, equilibration=2)
+
+            self.assertEqual(resumed.sweep, 5)
+            self.assertEqual(resumed.n_samples, 3)
+
+    def test_adsorbate_gcmc_resume_uses_total_target_sweeps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = str(Path(tmpdir) / "ads_gcmc.pkl")
+            thermo = str(Path(tmpdir) / "ads_gcmc.dat")
+            traj = str(Path(tmpdir) / "ads_gcmc.traj")
+
+            sim = AdsorbateGCMC(
+                atoms=_make_two_site_surface(),
+                calculator=ZeroCalculator(),
+                mu=-1.0,
+                T=300.0,
+                max_n_adsorbates=2,
+                site_elements=("O",),
+                substrate_elements=("Ti",),
+                functional_elements=(),
+                site_type="atop",
+                move_mode="hybrid",
+                site_hop_prob=0.5,
+                reorientation_prob=0.0,
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                seed=37,
+            )
+            sim.accepted_traj_file = None
+            sim.rejected_traj_file = None
+            sim.attempted_traj_file = None
+            sim.run(
+                nsweeps=3,
+                traj_file=traj,
+                interval=10,
+                sample_interval=1,
+                equilibration=2,
+                max_moves=0,
+            )
+
+            resumed = AdsorbateGCMC(
+                atoms=_make_two_site_surface(),
+                calculator=ZeroCalculator(),
+                mu=-1.0,
+                T=300.0,
+                max_n_adsorbates=2,
+                site_elements=("O",),
+                substrate_elements=("Ti",),
+                functional_elements=(),
+                site_type="atop",
+                move_mode="hybrid",
+                site_hop_prob=0.5,
+                reorientation_prob=0.0,
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                resume=True,
+                seed=37,
+            )
+            resumed.accepted_traj_file = None
+            resumed.rejected_traj_file = None
+            resumed.attempted_traj_file = None
+            resumed.run(
+                nsweeps=5,
+                traj_file=traj,
+                interval=10,
+                sample_interval=1,
+                equilibration=2,
+                max_moves=0,
+            )
+
+            self.assertEqual(resumed.sweep, 5)
+            self.assertEqual(resumed.n_samples, 3)
+
+    def test_alloy_cmc_resume_uses_total_target_sweeps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = str(Path(tmpdir) / "alloy.pkl")
+            thermo = str(Path(tmpdir) / "alloy.dat")
+            traj = str(Path(tmpdir) / "alloy.traj")
+
+            sim = AlloyCMC(
+                atoms=_make_ti_zr_alloy(),
+                calculator=ZeroCalculator(),
+                T=300.0,
+                swap_elements=["Ti", "Zr"],
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                seed=41,
+            )
+            sim.swap_indices = []
+            sim.run(nsweeps=3, traj_file=traj, interval=10, sample_interval=1, equilibration=2)
+
+            resumed = AlloyCMC(
+                atoms=_make_ti_zr_alloy(),
+                calculator=ZeroCalculator(),
+                T=300.0,
+                swap_elements=["Ti", "Zr"],
+                checkpoint_file=checkpoint,
+                checkpoint_interval=100,
+                thermo_file=thermo,
+                resume=True,
+                seed=41,
+            )
+            resumed.swap_indices = []
+            resumed.run(nsweeps=5, traj_file=traj, interval=10, sample_interval=1, equilibration=2)
+
+            self.assertEqual(resumed.sweep, 5)
+            self.assertEqual(resumed.n_samples, 3)
+
+
 class TestAdsorbateCMCReorientation(unittest.TestCase):
     def _make_sim(self) -> AdsorbateCMC:
         return AdsorbateCMC(
@@ -280,6 +532,68 @@ class TestAdsorbateCMCReorientation(unittest.TestCase):
         sim.rng = StubRNG(axis=[1.0, 0.0, 0.0], angle=np.pi)
         trial = sim._propose_reorientation()
         self.assertIsNone(trial)
+
+    def test_group_relative_positions_use_mic_for_wrapped_molecule(self):
+        sim = AdsorbateCMC(
+            atoms=_make_wrapped_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate_element="O",
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="reorientation",
+            rotation_max_angle_deg=180.0,
+            max_reorientation_trials=1,
+            min_clearance=0.1,
+            termination_clearance=0.0,
+            seed=19,
+        )
+
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        relative = sim._current_group_relative_positions(group)
+
+        self.assertTrue(np.allclose(relative[0], np.zeros(3)))
+        self.assertAlmostEqual(np.linalg.norm(relative[1]), 0.2, places=10)
+        self.assertAlmostEqual(abs(float(relative[1, 0])), 0.2, places=10)
+
+    def test_rotate_group_about_anchor_handles_wrapped_molecule(self):
+        sim = AdsorbateCMC(
+            atoms=_make_wrapped_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate_element="O",
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="reorientation",
+            rotation_max_angle_deg=180.0,
+            max_reorientation_trials=1,
+            min_clearance=0.1,
+            termination_clearance=0.0,
+            seed=23,
+        )
+
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        rotated = sim._rotate_group_about_anchor(
+            group,
+            axis=np.array([0.0, 0.0, 1.0]),
+            angle=0.5 * np.pi,
+        )
+
+        self.assertTrue(np.allclose(rotated[0], sim.atoms.positions[group[0]]))
+        self.assertAlmostEqual(
+            np.linalg.norm(rotated[1] - rotated[0]),
+            0.2,
+            places=10,
+        )
+        self.assertLess(np.linalg.norm(rotated[1] - rotated[0]), 1.0)
 
 
 class TestAmbiguousEmptyMolecularAdsorbates(unittest.TestCase):

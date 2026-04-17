@@ -523,6 +523,7 @@ class AdsorbateGCMC(AdsorbateCMC):
     ) -> Dict[str, float]:
         if nsweeps is None:
             nsweeps = self.nsteps
+        target_sweeps = int(nsweeps)
         if traj_file is None:
             traj_file = self.traj_file
         if log_every is not None:
@@ -560,7 +561,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         )
 
         logger.info(
-            f"Start adsorbate GCMC | T={self.T:.0f}K | nsweeps={int(nsweeps)} | "
+            f"Start adsorbate GCMC | T={self.T:.0f}K | nsweeps={target_sweeps} | "
             f"eligible_sites={self._eligible_site_count()} | moves_per_sweep={self._moves_per_sweep()} | "
             f"write_interval={int(interval)} | sample_interval={int(sample_interval)} | "
             f"equilibration={int(equilibration)}"
@@ -571,7 +572,9 @@ class AdsorbateGCMC(AdsorbateCMC):
             )
         )
 
-        for sweep in range(int(nsweeps)):
+        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
+
+        for _ in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             moves_this_sweep = self._moves_per_sweep()
             if max_moves is not None:
@@ -808,15 +811,16 @@ class AdsorbateGCMC(AdsorbateCMC):
                             else 0.0
                         )
                         logger.info(
-                            f"T={self.T:4.0f}K | sweep {sweep + 1:6d}/{int(nsweeps):6d} | "
+                            f"T={self.T:4.0f}K | sweep {self.sweep + 1:6d}/{target_sweeps:6d} | "
                             f"move {move_idx + 1:4d}/{moves_this_sweep:4d} | "
                             f"E: {self.e_old:10.4f} | Nads: {len(self.ads_groups):4d} | "
                             f"Acc: {acc:4.1f}%"
                         )
 
             self.sweep += 1
+            completed_sweep = int(self.sweep)
 
-            if sweep >= equilibration and (sweep + 1) % sample_interval == 0:
+            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
                 n_ads = len(self.ads_groups)
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
@@ -825,10 +829,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                 self.n_samples += 1
                 self.n_hist[n_ads] = self.n_hist.get(n_ads, 0) + 1
 
-            if (sweep + 1) % interval == 0:
+            if completed_sweep % interval == 0:
                 traj_writer.write(self.atoms)
                 with open(self.thermo_file, "a") as handle:
-                    handle.write(f"{self.sweep} {self.e_old:.6f} {len(self.ads_groups)}\n")
+                    handle.write(f"{completed_sweep} {self.e_old:.6f} {len(self.ads_groups)}\n")
 
                 acc = (self.accepted_moves / self.total_moves * 100.0) if self.total_moves else 0.0
                 avg_e = self.sum_E / self.n_samples if self.n_samples else self.e_old
@@ -839,7 +843,7 @@ class AdsorbateGCMC(AdsorbateCMC):
                     cv = var_e / (KB_EV_PER_K * self.T**2)
 
                 logger.info(
-                    f"T={self.T:4.0f}K | {self.sweep:6d} | E: {self.e_old:10.4f} | "
+                    f"T={self.T:4.0f}K | {completed_sweep:6d} | E: {self.e_old:10.4f} | "
                     f"AvgE: {avg_e:10.4f} | AvgN: {avg_n:6.2f} | Cv: {cv:8.4f} | "
                     f"Acc: {acc:4.1f}% | Nads: {len(self.ads_groups):4d} | "
                     f"Ins: {self.accepted_insertions}/{self.attempted_insertions} | "

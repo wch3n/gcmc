@@ -103,6 +103,7 @@ class AlloyCMC(BaseMC):
         self.md_planar_axis = int(md_planar_axis)
         self.md_init_momenta = md_init_momenta
         self.md_remove_drift = md_remove_drift
+        self._resumed_from_checkpoint = False
         if not (0.0 <= self.md_move_prob <= 1.0):
             raise ValueError("md_move_prob must be in [0, 1].")
         if not (0.0 <= self.hybrid_neighbor_prob <= 1.0):
@@ -285,6 +286,7 @@ class AlloyCMC(BaseMC):
         self.sum_E = state.get("sum_E", 0.0)
         self.sum_E_sq = state.get("sum_E_sq", 0.0)
         self.n_samples = state.get("n_samples", 0)
+        self._resumed_from_checkpoint = True
         self._refresh_cached_state()
         logger.info(f"[{self.T:.0f}K] Resumed from checkpoint.")
 
@@ -454,6 +456,7 @@ class AlloyCMC(BaseMC):
         equilibration: int = 0,
     ) -> Dict[str, float]:
         self.traj_file = traj_file
+        target_sweeps = int(nsweeps)
 
         # Determine trajectory write mode safely.
         if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0:
@@ -463,14 +466,15 @@ class AlloyCMC(BaseMC):
 
         self.traj_writer = Trajectory(self.traj_file, mode)
 
-        # Reset accumulators for this run block.
-        self.sum_E = 0.0
-        self.sum_E_sq = 0.0
-        self.n_samples = 0
-        self.accepted_moves = 0
-        self.total_moves = 0
-        self.md_attempted_moves = 0
-        self.md_accepted_moves = 0
+        if not self._resumed_from_checkpoint:
+            self.sum_E = 0.0
+            self.sum_E_sq = 0.0
+            self.n_samples = 0
+            self.accepted_moves = 0
+            self.total_moves = 0
+            self.md_attempted_moves = 0
+            self.md_accepted_moves = 0
+        self._resumed_from_checkpoint = False
         if self.neighbor_cache:
             self._invalidate_neighbor_cache()
 
@@ -484,7 +488,9 @@ class AlloyCMC(BaseMC):
 
         # Optional start-of-run header can be added here if needed.
 
-        for sweep in range(nsweeps):
+        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
+
+        for _ in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             if self.neighbor_cache and self.swap_mode in ("neighbor", "hybrid"):
                 self._ensure_neighbor_cache()
@@ -550,15 +556,16 @@ class AlloyCMC(BaseMC):
                 self.current_swap_indices = None
 
             self.sweep += 1
+            completed_sweep = int(self.sweep)
 
             # 1. Sampling.
-            if sweep >= equilibration and (sweep + 1) % sample_interval == 0:
+            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
                 self.n_samples += 1
 
             # 2. Reporting with temperature tag.
-            if (sweep + 1) % interval == 0:
+            if completed_sweep % interval == 0:
                 self.traj_writer.write(self.atoms)
                 with open(self.thermo_file, "a") as f:
                     f.write(f"{self.sweep} {self.e_old:.6f}\n")

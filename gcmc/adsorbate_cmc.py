@@ -395,6 +395,9 @@ class AdsorbateCMC(SurfaceMCBase):
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
         self._site_registry: Optional[list[dict[str, object]]] = None
+        self._reuse_io = False
+        self._persistent_traj_writers: dict[str, Trajectory] = {}
+        self._persistent_thermo_handles: dict[str, object] = {}
         self.enable_hybrid_md = bool(enable_hybrid_md)
         self.md_move_prob = float(md_move_prob)
         self.md_steps = int(md_steps)
@@ -437,6 +440,7 @@ class AdsorbateCMC(SurfaceMCBase):
         self.md_attempted_moves = 0
         self.md_accepted_moves = 0
         self.sweep = 0
+        self._resumed_from_checkpoint = False
 
         self.atoms.calc = self.calculator
         self.e_old = self.atoms.get_potential_energy()
@@ -481,8 +485,15 @@ class AdsorbateCMC(SurfaceMCBase):
         if atoms is None:
             atoms = self.atoms
         anchor_idx = self._anchor_index_for_group(group, atoms=atoms)
-        positions = atoms.get_positions()[np.asarray(group, dtype=int)]
-        return positions - atoms.positions[anchor_idx]
+        return np.asarray(
+            atoms.get_distances(
+                anchor_idx,
+                np.asarray(group, dtype=int),
+                mic=True,
+                vector=True,
+            ),
+            dtype=float,
+        )
 
     def _adsorbate_groups_for_atoms(self, atoms: Atoms) -> list[np.ndarray]:
         if atoms is self.atoms:
@@ -759,6 +770,7 @@ class AdsorbateCMC(SurfaceMCBase):
         self.n_samples = state.get("n_samples", 0)
         self._site_registry = None
         self._update_indices()
+        self._resumed_from_checkpoint = True
         logger.info(f"[{self.T:.0f}K] Resumed adsorbate MC from checkpoint.")
 
     def _metropolis_accept(self, delta_e: float, beta: Optional[float] = None) -> bool:
@@ -1253,6 +1265,41 @@ class AdsorbateCMC(SurfaceMCBase):
         mode = "a" if os.path.exists(filename) and os.path.getsize(filename) > 0 else "w"
         return Trajectory(filename, mode)
 
+    def _get_traj_writer(self, filename: Optional[str]) -> Optional[Trajectory]:
+        if not filename:
+            return None
+        if not self._reuse_io:
+            return self._open_optional_traj(filename)
+        writer = self._persistent_traj_writers.get(filename)
+        if writer is None:
+            writer = self._open_optional_traj(filename)
+            if writer is not None:
+                self._persistent_traj_writers[filename] = writer
+        return writer
+
+    def _get_thermo_handle(self):
+        if not self._reuse_io:
+            return None
+        handle = self._persistent_thermo_handles.get(self.thermo_file)
+        if handle is None or handle.closed:
+            handle = open(self.thermo_file, "a", buffering=1)
+            self._persistent_thermo_handles[self.thermo_file] = handle
+        return handle
+
+    def close_persistent_io(self) -> None:
+        for writer in self._persistent_traj_writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._persistent_traj_writers.clear()
+        for handle in self._persistent_thermo_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._persistent_thermo_handles.clear()
+
     def run(
         self,
         nsweeps: int,
@@ -1263,24 +1310,28 @@ class AdsorbateCMC(SurfaceMCBase):
     ) -> Dict[str, float]:
         self.traj_file = traj_file
 
-        mode = "a" if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0 else "w"
-        traj_writer = Trajectory(self.traj_file, mode)
-        accepted_writer = self._open_optional_traj(self.accepted_traj_file)
-        rejected_writer = self._open_optional_traj(self.rejected_traj_file)
-        attempted_writer = self._open_optional_traj(self.attempted_traj_file)
+        traj_writer = self._get_traj_writer(self.traj_file)
+        accepted_writer = self._get_traj_writer(self.accepted_traj_file)
+        rejected_writer = self._get_traj_writer(self.rejected_traj_file)
+        attempted_writer = self._get_traj_writer(self.attempted_traj_file)
+        thermo_handle = self._get_thermo_handle()
 
-        self.sum_E = 0.0
-        self.sum_E_sq = 0.0
-        self.n_samples = 0
-        self.accepted_moves = 0
-        self.total_moves = 0
-        self.md_attempted_moves = 0
-        self.md_accepted_moves = 0
+        target_sweeps = int(nsweeps)
+        if not self._resumed_from_checkpoint:
+            self.sum_E = 0.0
+            self.sum_E_sq = 0.0
+            self.n_samples = 0
+            self.accepted_moves = 0
+            self.total_moves = 0
+            self.md_attempted_moves = 0
+            self.md_accepted_moves = 0
+        self._resumed_from_checkpoint = False
+        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
 
         if len(self.ads_groups) == 0:
             logger.warning("AdsorbateCMC run started with no adsorbates present.")
 
-        for sweep in range(nsweeps):
+        for _ in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             moves_this_sweep = self._moves_per_sweep()
 
@@ -1373,16 +1424,21 @@ class AdsorbateCMC(SurfaceMCBase):
                     rejected_writer.write(atoms_trial)
 
             self.sweep += 1
+            completed_sweep = int(self.sweep)
 
-            if sweep >= equilibration and (sweep + 1) % sample_interval == 0:
+            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
                 self.n_samples += 1
 
-            if (sweep + 1) % interval == 0:
+            if completed_sweep % interval == 0:
                 traj_writer.write(self.atoms)
-                with open(self.thermo_file, "a") as handle:
-                    handle.write(f"{self.sweep} {self.e_old:.6f}\n")
+                if thermo_handle is None:
+                    with open(self.thermo_file, "a") as handle:
+                        handle.write(f"{self.sweep} {self.e_old:.6f}\n")
+                else:
+                    thermo_handle.write(f"{self.sweep} {self.e_old:.6f}\n")
+                    thermo_handle.flush()
 
                 acc = (
                     (self.accepted_moves / self.total_moves * 100.0)
@@ -1396,7 +1452,7 @@ class AdsorbateCMC(SurfaceMCBase):
                     cv = var / (KB_EV_PER_K * self.T**2)
 
                 logger.info(
-                    f"T={self.T:4.0f}K | {self.sweep:6d} | "
+                    f"T={self.T:4.0f}K | {completed_sweep:6d} | "
                     f"E: {self.e_old:10.4f} | Avg: {avg:10.4f} | "
                     f"Cv: {cv:8.4f} | Acc: {acc:4.1f}% | Nads: {len(self.ads_groups):4d}"
                     + (
@@ -1419,10 +1475,11 @@ class AdsorbateCMC(SurfaceMCBase):
                 self._save_checkpoint()
 
         self._save_checkpoint()
-        traj_writer.close()
-        for writer in (accepted_writer, rejected_writer, attempted_writer):
-            if writer is not None:
-                writer.close()
+        if not self._reuse_io:
+            traj_writer.close()
+            for writer in (accepted_writer, rejected_writer, attempted_writer):
+                if writer is not None:
+                    writer.close()
 
         final_avg = self.sum_E / self.n_samples if self.n_samples else self.e_old
         final_cv = 0.0

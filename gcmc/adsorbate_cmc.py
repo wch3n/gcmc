@@ -8,6 +8,7 @@ from ase import Atoms
 from ase import units
 from ase.build import make_supercell
 from ase.constraints import FixCartesian
+from ase.data import atomic_numbers, covalent_radii
 from ase.geometry import get_distances
 from ase.io import Trajectory, read, write
 from ase.md.langevin import Langevin
@@ -219,6 +220,9 @@ class AdsorbateCMC(SurfaceMCBase):
         md_planar_axis: int = 2,
         md_init_momenta: bool = True,
         md_remove_drift: bool = True,
+        enforce_molecular_integrity: bool = True,
+        molecular_bond_stretch_factor: float = 1.35,
+        molecular_bond_abs_tol: float = 0.35,
         **kwargs,
     ):
         if isinstance(atoms, str):
@@ -409,6 +413,9 @@ class AdsorbateCMC(SurfaceMCBase):
         self.md_planar_axis = int(md_planar_axis)
         self.md_init_momenta = bool(md_init_momenta)
         self.md_remove_drift = bool(md_remove_drift)
+        self.enforce_molecular_integrity = bool(enforce_molecular_integrity)
+        self.molecular_bond_stretch_factor = float(molecular_bond_stretch_factor)
+        self.molecular_bond_abs_tol = float(molecular_bond_abs_tol)
         if not (0.0 <= self.md_move_prob <= 1.0):
             raise ValueError("md_move_prob must be in [0, 1].")
         if self.md_steps < 1:
@@ -421,6 +428,10 @@ class AdsorbateCMC(SurfaceMCBase):
             raise ValueError("md_accept_mode must be 'potential' or 'hamiltonian'.")
         if self.md_planar_axis not in (0, 1, 2):
             raise ValueError("md_planar_axis must be 0, 1, or 2.")
+        if self.molecular_bond_stretch_factor <= 1.0:
+            raise ValueError("molecular_bond_stretch_factor must be > 1.")
+        if self.molecular_bond_abs_tol < 0.0:
+            raise ValueError("molecular_bond_abs_tol must be >= 0.")
         if self.md_accept_mode == "hamiltonian":
             if self.md_ensemble != "nve":
                 raise ValueError(
@@ -430,6 +441,7 @@ class AdsorbateCMC(SurfaceMCBase):
                 raise ValueError(
                     "md_accept_mode='hamiltonian' requires md_init_momenta=True."
                 )
+        self._template_bond_limits = self._build_template_bond_limits()
 
         self._update_indices()
         self.sum_E = 0.0
@@ -779,6 +791,66 @@ class AdsorbateCMC(SurfaceMCBase):
         if beta is None:
             beta = 1.0 / (KB_EV_PER_K * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
+
+    def _build_template_bond_limits(self) -> list[tuple[int, int, float]]:
+        if not self.is_molecular_adsorbate:
+            return []
+
+        positions = np.asarray(self.adsorbate_template.get_positions(), dtype=float)
+        symbols = list(self.adsorbate_template.get_chemical_symbols())
+        limits: list[tuple[int, int, float]] = []
+        for i in range(len(symbols)):
+            ri = float(covalent_radii[atomic_numbers[symbols[i]]])
+            for j in range(i + 1, len(symbols)):
+                rj = float(covalent_radii[atomic_numbers[symbols[j]]])
+                template_dist = float(np.linalg.norm(positions[j] - positions[i]))
+                if template_dist <= 1.2 * (ri + rj):
+                    max_dist = max(
+                        template_dist * self.molecular_bond_stretch_factor,
+                        template_dist + self.molecular_bond_abs_tol,
+                    )
+                    limits.append((i, j, max_dist))
+        return limits
+
+    def _group_matches_template_connectivity(
+        self,
+        group: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> bool:
+        if atoms is None:
+            atoms = self.atoms
+        if not self.is_molecular_adsorbate or not self.enforce_molecular_integrity:
+            return True
+        if not self._template_bond_limits:
+            return True
+
+        group = np.asarray(group, dtype=int)
+        if len(group) != self.adsorbate_size:
+            return False
+
+        for local_i, local_j, max_dist in self._template_bond_limits:
+            dist = float(
+                atoms.get_distance(int(group[local_i]), int(group[local_j]), mic=True)
+            )
+            if dist > max_dist:
+                return False
+        return True
+
+    def _molecular_adsorbates_are_intact(self, atoms: Optional[Atoms] = None) -> bool:
+        if atoms is None:
+            atoms = self.atoms
+        if not self.is_molecular_adsorbate or not self.enforce_molecular_integrity:
+            return True
+
+        groups = self._adsorbate_groups_for_atoms(atoms)
+        if not groups:
+            return True
+        return all(
+            self._group_matches_template_connectivity(
+                np.asarray(group, dtype=int), atoms=atoms
+            )
+            for group in groups
+        )
 
     def _apply_planar_constraint(self, atoms_obj: Atoms) -> None:
         if not self.md_planar:
@@ -1307,14 +1379,9 @@ class AdsorbateCMC(SurfaceMCBase):
         interval: int = 10,
         sample_interval: int = 1,
         equilibration: int = 0,
+        sweeps_are_total: bool = True,
     ) -> Dict[str, float]:
         self.traj_file = traj_file
-
-        traj_writer = self._get_traj_writer(self.traj_file)
-        accepted_writer = self._get_traj_writer(self.accepted_traj_file)
-        rejected_writer = self._get_traj_writer(self.rejected_traj_file)
-        attempted_writer = self._get_traj_writer(self.attempted_traj_file)
-        thermo_handle = self._get_thermo_handle()
 
         target_sweeps = int(nsweeps)
         if not self._resumed_from_checkpoint:
@@ -1326,12 +1393,29 @@ class AdsorbateCMC(SurfaceMCBase):
             self.md_attempted_moves = 0
             self.md_accepted_moves = 0
         self._resumed_from_checkpoint = False
-        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
+        remaining_sweeps = (
+            max(0, target_sweeps - int(self.sweep))
+            if bool(sweeps_are_total)
+            else target_sweeps
+        )
 
         if len(self.ads_groups) == 0:
             logger.warning("AdsorbateCMC run started with no adsorbates present.")
+        if not self._molecular_adsorbates_are_intact(self.atoms):
+            raise RuntimeError(
+                "Current molecular adsorbate state violates the template bond graph. "
+                "Start from an intact adsorbate or disable molecular-integrity enforcement."
+            )
 
-        for _ in range(remaining_sweeps):
+        chunk_mode = not bool(sweeps_are_total)
+
+        traj_writer = self._get_traj_writer(self.traj_file)
+        accepted_writer = self._get_traj_writer(self.accepted_traj_file)
+        rejected_writer = self._get_traj_writer(self.rejected_traj_file)
+        attempted_writer = self._get_traj_writer(self.attempted_traj_file)
+        thermo_handle = self._get_thermo_handle()
+
+        for local_sweep in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             moves_this_sweep = self._moves_per_sweep()
 
@@ -1359,6 +1443,11 @@ class AdsorbateCMC(SurfaceMCBase):
                         support_xy_tol=self.support_xy_tol,
                         z_max_support=self.z_max_support,
                     ):
+                        if rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
+                    if not self._molecular_adsorbates_are_intact(atoms_trial):
                         if rejected_writer is not None:
                             rejected_writer.write(atoms_trial)
                         continue
@@ -1399,6 +1488,11 @@ class AdsorbateCMC(SurfaceMCBase):
                             rejected_writer.write(atoms_trial)
                         continue
 
+                    if not self._molecular_adsorbates_are_intact(atoms_trial):
+                        if rejected_writer is not None:
+                            rejected_writer.write(atoms_trial)
+                        continue
+
                 if self.has_afloat_adsorbates(
                     atoms_trial,
                     support_xy_tol=self.support_xy_tol,
@@ -1425,13 +1519,16 @@ class AdsorbateCMC(SurfaceMCBase):
 
             self.sweep += 1
             completed_sweep = int(self.sweep)
+            local_completed_sweep = local_sweep + 1
 
-            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
+            sample_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if sample_counter > equilibration and sample_counter % sample_interval == 0:
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
                 self.n_samples += 1
 
-            if completed_sweep % interval == 0:
+            report_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if report_counter % interval == 0:
                 traj_writer.write(self.atoms)
                 if thermo_handle is None:
                     with open(self.thermo_file, "a") as handle:

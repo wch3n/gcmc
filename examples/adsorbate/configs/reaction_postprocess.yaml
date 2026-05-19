@@ -1,0 +1,127 @@
+parent:
+  traj:
+    - replica_295K.traj
+    - replica_303K.traj
+    - replica_312K.traj
+  start: 900
+  stop: null
+  step: 1
+
+site_analysis:
+  site_elements: [Ti, Zr, Mo]
+  substrate_elements: [Ti, Zr, Mo, C]
+  functional_elements: [O]
+  site_types: [atop, fcc, hcp]
+  surface_side: top
+  anchor_element: O
+  shell1_size: 6
+  shell2_size: 6
+  functional_cutoff: 3.0
+  surface_layer_tol: 0.5
+  site_match_tol: 0.6
+  support_xy_tol: 1.2
+  termination_site_xy_tol: 2.2
+  vertical_offset: 1.5
+  termination_clearance: 0.8
+
+selection:
+  aggregate_group_by: site
+  representative_top_k: 10
+  representative_n_per_group: 1
+
+calculator:
+  calculator: symmetrix
+  model_file: model.json
+  device: cuda
+  use_kokkos: true
+
+output:
+  output_dir: reaction_postprocess
+  out_prefix: parent_sites
+  write_per_trajectory: true
+  write_representatives: true
+  write_site_directories: true
+  sites_dir: sites
+  reactions_dir: reactions
+  reaction_state_dirs: [00_clean, 01_OH, 02_O, 03_OOH]
+
+candidate_generation:
+  enabled: true
+  include_original_o_site: true
+  include_nearby_o_sites: true
+  nearby_site_radius_A: 3.0
+  max_nearby_sites: 8
+  ooh_orientations: 8
+
+state_relaxation:
+  enabled: false
+  states: [00_clean, 01_OH, 02_O, 03_OOH]
+  fmax: 0.05
+  steps: 300
+  progress_log: state_relaxation.log
+  progress_stdout: true
+  max_candidates_per_state: null
+  skip_existing: true
+  enforce_adsorbate_integrity: true
+  adsorbate_bond_detection_factor: 1.2
+  adsorbate_bond_stretch_factor: 1.35
+  adsorbate_bond_abs_tol_A: 0.35
+
+vibrations:
+  enabled: false
+  temperature_K: 303.0
+  slab_cutoff_A: 3.5
+  delta_A: 0.01
+  nfree: 2
+  ignore_imag_modes: false
+  states: [clean, oh, o, ooh]
+  skip_existing: true
+  progress_log: vibration.log
+  progress_stdout: true
+
+reference_thermo:
+  enabled: false
+  molecules: [H2, H2O, O2]
+  output_dir: references
+  skip_existing: true
+  overwrite_che_references: false
+  vacuum_A: 8.0
+  temperature_K: 303.0
+  pressure_Pa: 101325.0
+  h2:
+    energy_eV: null
+    correction_eV: 0.0
+    pressure_Pa: 101325.0
+  h2o:
+    energy_eV: null
+    correction_eV: 0.0
+    pressure_Pa: 101325.0
+  o2:
+    energy_eV: null
+    correction_eV: 0.0
+    pressure_Pa: 101325.0
+    geometry: linear
+    symmetrynumber: 2
+    spin: 1.0
+  relaxation:
+    enabled: true
+    fmax: 0.001
+    steps: 1000
+    log_file: relax.log
+    progress_log: reference_thermo.log
+    progress_stdout: true
+  vibrations:
+    delta_A: 0.01
+    nfree: 2
+    ignore_imag_modes: false
+
+che:
+  enabled: false
+  clean_reference_mode: lowest_energy
+  use_vibrational_free_energies: true
+  oer_reference_mode: auto
+  total_oer_free_energy_eV: 4.92
+  equilibrium_potential_V: 1.23
+  boltzmann_weight_states: true
+  boltzmann_temperature_K: 303.0
+  boltzmann_energy_cluster_tol_eV: 0.01

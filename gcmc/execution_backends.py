@@ -6,7 +6,12 @@ from typing import Any, Dict, Optional
 
 from scipy.spatial import cKDTree
 
-from .process_replica import ReplicaWorker, ctx, _restore_atoms_from_snapshot
+from .process_replica import (
+    ReplicaWorker,
+    ctx,
+    _restore_atoms_from_snapshot,
+    _snapshot_matches_atoms,
+)
 
 logger = logging.getLogger("mc")
 
@@ -121,6 +126,8 @@ class _RayReplicaActor:
             checkpoint_file="placeholder.pkl",
             **self.worker_init_info["mc_kwargs"],
         )
+        if hasattr(self.sim, "_reuse_io"):
+            self.sim._reuse_io = True
 
     def run_task(self, replica_id: int, data: Dict[str, Any]) -> Any:
         try:
@@ -128,6 +135,8 @@ class _RayReplicaActor:
             sim.T = data["T"]
             if "mu" in data:
                 sim.mu = data["mu"]
+
+            snapshot_changed = not _snapshot_matches_atoms(sim.atoms, data)
 
             if len(sim.atoms) != len(data["positions"]):
                 sim.atoms = _restore_atoms_from_snapshot(
@@ -145,7 +154,8 @@ class _RayReplicaActor:
                     sim.atoms.set_tags(data["tags"])
                 sim.atoms.set_cell(data["cell"])
                 sim.atoms.pbc = data["pbc"]
-            sim._refresh_cached_state()
+            if snapshot_changed:
+                sim._refresh_cached_state()
 
             if data.get("e_old") is not None:
                 sim.e_old = data["e_old"]
@@ -166,6 +176,7 @@ class _RayReplicaActor:
                 interval=data["report_interval"],
                 sample_interval=data["sample_interval"],
                 equilibration=data["eq_steps"],
+                sweeps_are_total=False,
             )
 
             return {
@@ -230,6 +241,7 @@ class RayReplicaBackend(ReplicaExecutionBackend):
         self._actors_by_gpu = {}
         self._next_actor_by_gpu = {}
         self._pending_refs = []
+        self._pending_ref_info = {}
         self._placement_group = None
         self._remove_placement_group = None
         self._owns_placement_group = False
@@ -248,6 +260,12 @@ class RayReplicaBackend(ReplicaExecutionBackend):
             self._owns_ray_runtime = True
 
         actor_options = dict(self.backend_kwargs.get("actor_options", {}))
+        actor_options.setdefault(
+            "max_restarts", int(self.backend_kwargs.get("max_restarts", 0))
+        )
+        actor_options.setdefault(
+            "max_task_retries", int(self.backend_kwargs.get("max_task_retries", 0))
+        )
         if "num_gpus" in actor_options:
             num_gpus_per_actor = float(actor_options["num_gpus"])
             if num_gpus_per_actor < 0:
@@ -350,17 +368,51 @@ class RayReplicaBackend(ReplicaExecutionBackend):
         actor_pool = self._actors_by_gpu[target_gpu]
         if not actor_pool:
             raise RuntimeError(f"No Ray workers available for GPU slot {target_gpu}.")
-        idx = self._next_actor_by_gpu[target_gpu]
+        idx = (int(replica_id) // self.n_gpus) % len(actor_pool)
         actor = actor_pool[idx]
-        self._next_actor_by_gpu[target_gpu] = (idx + 1) % len(actor_pool)
-        self._pending_refs.append(actor.run_task.remote(replica_id, task_data))
+        ref = actor.run_task.remote(replica_id, task_data)
+        self._pending_refs.append(ref)
+        self._pending_ref_info[ref] = {
+            "replica_id": int(replica_id),
+            "target_gpu": int(target_gpu),
+            "temperature": float(task_data.get("T", float("nan"))),
+            "mu": task_data.get("mu"),
+            "traj_file": task_data.get("traj_file"),
+        }
 
     def get_result(self) -> Any:
         if not self._pending_refs:
             raise RuntimeError("No pending Ray tasks to collect.")
-        ready, pending = self._ray.wait(self._pending_refs, num_returns=1)
+        timeout_s = self.backend_kwargs.get("get_result_timeout_s", None)
+        ready, pending = self._ray.wait(
+            self._pending_refs,
+            num_returns=1,
+            timeout=None if timeout_s is None else float(timeout_s),
+        )
+        if not ready:
+            raise TimeoutError(
+                "Timed out waiting for a Ray replica worker result "
+                f"after {float(timeout_s):.1f}s with {len(self._pending_refs)} tasks pending."
+            )
         self._pending_refs = pending
-        return self._ray.get(ready[0])
+        ref = ready[0]
+        task_info = self._pending_ref_info.pop(ref, {})
+        try:
+            return self._ray.get(ref)
+        except Exception as exc:
+            replica_id = task_info.get("replica_id", "unknown")
+            target_gpu = task_info.get("target_gpu", "unknown")
+            temperature = task_info.get("temperature", float("nan"))
+            mu = task_info.get("mu", None)
+            traj_file = task_info.get("traj_file", "")
+            details = (
+                f"replica_id={replica_id}, target_gpu={target_gpu}, "
+                f"T={temperature}, "
+                f"mu={mu}, traj_file={traj_file}"
+            )
+            raise RuntimeError(
+                f"Ray replica worker failed while executing {details}: {exc}"
+            ) from exc
 
     def stop(self) -> None:
         if self._ray is not None:
@@ -373,6 +425,7 @@ class RayReplicaBackend(ReplicaExecutionBackend):
         self._actors_by_gpu = {}
         self._next_actor_by_gpu = {}
         self._pending_refs = []
+        self._pending_ref_info = {}
         if (
             self._owns_placement_group
             and self._placement_group is not None

@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -9,11 +10,17 @@ from unittest import mock
 import numpy as np
 from ase import Atoms
 from ase.constraints import FixAtoms, FixCartesian
+from ase.io import read
 
+from gcmc.constants import ADSORBATE_TAG_OFFSET
+from gcmc.utils import initialize_surface_adsorbates
 from gcmc.workflows import (
+    AdsorbateCMCWorkflow,
     AdsorbateGCMCScanWorkflow,
     _prepare_adsorbate_scan_atoms,
     _prepare_alloy_atoms,
+    _write_site_overlay_if_requested,
+    load_adsorbate_cmc_config,
 )
 
 
@@ -140,6 +147,186 @@ class TestWorkflowLayerZConstraints(unittest.TestCase):
         self.assertIsNotNone(fixed)
         self.assertTrue(np.array_equal(np.sort(cartesian.get_indices()), np.array([4, 5])))
         self.assertTrue(np.array_equal(np.sort(fixed.get_indices()), np.array([7])))
+
+    def test_adsorbate_cmc_output_dir_prefixes_relative_outputs(self):
+        cfg = SimpleNamespace(
+            snapshot="dummy.traj",
+            frame=0,
+            output_dir="/tmp/adsorbate_cmc_outputs",
+            output_prefix="seed_067/out",
+        )
+        workflow = AdsorbateCMCWorkflow(cfg, calculator_factory=lambda *_: None)
+
+        output_paths = workflow._build_output_paths()
+
+        self.assertEqual(
+            output_paths["traj_file"],
+            "/tmp/adsorbate_cmc_outputs/seed_067/out.traj",
+        )
+        self.assertEqual(
+            output_paths["thermo_file"],
+            "/tmp/adsorbate_cmc_outputs/seed_067/out.dat",
+        )
+        self.assertEqual(
+            output_paths["checkpoint_file"],
+            "/tmp/adsorbate_cmc_outputs/seed_067/out.pkl",
+        )
+        self.assertEqual(
+            output_paths["initial_traj_file"],
+            "/tmp/adsorbate_cmc_outputs/seed_067/out_initial.traj",
+        )
+        self.assertEqual(
+            output_paths["site_overlay_file"],
+            "/tmp/adsorbate_cmc_outputs/seed_067/out_sites.traj",
+        )
+
+    def test_load_adsorbate_cmc_config_preserves_relative_output_prefix_with_output_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                """
+system:
+  snapshot: slab.traj
+cmc:
+  seed: 67
+output:
+  output_dir: results
+  output_prefix: seed_067/out
+""".strip()
+            )
+
+            cfg = load_adsorbate_cmc_config(config_path)
+
+        self.assertEqual(cfg.output_dir, str((Path(tmpdir) / "results").resolve()))
+        self.assertEqual(cfg.output_prefix, "seed_067/out")
+
+    def test_adsorbate_cmc_multi_seed_run_writes_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = SimpleNamespace(
+                snapshot="dummy.traj",
+                frame=0,
+                temperature=300.0,
+                move_mode="hybrid",
+                enable_hybrid_md=False,
+                md_move_prob=0.0,
+                md_steps=0,
+                md_timestep_fs=1.0,
+                md_planar=False,
+                nsweeps=10,
+                write_interval=2,
+                sample_interval=1,
+                equilibration=0,
+                seed=81,
+                seeds=[67, 68],
+                backend="multiprocessing",
+                n_workers=1,
+                output_dir=tmpdir,
+                output_prefix="out",
+            )
+            workflow = AdsorbateCMCWorkflow(cfg, calculator_factory=lambda *_: None)
+
+            def _fake_single_seed(seed, *, multi_seed, task=None, emit_status=True):
+                output_paths = workflow._build_output_paths(
+                    seed=seed, multi_seed=multi_seed
+                )
+                return (
+                    {
+                        "acceptance": 10.0 + seed,
+                        "energy": -1.0 * seed,
+                        "cv": 0.1 * seed,
+                    },
+                    output_paths,
+                    {},
+                )
+
+            def _fake_runner(tasks, run_one, *, n_workers, status_formatter=None):
+                results = []
+                for task in tasks:
+                    result = run_one(task)
+                    results.append(result)
+                    if status_formatter is not None:
+                        status_formatter(result)
+                return results
+
+            with mock.patch.object(workflow, "_run_single_seed", side_effect=_fake_single_seed):
+                with mock.patch(
+                    "gcmc.workflows.run_tasks_with_multiprocessing",
+                    side_effect=_fake_runner,
+                ):
+                    results = workflow.run()
+
+            self.assertEqual([row["seed"] for row in results], [67, 68])
+            self.assertEqual(
+                results[0]["traj_file"],
+                str(Path(tmpdir) / "seed_067" / "out.traj"),
+            )
+            self.assertTrue((Path(tmpdir) / "summary.csv").is_file())
+
+    def test_write_site_overlay_if_requested_creates_overlay_traj(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            atoms = _make_two_sided_mxene_like_slab()
+            cfg = SimpleNamespace(
+                write_site_overlay=True,
+                site_overlay_include_blocked=True,
+                site_overlay_z_field="suggested_z_A",
+                site_elements=["Ti", "Zr", "Mo"],
+                top_layer_element=None,
+                substrate_elements=["Ti", "Zr", "Mo", "C"],
+                surface_side="top",
+                site_type=["atop", "fcc", "hcp"],
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                bridge_cutoff=None,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.5,
+                termination_clearance=0.0,
+            )
+            out_path = Path(tmpdir) / "sites.traj"
+
+            _write_site_overlay_if_requested(
+                atoms,
+                cfg,
+                output_file=out_path,
+                functional_elements=("O",),
+            )
+
+            self.assertTrue(out_path.is_file())
+            overlay = read(out_path)
+            self.assertGreater(len(overlay), len(atoms))
+
+
+class TestMolecularFixedCountInitialization(unittest.TestCase):
+    def test_initialize_surface_adsorbates_tags_molecular_groups(self):
+        atoms = _make_two_sided_mxene_like_slab()
+        adsorbate = Atoms(
+            symbols=["O", "H"],
+            positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)],
+        )
+
+        initialized, _, _ = initialize_surface_adsorbates(
+            atoms,
+            adsorbate=adsorbate,
+            n_adsorbates=1,
+            site_elements=["Ti", "Zr", "Mo"],
+            substrate_elements=["Ti", "Zr", "Mo", "C"],
+            surface_side="top",
+            site_types=["atop"],
+            layer_tol=0.5,
+            xy_tol=0.6,
+            support_xy_tol=1.2,
+            termination_elements=["O"],
+            min_termination_dist=0.8,
+            anchor_index=0,
+            seed=67,
+        )
+
+        tags = np.asarray(initialized.get_tags(), dtype=int)
+        added_tags = tags[len(atoms) :]
+
+        self.assertEqual(len(added_tags), 2)
+        self.assertTrue(np.all(added_tags >= ADSORBATE_TAG_OFFSET))
+        self.assertEqual(len(np.unique(added_tags)), 1)
 
 
 class _FakeRayModule:

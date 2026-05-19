@@ -30,6 +30,28 @@ def _restore_atoms_from_snapshot(
     return atoms
 
 
+def _snapshot_matches_atoms(atoms: Atoms, data) -> bool:
+    """Return True when an incoming snapshot is identical to the current atoms state."""
+    if len(atoms) != len(data["positions"]):
+        return False
+    if not np.array_equal(atoms.get_positions(), np.asarray(data["positions"], dtype=float)):
+        return False
+    if not np.array_equal(
+        atoms.get_atomic_numbers(), np.asarray(data["numbers"], dtype=int)
+    ):
+        return False
+    incoming_tags = data.get("tags")
+    if incoming_tags is not None and not np.array_equal(
+        atoms.get_tags(), np.asarray(incoming_tags, dtype=int)
+    ):
+        return False
+    if not np.array_equal(atoms.get_cell().array, np.asarray(data["cell"], dtype=float)):
+        return False
+    if not np.array_equal(atoms.get_pbc(), np.asarray(data["pbc"], dtype=bool)):
+        return False
+    return True
+
+
 class ReplicaWorker(ctx.Process):
     def __init__(self, rank, device_id, task_queue, result_queue, init_kwargs):
         super().__init__()
@@ -91,6 +113,8 @@ class ReplicaWorker(ctx.Process):
                 if "mu" in data:
                     sim.mu = data["mu"]
 
+                snapshot_changed = not _snapshot_matches_atoms(sim.atoms, data)
+
                 # Safely refresh atom container when atom count changes.
                 if len(sim.atoms) != len(data["positions"]):
                     sim.atoms = _restore_atoms_from_snapshot(
@@ -109,7 +133,8 @@ class ReplicaWorker(ctx.Process):
                     sim.atoms.set_cell(data["cell"])
                     sim.atoms.pbc = data["pbc"]
 
-                sim._refresh_cached_state()
+                if snapshot_changed:
+                    sim._refresh_cached_state()
 
                 if data.get("e_old") is not None:
                     sim.e_old = data["e_old"]
@@ -132,6 +157,7 @@ class ReplicaWorker(ctx.Process):
                     interval=data["report_interval"],
                     sample_interval=data["sample_interval"],
                     equilibration=data["eq_steps"],
+                    sweeps_are_total=False,
                 )
 
                 # Return results.

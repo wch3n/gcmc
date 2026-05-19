@@ -357,6 +357,42 @@ class TestResumeTargets(unittest.TestCase):
             self.assertEqual(resumed.sweep, 5)
             self.assertEqual(resumed.n_samples, 3)
 
+    def test_adsorbate_cmc_chunk_mode_runs_additional_sweeps(self):
+        sim = AdsorbateCMC(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.5,
+            seed=33,
+        )
+        sim._moves_per_sweep = lambda: 0
+        sim.sweep = 3
+        sim.accepted_traj_file = None
+        sim.rejected_traj_file = None
+        sim.attempted_traj_file = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "cmc.dat")
+            sim.run(
+                nsweeps=2,
+                traj_file=str(Path(tmpdir) / "cmc.traj"),
+                interval=10,
+                sample_interval=1,
+                equilibration=1,
+                sweeps_are_total=False,
+            )
+
+        self.assertEqual(sim.sweep, 5)
+        self.assertEqual(sim.n_samples, 1)
+
     def test_adsorbate_gcmc_resume_uses_total_target_sweeps(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = str(Path(tmpdir) / "ads_gcmc.pkl")
@@ -427,6 +463,42 @@ class TestResumeTargets(unittest.TestCase):
             self.assertEqual(resumed.sweep, 5)
             self.assertEqual(resumed.n_samples, 3)
 
+    def test_adsorbate_gcmc_chunk_mode_runs_additional_sweeps(self):
+        sim = AdsorbateGCMC(
+            atoms=_make_two_site_surface(),
+            calculator=ZeroCalculator(),
+            mu=-1.0,
+            T=300.0,
+            max_n_adsorbates=2,
+            site_elements=("O",),
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.0,
+            seed=39,
+        )
+        sim.sweep = 3
+        sim.accepted_traj_file = None
+        sim.rejected_traj_file = None
+        sim.attempted_traj_file = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "gcmc.dat")
+            sim.run(
+                nsweeps=2,
+                traj_file=str(Path(tmpdir) / "gcmc.traj"),
+                interval=10,
+                sample_interval=1,
+                equilibration=1,
+                max_moves=0,
+                sweeps_are_total=False,
+            )
+
+        self.assertEqual(sim.sweep, 5)
+        self.assertEqual(sim.n_samples, 1)
+
     def test_alloy_cmc_resume_uses_total_target_sweeps(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = str(Path(tmpdir) / "alloy.pkl")
@@ -462,6 +534,162 @@ class TestResumeTargets(unittest.TestCase):
 
             self.assertEqual(resumed.sweep, 5)
             self.assertEqual(resumed.n_samples, 3)
+
+    def test_alloy_cmc_chunk_mode_runs_additional_sweeps(self):
+        sim = AlloyCMC(
+            atoms=_make_ti_zr_alloy(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            swap_elements=["Ti", "Zr"],
+            seed=43,
+        )
+        sim.swap_indices = []
+        sim.sweep = 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "alloy.dat")
+            sim.run(
+                nsweeps=2,
+                traj_file=str(Path(tmpdir) / "alloy.traj"),
+                interval=10,
+                sample_interval=1,
+                equilibration=1,
+                sweeps_are_total=False,
+            )
+
+        self.assertEqual(sim.sweep, 5)
+        self.assertEqual(sim.n_samples, 1)
+
+
+class TestMolecularIntegrity(unittest.TestCase):
+    def _make_cmc_sim(self, **overrides) -> AdsorbateCMC:
+        data = dict(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.5,
+            seed=43,
+        )
+        data.update(overrides)
+        return AdsorbateCMC(**data)
+
+    def _make_gcmc_sim(self, **overrides) -> AdsorbateGCMC:
+        data = dict(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            mu=-1.0,
+            T=300.0,
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            max_n_adsorbates=1,
+            site_elements=("Ti",),
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_type="atop",
+            move_mode="hybrid",
+            site_hop_prob=0.5,
+            reorientation_prob=0.5,
+            seed=47,
+        )
+        data.update(overrides)
+        return AdsorbateGCMC(**data)
+
+    def test_detects_dissociated_molecular_adsorbate(self):
+        sim = self._make_cmc_sim()
+        trial = sim.atoms.copy()
+        trial.positions[2] = np.array([0.0, 0.0, 4.5], dtype=float)
+
+        self.assertFalse(sim._molecular_adsorbates_are_intact(trial))
+        self.assertTrue(sim._molecular_adsorbates_are_intact(sim.atoms))
+
+    def test_run_rejects_dissociated_starting_state(self):
+        sim = self._make_cmc_sim()
+        sim.atoms.positions[2] = np.array([0.0, 0.0, 4.5], dtype=float)
+        sim._moves_per_sweep = lambda: 0
+        sim.accepted_traj_file = None
+        sim.rejected_traj_file = None
+        sim.attempted_traj_file = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "cmc.dat")
+            with self.assertRaisesRegex(RuntimeError, "template bond graph"):
+                sim.run(
+                    nsweeps=1,
+                    traj_file=str(Path(tmpdir) / "cmc.traj"),
+                    interval=10,
+                    sample_interval=1,
+                    equilibration=0,
+                )
+
+    def test_cmc_md_rejects_dissociated_trial(self):
+        sim = self._make_cmc_sim(
+            enable_hybrid_md=True,
+            md_move_prob=1.0,
+            md_steps=1,
+        )
+        sim._moves_per_sweep = lambda: 1
+        sim.accepted_traj_file = None
+        sim.rejected_traj_file = None
+        sim.attempted_traj_file = None
+        original_positions = sim.atoms.positions.copy()
+
+        dissociated = sim.atoms.copy()
+        dissociated.positions[2] = np.array([0.0, 0.0, 4.5], dtype=float)
+        sim._propose_md_move = lambda: (dissociated, -1.0, -1.0)
+        sim._metropolis_accept = lambda *args, **kwargs: True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "cmc.dat")
+            sim.run(
+                nsweeps=1,
+                traj_file=str(Path(tmpdir) / "cmc.traj"),
+                interval=10,
+                sample_interval=1,
+                equilibration=0,
+            )
+
+        self.assertEqual(sim.accepted_moves, 0)
+        self.assertEqual(sim.md_accepted_moves, 0)
+        self.assertTrue(np.allclose(sim.atoms.positions, original_positions))
+
+    def test_gcmc_md_rejects_dissociated_trial(self):
+        sim = self._make_gcmc_sim(
+            enable_hybrid_md=True,
+            md_move_prob=1.0,
+            md_steps=1,
+        )
+        sim.accepted_traj_file = None
+        sim.rejected_traj_file = None
+        sim.attempted_traj_file = None
+        original_positions = sim.atoms.positions.copy()
+
+        dissociated = sim.atoms.copy()
+        dissociated.positions[2] = np.array([0.0, 0.0, 4.5], dtype=float)
+        sim._propose_md_move = lambda: (dissociated, -1.0, -1.0)
+        sim._metropolis_accept = lambda *args, **kwargs: True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.thermo_file = str(Path(tmpdir) / "gcmc.dat")
+            sim.run(
+                nsweeps=1,
+                traj_file=str(Path(tmpdir) / "gcmc.traj"),
+                interval=10,
+                sample_interval=1,
+                equilibration=0,
+                max_moves=1,
+            )
+
+        self.assertEqual(sim.accepted_moves, 0)
+        self.assertEqual(sim.md_accepted_moves, 0)
+        self.assertTrue(np.allclose(sim.atoms.positions, original_positions))
 
 
 class TestAdsorbateCMCReorientation(unittest.TestCase):

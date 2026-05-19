@@ -18,6 +18,8 @@ from ase.symbols import string2symbols
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import Delaunay
 
+from .constants import ADSORBATE_TAG_OFFSET
+
 
 def _cluster_axis_values(values: np.ndarray, tol: float) -> List[np.ndarray]:
     """Cluster sorted 1D coordinates using a simple absolute tolerance."""
@@ -1081,14 +1083,25 @@ def initialize_surface_adsorbates(
 
     selected_support_groups = []
     atoms_new = atoms.copy()
+    tags = np.asarray(atoms_new.get_tags(), dtype=int)
+    if len(tags) != len(atoms_new):
+        tags = np.zeros(len(atoms_new), dtype=int)
+    next_group_id = int(np.max(tags[tags >= ADSORBATE_TAG_OFFSET]) - ADSORBATE_TAG_OFFSET + 1) if np.any(tags >= ADSORBATE_TAG_OFFSET) else 0
     for site in selected_sites:
+        start = len(atoms_new)
         atoms_new, support_indices = place_adsorbate_on_site(
             atoms_new,
             adsorbate_template,
             site,
             anchor_index=anchor_index,
         )
+        stop = len(atoms_new)
+        group_tag = ADSORBATE_TAG_OFFSET + next_group_id
+        if stop > start:
+            tags = np.append(tags, np.full(stop - start, group_tag, dtype=int))
+            next_group_id += 1
         selected_support_groups.append(np.asarray(support_indices, dtype=int))
+    atoms_new.set_tags(tags)
 
     selected_support_indices = (
         np.unique(np.concatenate(selected_support_groups))

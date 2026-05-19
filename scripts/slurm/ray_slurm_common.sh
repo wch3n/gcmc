@@ -1,5 +1,8 @@
 #!/bin/bash
 
+RAY_SLURM_NODES=()
+RAY_SLURM_PIDS=()
+
 ray_slurm_require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "ERROR: required command not found: $1" >&2
@@ -37,13 +40,13 @@ ray_slurm_init() {
 }
 
 ray_slurm_stop() {
-  if [[ ${#RAY_SLURM_NODES[@]:-} -gt 0 ]]; then
+  if [[ ${#RAY_SLURM_NODES[@]} -gt 0 ]]; then
     for n in "${RAY_SLURM_NODES[@]}"; do
       srun -N1 -n1 -w "$n" ray stop --force >/dev/null 2>&1 || true
     done
   fi
 
-  if [[ ${#RAY_SLURM_PIDS[@]:-} -gt 0 ]]; then
+  if [[ ${#RAY_SLURM_PIDS[@]} -gt 0 ]]; then
     for pid in "${RAY_SLURM_PIDS[@]}"; do
       kill "$pid" >/dev/null 2>&1 || true
     done

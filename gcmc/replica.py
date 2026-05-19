@@ -4,6 +4,7 @@ import os
 import pickle
 import time
 from ase import Atoms
+from ase.io import Trajectory
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
 from .execution_backends import build_replica_backend
 from .process_replica import _restore_atoms_from_snapshot
@@ -88,7 +89,9 @@ class ReplicaExchange:
         self.stats_file = stats_file
         self.results_file = results_file
         self.checkpoint_file = checkpoint_file
+        self.resume = bool(resume)
         self.cycle_start = 0
+        self._resume_outputs_prepared = False
         self.has_adsorbate_observables = any(
             (
                 _count_tagged_adsorbate_groups(state["atoms"]) > 0
@@ -130,7 +133,7 @@ class ReplicaExchange:
                     header += f",N_{el}_avg,chi_{el}"
                 f.write(header + "\n")
 
-        if resume and os.path.exists(self.checkpoint_file):
+        if self.resume and os.path.exists(self.checkpoint_file):
             self._load_master_checkpoint()
 
     def _start_workers(self):
@@ -285,6 +288,7 @@ class ReplicaExchange:
         )
 
     def run(self, n_cycles, equilibration_cycles=0):
+        self._prepare_resume_outputs()
         self._start_workers()
         logger.info(f"Starting PT Loop: Cycles {self.cycle_start} -> {n_cycles}")
         kB = KB_EV_PER_K
@@ -538,9 +542,166 @@ class ReplicaExchange:
             "seed_nonce": self.seed_nonce,
             "replica_snapshots": replica_snapshots,
         }
-        with open(self.checkpoint_file, "wb") as f:
-            pickle.dump(data, f)
+        self._atomic_pickle_dump(data, self.checkpoint_file)
         logger.info(f"Checkpoint cycle {cycle}")
+
+    @staticmethod
+    def _atomic_pickle_dump(data, path):
+        path = os.fspath(path)
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        tmp_path = os.path.join(
+            directory,
+            f".{os.path.basename(path)}.tmp.{os.getpid()}",
+        )
+        with open(tmp_path, "wb") as handle:
+            pickle.dump(data, handle)
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _atomic_write_lines(path, lines):
+        path = os.fspath(path)
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        tmp_path = os.path.join(
+            directory,
+            f".{os.path.basename(path)}.tmp.{os.getpid()}",
+        )
+        with open(tmp_path, "w") as handle:
+            handle.writelines(lines)
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _line_first_float(line):
+        stripped = line.strip()
+        if not stripped:
+            return None
+        try:
+            return float(stripped.replace(",", " ").split()[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _truncate_results_file_for_resume(self, cutoff_cycle):
+        if not os.path.exists(self.results_file):
+            return
+        kept = []
+        removed = 0
+        with open(self.results_file) as handle:
+            for line in handle:
+                value = self._line_first_float(line)
+                if value is None:
+                    kept.append(line)
+                elif value <= cutoff_cycle:
+                    kept.append(line)
+                else:
+                    removed += 1
+        if removed:
+            self._atomic_write_lines(self.results_file, kept)
+            logger.info(
+                "Resume cleanup: removed %d stale rows from %s after cycle %d.",
+                removed,
+                self.results_file,
+                cutoff_cycle,
+            )
+
+    def _truncate_stats_file_for_resume(self, cutoff_cycle):
+        if not os.path.exists(self.stats_file):
+            return
+        kept = []
+        removed = 0
+        with open(self.stats_file) as handle:
+            for line in handle:
+                value = self._line_first_float(line)
+                if value is None:
+                    kept.append(line)
+                elif value < cutoff_cycle:
+                    kept.append(line)
+                else:
+                    removed += 1
+        if removed:
+            self._atomic_write_lines(self.stats_file, kept)
+            logger.info(
+                "Resume cleanup: removed %d stale rows from %s at/after cycle %d.",
+                removed,
+                self.stats_file,
+                cutoff_cycle,
+            )
+
+    def _truncate_thermo_file_for_resume(self, path, cutoff_sweep):
+        if not os.path.exists(path):
+            return None
+        kept = []
+        kept_data_rows = 0
+        removed = 0
+        with open(path) as handle:
+            for line in handle:
+                value = self._line_first_float(line)
+                if value is None:
+                    kept.append(line)
+                elif value <= cutoff_sweep:
+                    kept.append(line)
+                    kept_data_rows += 1
+                else:
+                    removed += 1
+        if removed:
+            self._atomic_write_lines(path, kept)
+            logger.info(
+                "Resume cleanup: removed %d stale rows from %s after sweep %d.",
+                removed,
+                path,
+                cutoff_sweep,
+            )
+        return kept_data_rows
+
+    def _truncate_traj_file_for_resume(self, path, keep_frames):
+        if keep_frames is None or not os.path.exists(path):
+            return
+        keep_frames = int(keep_frames)
+        traj = Trajectory(path)
+        n_frames = len(traj)
+        if n_frames <= keep_frames:
+            traj.close()
+            return
+
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        tmp_path = os.path.join(
+            directory,
+            f".{os.path.basename(path)}.tmp.{os.getpid()}",
+        )
+        writer = Trajectory(tmp_path, "w")
+        try:
+            for idx in range(keep_frames):
+                writer.write(traj[idx])
+        finally:
+            writer.close()
+            traj.close()
+        os.replace(tmp_path, path)
+        logger.info(
+            "Resume cleanup: truncated %s from %d to %d frames.",
+            path,
+            n_frames,
+            keep_frames,
+        )
+
+    def _prepare_resume_outputs(self):
+        if (
+            not self.resume
+            or self._resume_outputs_prepared
+            or self.cycle_start <= 0
+        ):
+            return
+
+        cutoff_cycle = int(self.cycle_start)
+        cutoff_sweep = int(cutoff_cycle * self.swap_interval)
+        self._truncate_results_file_for_resume(cutoff_cycle)
+        self._truncate_stats_file_for_resume(cutoff_cycle)
+
+        for state in self.replica_states:
+            keep_frames = self._truncate_thermo_file_for_resume(
+                state["thermo_file"],
+                cutoff_sweep,
+            )
+            self._truncate_traj_file_for_resume(state["traj_file"], keep_frames)
+
+        self._resume_outputs_prepared = True
 
     def _load_master_checkpoint(self):
         with open(self.checkpoint_file, "rb") as f:

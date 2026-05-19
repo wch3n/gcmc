@@ -11,6 +11,8 @@ def _make_fake_ray_module():
     mod._initialized = False
     mod.init_calls = []
     mod.actor_option_calls = []
+    mod.wait_result = None
+    mod.get_map = {}
 
     def is_initialized():
         return mod._initialized
@@ -38,12 +40,20 @@ def _make_fake_ray_module():
     def shutdown():
         mod._initialized = False
 
+    def wait(refs, num_returns=1, timeout=None):
+        if mod.wait_result is not None:
+            return mod.wait_result
+        ready = list(refs[:num_returns])
+        pending = list(refs[num_returns:])
+        return ready, pending
+
     mod.is_initialized = is_initialized
     mod.init = init
     mod.remote = remote
     mod.kill = kill
     mod.shutdown = shutdown
-    mod.get = lambda _obj: None
+    mod.wait = wait
+    mod.get = lambda obj: mod.get_map.get(obj)
     return mod
 
 
@@ -80,6 +90,36 @@ class RayBackendConfigTests(unittest.TestCase):
         self.assertTrue(
             all(abs(opts["num_gpus"] - 0.25) < 1e-12 for opts in fake_ray.actor_option_calls)
         )
+
+    def test_actor_retry_policy_defaults_to_fail_fast(self):
+        fake_ray = _make_fake_ray_module()
+        with patch.dict(sys.modules, {"ray": fake_ray}):
+            backend = RayReplicaBackend(
+                n_gpus=1,
+                workers_per_gpu=1,
+                worker_init_info={},
+                backend_kwargs={},
+            )
+            backend.start()
+
+        self.assertEqual(len(fake_ray.actor_option_calls), 1)
+        self.assertEqual(fake_ray.actor_option_calls[0]["max_restarts"], 0)
+        self.assertEqual(fake_ray.actor_option_calls[0]["max_task_retries"], 0)
+
+    def test_respects_explicit_actor_retry_overrides(self):
+        fake_ray = _make_fake_ray_module()
+        with patch.dict(sys.modules, {"ray": fake_ray}):
+            backend = RayReplicaBackend(
+                n_gpus=1,
+                workers_per_gpu=1,
+                worker_init_info={},
+                backend_kwargs={"max_restarts": 2, "max_task_retries": 3},
+            )
+            backend.start()
+
+        self.assertEqual(len(fake_ray.actor_option_calls), 1)
+        self.assertEqual(fake_ray.actor_option_calls[0]["max_restarts"], 2)
+        self.assertEqual(fake_ray.actor_option_calls[0]["max_task_retries"], 3)
 
     def test_rejects_negative_num_gpus_override(self):
         fake_ray = _make_fake_ray_module()
@@ -146,6 +186,23 @@ class RayBackendConfigTests(unittest.TestCase):
         self.assertTrue(
             all(call["placement_group_bundle_index"] in {0, 1} for call in sched_calls)
         )
+
+    def test_get_result_timeout_raises_clear_error(self):
+        fake_ray = _make_fake_ray_module()
+        fake_ray.wait_result = ([], ["ref1"])
+        with patch.dict(sys.modules, {"ray": fake_ray}):
+            backend = RayReplicaBackend(
+                n_gpus=1,
+                workers_per_gpu=1,
+                worker_init_info={},
+                backend_kwargs={"get_result_timeout_s": 5},
+            )
+            backend._ray = fake_ray
+            backend._pending_refs = ["ref1"]
+            with self.assertRaises(TimeoutError) as ctx:
+                backend.get_result()
+
+        self.assertIn("5.0s", str(ctx.exception))
 
 
 if __name__ == "__main__":

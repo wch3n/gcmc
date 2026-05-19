@@ -520,6 +520,7 @@ class AdsorbateGCMC(AdsorbateCMC):
         max_moves: Optional[int] = None,
         log_every: Optional[int] = None,
         progress_interval_moves: Optional[int] = None,
+        sweeps_are_total: bool = True,
     ) -> Dict[str, float]:
         if nsweeps is None:
             nsweeps = self.nsteps
@@ -530,11 +531,6 @@ class AdsorbateGCMC(AdsorbateCMC):
             interval = int(log_every)
 
         self.traj_file = traj_file
-        mode = "a" if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0 else "w"
-        traj_writer = Trajectory(self.traj_file, mode)
-        accepted_writer = self._open_optional_traj(self.accepted_traj_file)
-        rejected_writer = self._open_optional_traj(self.rejected_traj_file)
-        attempted_writer = self._open_optional_traj(self.attempted_traj_file)
 
         if not self._resumed_from_checkpoint:
             self.sum_E = 0.0
@@ -572,9 +568,27 @@ class AdsorbateGCMC(AdsorbateCMC):
             )
         )
 
-        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
+        remaining_sweeps = (
+            max(0, target_sweeps - int(self.sweep))
+            if bool(sweeps_are_total)
+            else target_sweeps
+        )
 
-        for _ in range(remaining_sweeps):
+        chunk_mode = not bool(sweeps_are_total)
+
+        if not self._molecular_adsorbates_are_intact(self.atoms):
+            raise RuntimeError(
+                "Current molecular adsorbate state violates the template bond graph. "
+                "Start from an intact adsorbate or disable molecular-integrity enforcement."
+            )
+
+        mode = "a" if os.path.exists(self.traj_file) and os.path.getsize(self.traj_file) > 0 else "w"
+        traj_writer = Trajectory(self.traj_file, mode)
+        accepted_writer = self._open_optional_traj(self.accepted_traj_file)
+        rejected_writer = self._open_optional_traj(self.rejected_traj_file)
+        attempted_writer = self._open_optional_traj(self.attempted_traj_file)
+
+        for local_sweep in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             moves_this_sweep = self._moves_per_sweep()
             if max_moves is not None:
@@ -607,6 +621,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                             support_xy_tol=self.support_xy_tol,
                             z_max_support=self.z_max_support,
                         ):
+                            if rejected_writer is not None:
+                                rejected_writer.write(atoms_trial)
+                            continue
+                        if not self._molecular_adsorbates_are_intact(atoms_trial):
                             if rejected_writer is not None:
                                 rejected_writer.write(atoms_trial)
                             continue
@@ -667,6 +685,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                                 if rejected_writer is not None:
                                     rejected_writer.write(atoms_trial)
                                 continue
+                            if not self._molecular_adsorbates_are_intact(atoms_trial):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
                         if self.has_afloat_adsorbates(
                             atoms_trial,
                             support_xy_tol=self.support_xy_tol,
@@ -719,6 +741,10 @@ class AdsorbateGCMC(AdsorbateCMC):
                                 if rejected_writer is not None:
                                     rejected_writer.write(atoms_trial)
                                 continue
+                            if not self._molecular_adsorbates_are_intact(atoms_trial):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
                         # A deletion that removes the last adsorbate leaves a clean slab.
                         # In that case there is no adsorbate support geometry to validate.
                         if int(proposal_info["n_ads"]) > 1:
@@ -760,18 +786,22 @@ class AdsorbateGCMC(AdsorbateCMC):
                         continue
                     if attempted_writer is not None:
                         attempted_writer.write(atoms_trial)
-                    if self.relax:
-                        atoms_trial, converged = self.relax_structure(
-                            atoms_trial, move_ind=[self.sweep, move_idx]
-                        )
-                        if not converged:
-                            continue
-                        if self.has_detached_functional_groups(
-                            atoms_trial, detach_tol=self.detach_tol
-                        ):
-                            if rejected_writer is not None:
-                                rejected_writer.write(atoms_trial)
-                            continue
+                        if self.relax:
+                            atoms_trial, converged = self.relax_structure(
+                                atoms_trial, move_ind=[self.sweep, move_idx]
+                            )
+                            if not converged:
+                                continue
+                            if self.has_detached_functional_groups(
+                                atoms_trial, detach_tol=self.detach_tol
+                            ):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
+                            if not self._molecular_adsorbates_are_intact(atoms_trial):
+                                if rejected_writer is not None:
+                                    rejected_writer.write(atoms_trial)
+                                continue
                     if self.has_afloat_adsorbates(
                         atoms_trial,
                         support_xy_tol=self.support_xy_tol,
@@ -819,8 +849,10 @@ class AdsorbateGCMC(AdsorbateCMC):
 
             self.sweep += 1
             completed_sweep = int(self.sweep)
+            local_completed_sweep = local_sweep + 1
 
-            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
+            sample_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if sample_counter > equilibration and sample_counter % sample_interval == 0:
                 n_ads = len(self.ads_groups)
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
@@ -829,7 +861,8 @@ class AdsorbateGCMC(AdsorbateCMC):
                 self.n_samples += 1
                 self.n_hist[n_ads] = self.n_hist.get(n_ads, 0) + 1
 
-            if completed_sweep % interval == 0:
+            report_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if report_counter % interval == 0:
                 traj_writer.write(self.atoms)
                 with open(self.thermo_file, "a") as handle:
                     handle.write(f"{completed_sweep} {self.e_old:.6f} {len(self.ads_groups)}\n")

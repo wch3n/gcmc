@@ -7,9 +7,11 @@ Exports:
 - GCMC: Legacy Grand Canonical Monte Carlo.
 - AdsorbateGCMC: Site-based grand-canonical MC for adsorbates.
 - AdsorbateGCMCScanWorkflow: Scan runner for parallel adsorbate GCMC jobs.
+- AdsorbateReplicaExchangeWorkflow: YAML-driven temperature-replica exchange runner for fixed-loading adsorbates.
 - load_adsorbate_gcmc_scan_config: YAML/flat config loader for adsorbate GCMC scans.
 - AdsorbateCMCWorkflow: YAML-driven canonical adsorbate CMC runner.
 - AdsorbateGCMCWorkflow: YAML-driven single-run adsorbate GCMC runner.
+- load_adsorbate_pt_config: YAML/flat config loader for adsorbate temperature replica exchange.
 - AlloyCMCWorkflow: YAML-driven canonical alloy CMC runner.
 - AlloyReplicaExchangeWorkflow: YAML-driven alloy replica-exchange runner.
 - load_adsorbate_cmc_config: YAML/flat config loader for canonical adsorbate CMC.
@@ -36,11 +38,13 @@ from .workflows import (
     AdsorbateCMCWorkflow,
     AdsorbateGCMCWorkflow,
     AdsorbateGCMCScanWorkflow,
+    AdsorbateReplicaExchangeWorkflow,
     load_alloy_cmc_config,
     load_alloy_pt_config,
     load_adsorbate_cmc_config,
     load_adsorbate_gcmc_config,
     load_adsorbate_gcmc_scan_config,
+    load_adsorbate_pt_config,
 )
 from .analysis import (
     MXeneAdsorptionSiteAnalyzer,
@@ -64,11 +68,13 @@ __all__ = [
     "AdsorbateCMCWorkflow",
     "AdsorbateGCMCWorkflow",
     "AdsorbateGCMCScanWorkflow",
+    "AdsorbateReplicaExchangeWorkflow",
     "load_alloy_cmc_config",
     "load_alloy_pt_config",
     "load_adsorbate_cmc_config",
     "load_adsorbate_gcmc_config",
     "load_adsorbate_gcmc_scan_config",
+    "load_adsorbate_pt_config",
     "MXeneAdsorptionSiteAnalyzer",
     "MXeneOrderingAnalyzer",
     "MXeneSROAnalyzer",

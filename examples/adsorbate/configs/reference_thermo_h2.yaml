@@ -1,0 +1,32 @@
+reference:
+  molecule: H2
+  vacuum_A: 8.0
+  temperature_K: 303.0
+  pressure_Pa: 101325.0
+  energy_eV: null
+  correction_eV: 0.0
+  geometry: linear
+  symmetrynumber: 2
+  spin: 0.0
+
+calculator:
+  calculator: symmetrix
+  model_file: model.json
+  device: cuda
+  use_kokkos: true
+
+output:
+  output_dir: h2_reference
+
+relaxation:
+  enabled: true
+  fmax: 0.001
+  steps: 1000
+  log_file: relax.log
+  progress_log: reference_thermo.log
+  progress_stdout: true
+
+vibrations:
+  delta_A: 0.01
+  nfree: 2
+  ignore_imag_modes: false

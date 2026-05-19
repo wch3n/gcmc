@@ -267,8 +267,15 @@ class AlloyCMC(BaseMC):
             "sum_E_sq": self.sum_E_sq,
             "n_samples": self.n_samples,
         }
-        with open(self.checkpoint_file, "wb") as f:
+        checkpoint_path = os.fspath(self.checkpoint_file)
+        directory = os.path.dirname(os.path.abspath(checkpoint_path)) or "."
+        tmp_path = os.path.join(
+            directory,
+            f".{os.path.basename(checkpoint_path)}.tmp.{os.getpid()}",
+        )
+        with open(tmp_path, "wb") as f:
             pickle.dump(state, f)
+        os.replace(tmp_path, checkpoint_path)
 
     def _load_checkpoint(self):
         if not os.path.exists(self.checkpoint_file):
@@ -454,6 +461,7 @@ class AlloyCMC(BaseMC):
         interval: int = 10,
         sample_interval: int = 1,
         equilibration: int = 0,
+        sweeps_are_total: bool = True,
     ) -> Dict[str, float]:
         self.traj_file = traj_file
         target_sweeps = int(nsweeps)
@@ -488,9 +496,15 @@ class AlloyCMC(BaseMC):
 
         # Optional start-of-run header can be added here if needed.
 
-        remaining_sweeps = max(0, target_sweeps - int(self.sweep))
+        remaining_sweeps = (
+            max(0, target_sweeps - int(self.sweep))
+            if bool(sweeps_are_total)
+            else target_sweeps
+        )
 
-        for _ in range(remaining_sweeps):
+        chunk_mode = not bool(sweeps_are_total)
+
+        for local_sweep in range(remaining_sweeps):
             beta = 1.0 / (KB_EV_PER_K * self.T)
             if self.neighbor_cache and self.swap_mode in ("neighbor", "hybrid"):
                 self._ensure_neighbor_cache()
@@ -557,15 +571,18 @@ class AlloyCMC(BaseMC):
 
             self.sweep += 1
             completed_sweep = int(self.sweep)
+            local_completed_sweep = local_sweep + 1
 
             # 1. Sampling.
-            if completed_sweep > equilibration and completed_sweep % sample_interval == 0:
+            sample_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if sample_counter > equilibration and sample_counter % sample_interval == 0:
                 self.sum_E += self.e_old
                 self.sum_E_sq += self.e_old**2
                 self.n_samples += 1
 
             # 2. Reporting with temperature tag.
-            if completed_sweep % interval == 0:
+            report_counter = local_completed_sweep if chunk_mode else completed_sweep
+            if report_counter % interval == 0:
                 self.traj_writer.write(self.atoms)
                 with open(self.thermo_file, "a") as f:
                     f.write(f"{self.sweep} {self.e_old:.6f}\n")

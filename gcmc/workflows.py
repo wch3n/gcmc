@@ -16,10 +16,13 @@ from ase.build import make_supercell
 from ase.constraints import FixAtoms, FixCartesian
 from ase.io import read, write
 
-from .adsorbate_cmc import AdsorbateCMC
+from .analysis.site_viz import overlay_site_markers
+from .adsorbate_cmc import AdsorbateCMC, _place_adsorbate_template
 from .adsorbate_gcmc import AdsorbateGCMC
 from .alloy_cmc import AlloyCMC
+from .constants import ADSORBATE_TAG_OFFSET
 from .replica import MuReplicaExchange, ReplicaExchange
+from .utils import build_surface_site_registry
 from .utils import initialize_surface_adsorbates
 from .utils import initialize_alloy_sublattice
 from .utils import generate_nonuniform_temperature_grid
@@ -119,6 +122,9 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "resume": False,
     "checkpoint_interval": 100,
     "write_attempted_traj": False,
+    "write_site_overlay": False,
+    "site_overlay_include_blocked": False,
+    "site_overlay_z_field": "suggested_z_A",
     "use_mu_exchange": False,
     "swap_interval": 20,
     "swap_stride": 1,
@@ -138,6 +144,11 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "ray_log_to_driver": False,
     "ray_num_cpus_per_task": 1,
     "ray_num_gpus_per_task": None,
+    "ray_task_max_retries": 0,
+    "ray_retry_exceptions": False,
+    "ray_actor_max_restarts": 0,
+    "ray_actor_max_task_retries": 0,
+    "ray_get_timeout_s": None,
     "worker_log_to_stdout": False,
     "output_dir": "adsorbate_gcmc_scan",
 }
@@ -209,6 +220,9 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "resume": False,
     "checkpoint_interval": 100,
     "write_attempted_traj": False,
+    "write_site_overlay": False,
+    "site_overlay_include_blocked": False,
+    "site_overlay_z_field": "suggested_z_A",
     "seed": 81,
     "output_prefix": "adsorbate_gcmc",
 }
@@ -280,10 +294,92 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "sample_interval": 2,
     "equilibration": 40,
     "seed": 81,
+    "seeds": None,
+    "backend": "multiprocessing",
+    "devices": ["cuda:0"],
+    "gpu_ids": [0],
+    "n_workers": 1,
+    "ray_address": None,
+    "ray_log_to_driver": False,
+    "ray_num_cpus_per_task": 1,
+    "ray_num_gpus_per_task": None,
+    "ray_task_max_retries": 0,
+    "ray_retry_exceptions": False,
+    "ray_get_timeout_s": None,
     "resume": False,
     "checkpoint_interval": 100,
+    "write_site_overlay": False,
+    "site_overlay_include_blocked": False,
+    "site_overlay_z_field": "suggested_z_A",
+    "output_dir": None,
     "output_prefix": "adsorbate_cmc",
 }
+
+_DEFAULT_ADSORBATE_PT_CONFIG = {
+    key: value
+    for key, value in _DEFAULT_ADSORBATE_CMC_CONFIG.items()
+    if key
+    not in {
+        "temperature",
+        "nsweeps",
+        "write_interval",
+        "sample_interval",
+        "equilibration",
+        "seed",
+        "seeds",
+        "devices",
+        "gpu_ids",
+        "n_workers",
+        "output_prefix",
+    }
+}
+_DEFAULT_ADSORBATE_PT_CONFIG.update(
+    {
+        "default_dtype": None,
+        "initialization_seed": 81,
+        "T_start": 800.0,
+        "T_end": 50.0,
+        "T_step": 50.0,
+        "n_replicas": None,
+        "fine_grid_temps": [],
+        "fine_grid_weights": [],
+        "fine_grid_strength": 4.0,
+        "fine_grid_width": None,
+        "grid_space": "temperature",
+        "swap_stride": 1,
+        "swap_interval": 20,
+        "report_interval": 5,
+        "sampling_interval": 1,
+        "local_eq_fraction": 0.2,
+        "checkpoint_interval": 10,
+        "worker_checkpoint_interval": 0,
+        "seed_nonce": 0,
+        "n_cycles": 2,
+        "equilibration_cycles": 0,
+        "backend": "multiprocessing",
+        "n_gpus": None,
+        "workers_per_gpu": None,
+        "ray_address": None,
+        "ray_log_to_driver": False,
+        "ray_num_cpus_per_task": 1,
+        "ray_num_gpus_per_task": None,
+        "ray_actor_max_restarts": 0,
+        "ray_actor_max_task_retries": 0,
+        "ray_get_timeout_s": None,
+        "use_placement_group": False,
+        "placement_group_strategy": "SPREAD",
+        "remove_placement_group_on_stop": True,
+        "shutdown_on_stop": False,
+        "stats_file": "replica_stats.csv",
+        "results_file": "results.csv",
+        "checkpoint_file": "pt_state.pkl",
+        "initial_traj_file": "adsorbate_pt_initial.traj",
+        "output_dir": "adsorbate_pt",
+        "write_site_overlay": False,
+        "site_overlay_include_blocked": False,
+        "site_overlay_z_field": "suggested_z_A",
+    }
+)
 
 _DEFAULT_ALLOY_CMC_CONFIG = {
     "snapshot": None,
@@ -392,6 +488,7 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "sampling_interval": 1,
     "local_eq_fraction": 0.2,
     "checkpoint_interval": 10,
+    "worker_checkpoint_interval": 0,
     "resume": False,
     "track_composition": [],
     "seed_nonce": 0,
@@ -404,6 +501,9 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "ray_log_to_driver": False,
     "ray_num_cpus_per_task": 1,
     "ray_num_gpus_per_task": None,
+    "ray_actor_max_restarts": 0,
+    "ray_actor_max_task_retries": 0,
+    "ray_get_timeout_s": None,
     "use_placement_group": False,
     "placement_group_strategy": "SPREAD",
     "remove_placement_group_on_stop": True,
@@ -638,6 +738,68 @@ def _prepare_alloy_atoms(atoms, cfg: SimpleNamespace):
     return _apply_workflow_constraints(atoms, cfg)
 
 
+def _strip_tagged_adsorbates(atoms: Atoms) -> Atoms:
+    tags = np.asarray(atoms.get_tags(), dtype=int)
+    if tags.size == 0 or not np.any(tags >= ADSORBATE_TAG_OFFSET):
+        return atoms
+    return atoms[tags < ADSORBATE_TAG_OFFSET]
+
+
+def _resolve_registry_site_elements(cfg: SimpleNamespace) -> tuple[str, ...]:
+    site_elements = _parse_symbols(getattr(cfg, "site_elements", ()))
+    if site_elements:
+        return site_elements
+    top_layer_element = getattr(cfg, "top_layer_element", None)
+    if top_layer_element is not None:
+        return (str(top_layer_element),)
+    return ()
+
+
+def _write_site_overlay_if_requested(
+    atoms: Atoms,
+    cfg: SimpleNamespace,
+    *,
+    output_file: str | Path | None,
+    functional_elements: tuple[str, ...],
+) -> None:
+    if not bool(getattr(cfg, "write_site_overlay", False)):
+        return
+    if output_file is None:
+        return
+
+    slab_atoms = _strip_tagged_adsorbates(atoms.copy())
+    site_elements = _resolve_registry_site_elements(cfg)
+    if not site_elements:
+        raise ValueError(
+            "write_site_overlay=True requires site_elements or top_layer_element."
+        )
+
+    registry = build_surface_site_registry(
+        slab_atoms,
+        site_elements=site_elements,
+        substrate_elements=_parse_symbols(getattr(cfg, "substrate_elements", ())),
+        surface_side=getattr(cfg, "surface_side", "top"),
+        site_types=getattr(cfg, "site_type", ("atop",)),
+        layer_tol=float(getattr(cfg, "surface_layer_tol", 0.5)),
+        xy_tol=float(getattr(cfg, "site_match_tol", 0.6)),
+        bridge_cutoff=getattr(cfg, "bridge_cutoff", None),
+        support_xy_tol=_resolve_support_xy_tol(cfg),
+        termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
+        vertical_offset=float(getattr(cfg, "vertical_offset", 1.8)),
+        termination_elements=functional_elements,
+        min_termination_dist=float(getattr(cfg, "termination_clearance", 0.8)),
+    )
+    overlay = overlay_site_markers(
+        slab_atoms,
+        registry,
+        include_blocked=bool(getattr(cfg, "site_overlay_include_blocked", False)),
+        z_field=str(getattr(cfg, "site_overlay_z_field", "suggested_z_A")),
+    )
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write(output_path, overlay)
+
+
 def build_adsorbate_gcmc_calculator(cfg: SimpleNamespace, task: dict):
     calculator = str(getattr(cfg, "calculator", "lj")).lower()
     if calculator == "lj":
@@ -864,7 +1026,10 @@ def load_adsorbate_gcmc_config(config_path: str | Path) -> SimpleNamespace:
     output_prefix = flat_config.get("output_prefix")
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
-        if not output_prefix_path.is_absolute():
+        output_dir = flat_config.get("output_dir")
+        if output_prefix_path.is_absolute():
+            flat_config["output_prefix"] = str(output_prefix_path)
+        elif output_dir is None:
             flat_config["output_prefix"] = str(
                 (config_path.parent / output_prefix_path).resolve()
             )
@@ -882,19 +1047,20 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
         raise ValueError("Adsorbate CMC config must be a mapping.")
 
     if any(
-        key in raw for key in ("system", "cmc", "calculator", "output")
+        key in raw for key in ("system", "cmc", "calculator", "backend", "output")
     ):
         merged = _deep_update(
             {
                 "system": {},
                 "cmc": {},
                 "calculator": {},
+                "backend": {},
                 "output": {},
             },
             raw,
         )
         flat_config = dict(_DEFAULT_ADSORBATE_CMC_CONFIG)
-        for section in ("system", "cmc", "calculator", "output"):
+        for section in ("system", "cmc", "calculator", "backend", "output"):
             flat_config.update(merged.get(section, {}))
     else:
         flat_config = dict(_DEFAULT_ADSORBATE_CMC_CONFIG)
@@ -919,12 +1085,85 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
     output_prefix = flat_config.get("output_prefix")
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
-        if not output_prefix_path.is_absolute():
+        output_dir = flat_config.get("output_dir")
+        if output_prefix_path.is_absolute():
+            flat_config["output_prefix"] = str(output_prefix_path)
+        elif output_dir is None:
             flat_config["output_prefix"] = str(
                 (config_path.parent / output_prefix_path).resolve()
             )
         else:
             flat_config["output_prefix"] = str(output_prefix_path)
+    return SimpleNamespace(**flat_config)
+
+
+def load_adsorbate_pt_config(config_path: str | Path) -> SimpleNamespace:
+    import yaml
+
+    config_path = Path(config_path).resolve()
+    raw = yaml.safe_load(config_path.read_text()) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("Adsorbate PT config must be a mapping.")
+
+    if any(
+        key in raw for key in ("system", "pt", "cmc", "calculator", "backend", "output")
+    ):
+        merged = _deep_update(
+            {
+                "system": {},
+                "pt": {},
+                "cmc": {},
+                "calculator": {},
+                "backend": {},
+                "output": {},
+            },
+            raw,
+        )
+        flat_config = dict(_DEFAULT_ADSORBATE_PT_CONFIG)
+        for section in ("system", "pt", "cmc", "calculator", "backend", "output"):
+            flat_config.update(merged.get(section, {}))
+
+        pt_section = merged.get("pt", {})
+        cmc_section = merged.get("cmc", {})
+        if "checkpoint_interval" in pt_section:
+            flat_config["checkpoint_interval"] = pt_section["checkpoint_interval"]
+        if "checkpoint_interval" in cmc_section:
+            flat_config["worker_checkpoint_interval"] = cmc_section[
+                "checkpoint_interval"
+            ]
+        if "worker_checkpoint_interval" in cmc_section:
+            flat_config["worker_checkpoint_interval"] = cmc_section[
+                "worker_checkpoint_interval"
+            ]
+    else:
+        flat_config = dict(_DEFAULT_ADSORBATE_PT_CONFIG)
+        flat_config.update(raw)
+
+    flat_config = _resolve_path_fields(flat_config, config_path.parent)
+    adsorbate_value = flat_config.get("adsorbate")
+    if isinstance(adsorbate_value, str):
+        adsorbate_path = config_path.parent / adsorbate_value
+        if (
+            Path(adsorbate_value).is_absolute()
+            or adsorbate_path.exists()
+            or Path(adsorbate_value).suffix
+        ):
+            path = Path(adsorbate_value)
+            if not path.is_absolute():
+                flat_config["adsorbate"] = str(adsorbate_path.resolve())
+            else:
+                flat_config["adsorbate"] = str(path)
+
+    output_dir = Path(flat_config["output_dir"])
+    for key in ("stats_file", "results_file", "checkpoint_file", "initial_traj_file"):
+        value = flat_config.get(key)
+        if value is None:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            flat_config[key] = str((output_dir / path).resolve())
+        else:
+            flat_config[key] = str(path)
     return SimpleNamespace(**flat_config)
 
 
@@ -994,6 +1233,19 @@ def load_alloy_pt_config(config_path: str | Path) -> SimpleNamespace:
         flat_config = dict(_DEFAULT_ALLOY_PT_CONFIG)
         for section in ("system", "pt", "mc", "calculator", "backend", "output"):
             flat_config.update(merged.get(section, {}))
+
+        pt_section = merged.get("pt", {})
+        mc_section = merged.get("mc", {})
+        if "checkpoint_interval" in pt_section:
+            flat_config["checkpoint_interval"] = pt_section["checkpoint_interval"]
+        if "checkpoint_interval" in mc_section:
+            flat_config["worker_checkpoint_interval"] = mc_section[
+                "checkpoint_interval"
+            ]
+        if "worker_checkpoint_interval" in mc_section:
+            flat_config["worker_checkpoint_interval"] = mc_section[
+                "worker_checkpoint_interval"
+            ]
     else:
         flat_config = dict(_DEFAULT_ALLOY_PT_CONFIG)
         flat_config.update(raw)
@@ -1052,6 +1304,9 @@ def run_tasks_with_ray(
     log_to_driver: bool = False,
     num_cpus: float = 1.0,
     num_gpus: float = 0.0,
+    max_retries: int = 0,
+    retry_exceptions: bool = False,
+    get_timeout_s: float | None = None,
     status_formatter: StatusFormatter | None = None,
 ) -> list[dict]:
     import ray
@@ -1062,13 +1317,25 @@ def run_tasks_with_ray(
 
     ray.init(**init_kwargs)
     remote_run_one = ray.remote(
-        num_cpus=float(num_cpus), num_gpus=float(num_gpus)
+        num_cpus=float(num_cpus),
+        num_gpus=float(num_gpus),
+        max_retries=int(max_retries),
+        retry_exceptions=bool(retry_exceptions),
     )(_ray_run_one)
 
     results = []
     pending = [remote_run_one.remote(task, run_one) for task in tasks]
     while pending:
-        ready, pending = ray.wait(pending, num_returns=1)
+        ready, pending = ray.wait(
+            pending,
+            num_returns=1,
+            timeout=None if get_timeout_s is None else float(get_timeout_s),
+        )
+        if not ready:
+            raise TimeoutError(
+                "Timed out waiting for Ray task results "
+                f"after {float(get_timeout_s):.1f}s with {len(pending)} tasks pending."
+            )
         result = ray.get(ready[0])
         results.append(result)
         if status_formatter is not None:
@@ -1130,6 +1397,38 @@ def write_adsorbate_gcmc_scan_summary(results: list[dict], summary_file: Path) -
                     row.get("attempted_traj_file", ""),
                     row["thermo_file"],
                     row["checkpoint_file"],
+                ]
+            )
+
+
+def write_adsorbate_cmc_summary(results: list[dict], summary_file: Path) -> None:
+    with open(summary_file, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "seed",
+                "T_K",
+                "energy_eV",
+                "cv_eV_per_K",
+                "acceptance_pct",
+                "traj_file",
+                "thermo_file",
+                "checkpoint_file",
+                "initial_traj_file",
+            ]
+        )
+        for row in results:
+            writer.writerow(
+                [
+                    row["seed"],
+                    f"{row['T']:.6f}",
+                    f"{row['energy']:.10f}",
+                    f"{row['cv']:.10f}",
+                    f"{row['acceptance']:.6f}",
+                    row["traj_file"],
+                    row["thermo_file"],
+                    row["checkpoint_file"],
+                    row["initial_traj_file"],
                 ]
             )
 
@@ -1511,6 +1810,13 @@ class AdsorbateGCMCScanWorkflow:
                     "num_cpus": float(cfg.ray_num_cpus_per_task),
                     "num_gpus": self._ray_num_gpus_per_task(),
                 },
+                "max_restarts": int(
+                    getattr(cfg, "ray_actor_max_restarts", 0)
+                ),
+                "max_task_retries": int(
+                    getattr(cfg, "ray_actor_max_task_retries", 0)
+                ),
+                "get_result_timeout_s": getattr(cfg, "ray_get_timeout_s", None),
             }
         else:
             gpu_ids = tuple(getattr(cfg, "gpu_ids", (0,)))
@@ -1698,6 +2004,18 @@ class AdsorbateGCMCScanWorkflow:
         print(f"backend: {backend}")
         print(f"output dir: {out_dir}")
 
+        atoms = self.snapshot_loader(Path(self.config.snapshot), int(self.config.frame))
+        atoms = _prepare_adsorbate_scan_atoms(atoms, self.config, {})
+        functional_elements = _infer_functional_elements_from_config(
+            atoms, self.config, {}
+        )
+        _write_site_overlay_if_requested(
+            atoms,
+            self.config,
+            output_file=out_dir / "site_overlay.traj",
+            functional_elements=functional_elements,
+        )
+
         if bool(getattr(self.config, "use_mu_exchange", False)):
             total_sweeps, equilibration_sweeps = self._resolve_mu_exchange_schedule(
                 self.config
@@ -1745,6 +2063,13 @@ class AdsorbateGCMCScanWorkflow:
                     log_to_driver=bool(self.config.ray_log_to_driver),
                     num_cpus=float(self.config.ray_num_cpus_per_task),
                     num_gpus=self._ray_num_gpus_per_task(),
+                    max_retries=int(
+                        getattr(self.config, "ray_task_max_retries", 0)
+                    ),
+                    retry_exceptions=bool(
+                        getattr(self.config, "ray_retry_exceptions", False)
+                    ),
+                    get_timeout_s=getattr(self.config, "ray_get_timeout_s", None),
                     status_formatter=self.status_formatter,
                 )
             else:
@@ -1775,24 +2100,58 @@ class AdsorbateCMCWorkflow:
         calculator_factory: CalculatorFactory,
         snapshot_loader=load_snapshot_default,
         status_formatter: Callable[[dict], str] = format_adsorbate_cmc_status,
+        summary_writer=write_adsorbate_cmc_summary,
     ) -> None:
         self.config = config
         self.calculator_factory = calculator_factory
         self.snapshot_loader = snapshot_loader
         self.status_formatter = status_formatter
+        self.summary_writer = summary_writer
 
     def _load_atoms(self):
         atoms = self.snapshot_loader(Path(self.config.snapshot), int(self.config.frame))
         return _prepare_adsorbate_scan_atoms(atoms, self.config, {})
 
-    def _build_output_paths(self) -> dict[str, str]:
+    def _resolve_seeds(self) -> list[int]:
+        seeds = getattr(self.config, "seeds", None)
+        if seeds is None:
+            return [int(self.config.seed)]
+        resolved = [int(seed) for seed in seeds]
+        if not resolved:
+            raise ValueError("seeds must contain at least one seed.")
+        return resolved
+
+    def _output_root(self) -> Path:
+        output_dir = getattr(self.config, "output_dir", None)
+        if output_dir is not None:
+            root = Path(output_dir)
+        else:
+            prefix = Path(self.config.output_prefix)
+            root = prefix.parent if prefix.is_absolute() else (Path.cwd() / prefix.parent)
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _build_output_paths(
+        self,
+        *,
+        seed: int | None = None,
+        multi_seed: bool = False,
+    ) -> dict[str, str]:
         prefix = Path(self.config.output_prefix)
+        output_dir = getattr(self.config, "output_dir", None)
+        if output_dir is not None and not prefix.is_absolute():
+            prefix = Path(output_dir) / prefix
+        if multi_seed:
+            if seed is None:
+                raise ValueError("seed is required when multi_seed=True.")
+            prefix = prefix.parent / f"seed_{int(seed):03d}" / prefix.name
         prefix.parent.mkdir(parents=True, exist_ok=True)
         return {
             "traj_file": str(prefix.with_suffix(".traj")),
             "thermo_file": str(prefix.with_suffix(".dat")),
             "checkpoint_file": str(prefix.with_suffix(".pkl")),
             "initial_traj_file": str(prefix.parent / f"{prefix.name}_initial.traj"),
+            "site_overlay_file": str(prefix.parent / f"{prefix.name}_sites.traj"),
         }
 
     def _build_adsorbate_template(self) -> tuple[Atoms, int]:
@@ -1802,13 +2161,55 @@ class AdsorbateCMCWorkflow:
         )
         return template, anchor_index
 
-    def _build_simulation(self):
+    def _ray_num_gpus_per_task(self) -> float:
+        value = getattr(self.config, "ray_num_gpus_per_task", None)
+        if value is not None:
+            return float(value)
+        return 1.0 if getattr(self.config, "calculator", None) == "mace" else 0.0
+
+    def _build_tasks(self, backend: str) -> list[dict]:
+        tasks = []
+        devices = tuple(getattr(self.config, "devices", ()))
+        gpu_ids = tuple(getattr(self.config, "gpu_ids", ()))
+        for idx, seed in enumerate(self._resolve_seeds()):
+            if backend == "multiprocessing":
+                device = devices[idx % len(devices)] if devices else None
+                gpu_id = gpu_ids[idx % len(gpu_ids)] if gpu_ids else None
+            else:
+                device = "cuda" if self._ray_num_gpus_per_task() > 0.0 else "cpu"
+                gpu_id = None
+            tasks.append(
+                {
+                    "seed": int(seed),
+                    "device": device,
+                    "gpu_id": gpu_id,
+                }
+            )
+        return tasks
+
+    def _build_simulation(
+        self,
+        *,
+        seed: int | None = None,
+        multi_seed: bool = False,
+        task: dict | None = None,
+    ):
         cfg = self.config
+        run_seed = int(cfg.seed) if seed is None else int(seed)
         atoms = self._load_atoms()
-        calculator = self.calculator_factory(cfg, {"device": getattr(cfg, "device", None)})
-        output_paths = self._build_output_paths()
+        calculator = self.calculator_factory(
+            cfg,
+            task if task is not None else {"device": getattr(cfg, "device", None)},
+        )
+        output_paths = self._build_output_paths(seed=run_seed, multi_seed=multi_seed)
         substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
         functional_elements = _infer_functional_elements_from_config(atoms, cfg, {})
+        _write_site_overlay_if_requested(
+            atoms,
+            cfg,
+            output_file=output_paths["site_overlay_file"],
+            functional_elements=functional_elements,
+        )
         adsorbate_template, anchor_index = self._build_adsorbate_template()
         anchor_symbol = adsorbate_template[anchor_index].symbol
         init_mode = str(getattr(cfg, "initialization_mode", "clean_surface")).lower()
@@ -1852,7 +2253,7 @@ class AdsorbateCMCWorkflow:
             thermo_file=output_paths["thermo_file"],
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
-            seed=int(cfg.seed),
+            seed=run_seed,
             resume=bool(getattr(cfg, "resume", False)),
             enable_hybrid_md=bool(getattr(cfg, "enable_hybrid_md", False)),
             md_move_prob=float(getattr(cfg, "md_move_prob", 0.1)),
@@ -1871,6 +2272,7 @@ class AdsorbateCMCWorkflow:
             "initialization_mode": init_mode,
             "snapshot": str(cfg.snapshot),
             "frame": int(cfg.frame),
+            "seed": run_seed,
         }
 
         if init_mode == "clean_surface":
@@ -1906,7 +2308,7 @@ class AdsorbateCMCWorkflow:
                     termination_elements=functional_elements,
                     min_termination_dist=cfg.termination_clearance,
                     anchor_index=anchor_index,
-                    seed=int(cfg.seed),
+                    seed=run_seed,
                 )
             )
             write(output_paths["initial_traj_file"], atoms_with_ads)
@@ -1937,26 +2339,38 @@ class AdsorbateCMCWorkflow:
 
         return cmc, output_paths, init_summary
 
-    def run(self) -> dict:
-        cmc, output_paths, init_summary = self._build_simulation()
-        print(f"Loaded snapshot: {init_summary['snapshot']}")
-        print(f"Frame: {init_summary['frame']}")
-        print(f"Initialization mode: {init_summary['initialization_mode']}")
+    def _run_single_seed(
+        self,
+        seed: int,
+        *,
+        multi_seed: bool,
+        task: dict | None = None,
+        emit_status: bool = True,
+    ) -> tuple[dict, dict[str, str], dict]:
+        cmc, output_paths, init_summary = self._build_simulation(
+            seed=seed,
+            multi_seed=multi_seed,
+            task=task,
+        )
+        seed_label = f"Seed {int(seed):03d}: " if multi_seed else ""
+        print(f"{seed_label}Loaded snapshot: {init_summary['snapshot']}")
+        print(f"{seed_label}Frame: {init_summary['frame']}")
+        print(f"{seed_label}Initialization mode: {init_summary['initialization_mode']}")
         if "coverage" in init_summary:
-            print(f"Coverage: {init_summary['coverage']}")
+            print(f"{seed_label}Coverage: {init_summary['coverage']}")
         if "n_adsorbates" in init_summary:
-            print(f"Fixed loading: {init_summary['n_adsorbates']}")
+            print(f"{seed_label}Fixed loading: {init_summary['n_adsorbates']}")
             print(
-                "Candidate top-surface support atoms: "
+                f"{seed_label}Candidate top-surface support atoms: "
                 f"{init_summary['candidate_support_count']}"
             )
             print(
-                "Initial support indices: "
+                f"{seed_label}Initial support indices: "
                 f"{tuple(init_summary['selected_support_indices'])}"
             )
-        print(f"Move mode: {self.config.move_mode}")
+        print(f"{seed_label}Move mode: {self.config.move_mode}")
         print(
-            "Hybrid MD:",
+            f"{seed_label}Hybrid MD:",
             bool(getattr(self.config, "enable_hybrid_md", False)),
             (
                 f"(prob={getattr(self.config, 'md_move_prob', 0.0)}, "
@@ -1973,9 +2387,482 @@ class AdsorbateCMCWorkflow:
             sample_interval=int(self.config.sample_interval),
             equilibration=int(self.config.equilibration),
         )
-        print(f"Final AdsorbateCMC stats: {stats}")
-        print(self.status_formatter(stats))
-        return stats
+        print(f"{seed_label}Final AdsorbateCMC stats: {stats}")
+        if emit_status:
+            print(self.status_formatter(stats))
+        return stats, output_paths, init_summary
+
+    def _run_one(self, task: dict) -> dict:
+        gpu_id = task.get("gpu_id")
+        if gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+        stats, output_paths, _ = self._run_single_seed(
+            int(task["seed"]),
+            multi_seed=True,
+            task=task,
+            emit_status=False,
+        )
+        return {
+            "seed": int(task["seed"]),
+            "device": (
+                task["device"]
+                if task.get("device") is not None
+                else (task["gpu_id"] if task.get("gpu_id") is not None else "cpu")
+            ),
+            "T": float(self.config.temperature),
+            "traj_file": output_paths["traj_file"],
+            "thermo_file": output_paths["thermo_file"],
+            "checkpoint_file": output_paths["checkpoint_file"],
+            "initial_traj_file": output_paths["initial_traj_file"],
+            **stats,
+        }
+
+    def run(self) -> dict | list[dict]:
+        seeds = self._resolve_seeds()
+        if len(seeds) == 1:
+            stats, _, _ = self._run_single_seed(seeds[0], multi_seed=False)
+            return stats
+
+        out_root = self._output_root()
+        print(f"seeds: {tuple(int(seed) for seed in seeds)}")
+        backend = str(getattr(self.config, "backend", "multiprocessing")).lower()
+        if backend not in {"multiprocessing", "ray"}:
+            raise ValueError(
+                "AdsorbateCMC multi-seed backend must be 'multiprocessing' or 'ray'."
+            )
+
+        tasks = self._build_tasks(backend)
+        if backend == "ray":
+            results = run_tasks_with_ray(
+                tasks,
+                self._run_one,
+                address=getattr(self.config, "ray_address", None),
+                log_to_driver=bool(getattr(self.config, "ray_log_to_driver", False)),
+                num_cpus=float(getattr(self.config, "ray_num_cpus_per_task", 1.0)),
+                num_gpus=self._ray_num_gpus_per_task(),
+                max_retries=int(getattr(self.config, "ray_task_max_retries", 0)),
+                retry_exceptions=bool(
+                    getattr(self.config, "ray_retry_exceptions", False)
+                ),
+                get_timeout_s=getattr(self.config, "ray_get_timeout_s", None),
+                status_formatter=self.status_formatter,
+            )
+        else:
+            results = run_tasks_with_multiprocessing(
+                tasks,
+                self._run_one,
+                n_workers=int(getattr(self.config, "n_workers", 1)),
+                status_formatter=self.status_formatter,
+            )
+        results.sort(key=lambda row: row["seed"])
+
+        summary_file = out_root / "summary.csv"
+        self.summary_writer(results, summary_file)
+        print(f"Wrote summary: {summary_file}")
+        return results
+
+
+class AdsorbateReplicaExchangeWorkflow:
+    @classmethod
+    def from_yaml(cls, config_path: str | Path) -> "AdsorbateReplicaExchangeWorkflow":
+        config = load_adsorbate_pt_config(config_path)
+        return cls(config)
+
+    def __init__(self, config, *, snapshot_loader=load_snapshot_default) -> None:
+        self.config = config
+        self.snapshot_loader = snapshot_loader
+
+    def _load_atoms(self):
+        atoms = self.snapshot_loader(Path(self.config.snapshot), int(self.config.frame))
+        return _prepare_adsorbate_scan_atoms(atoms, self.config, {})
+
+    def _build_adsorbate_template(self) -> tuple[Atoms, int]:
+        template, default_anchor_index = build_adsorbate_template(self.config.adsorbate)
+        anchor_index = int(
+            getattr(self.config, "adsorbate_anchor_index", default_anchor_index)
+        )
+        return template, anchor_index
+
+    def _write_initial_traj(self, atoms: Atoms) -> None:
+        initial_traj = Path(self.config.initial_traj_file)
+        initial_traj.parent.mkdir(parents=True, exist_ok=True)
+        if bool(getattr(self.config, "resume", False)) and initial_traj.exists():
+            return
+        write(initial_traj, atoms)
+
+    def _initialize_atoms(
+        self,
+    ) -> tuple[Atoms, dict, tuple[str, ...], tuple[str, ...], Atoms, int]:
+        cfg = self.config
+        atoms = self._load_atoms()
+        substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
+        functional_elements = _infer_functional_elements_from_config(atoms, cfg, {})
+        _write_site_overlay_if_requested(
+            atoms,
+            cfg,
+            output_file=Path(cfg.output_dir) / "site_overlay.traj",
+            functional_elements=functional_elements,
+        )
+        adsorbate_template, anchor_index = self._build_adsorbate_template()
+        init_mode = str(getattr(cfg, "initialization_mode", "clean_surface")).lower()
+        init_seed = int(getattr(cfg, "initialization_seed", 81))
+
+        init_summary = {
+            "snapshot": str(cfg.snapshot),
+            "frame": int(cfg.frame),
+            "initialization_mode": init_mode,
+            "initialization_seed": init_seed,
+            "initial_traj_file": str(cfg.initial_traj_file),
+        }
+
+        if init_mode == "clean_surface":
+            site_registry = build_surface_site_registry(
+                atoms,
+                site_elements=(
+                    _parse_symbols(getattr(cfg, "site_elements", ()))
+                    if _parse_symbols(getattr(cfg, "site_elements", ()))
+                    else (
+                        (str(getattr(cfg, "top_layer_element", None)),)
+                        if getattr(cfg, "top_layer_element", None) is not None
+                        else ()
+                    )
+                ),
+                substrate_elements=substrate_elements,
+                surface_side=getattr(cfg, "surface_side", "top"),
+                site_types=cfg.site_type,
+                layer_tol=cfg.surface_layer_tol,
+                xy_tol=cfg.site_match_tol,
+                bridge_cutoff=getattr(cfg, "bridge_cutoff", None),
+                bridge_cutoff_scale=1.15,
+                support_xy_tol=_resolve_support_xy_tol(cfg),
+                termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
+                vertical_offset=cfg.vertical_offset,
+                termination_elements=functional_elements,
+                min_termination_dist=cfg.termination_clearance,
+            )
+            atoms_with_ads = _place_adsorbate_template(
+                atoms,
+                adsorbate_template,
+                anchor_index=anchor_index,
+                site_registry=site_registry,
+                coverage=float(cfg.coverage),
+                seed=init_seed,
+            )
+            init_summary["coverage"] = float(cfg.coverage)
+        elif init_mode == "fixed_count":
+            n_adsorbates = getattr(cfg, "n_adsorbates", None)
+            if n_adsorbates is None:
+                raise ValueError(
+                    "initialization_mode='fixed_count' requires n_adsorbates."
+                )
+            atoms_with_ads, support_indices, candidate_support_indices = (
+                initialize_surface_adsorbates(
+                    atoms,
+                    adsorbate=adsorbate_template,
+                    n_adsorbates=int(n_adsorbates),
+                    site_elements=_parse_symbols(getattr(cfg, "site_elements", ())),
+                    substrate_elements=substrate_elements,
+                    surface_side=getattr(cfg, "surface_side", "top"),
+                    site_types=cfg.site_type,
+                    layer_tol=cfg.surface_layer_tol,
+                    xy_tol=cfg.site_match_tol,
+                    bridge_cutoff=getattr(cfg, "bridge_cutoff", None),
+                    support_xy_tol=_resolve_support_xy_tol(cfg),
+                    termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
+                    vertical_offset=cfg.vertical_offset,
+                    termination_elements=functional_elements,
+                    min_termination_dist=cfg.termination_clearance,
+                    anchor_index=anchor_index,
+                    seed=init_seed,
+                )
+            )
+            init_summary.update(
+                {
+                    "n_adsorbates": int(n_adsorbates),
+                    "candidate_support_count": int(len(candidate_support_indices)),
+                    "selected_support_indices": np.asarray(
+                        support_indices, dtype=int
+                    ).tolist(),
+                }
+            )
+        elif init_mode == "preloaded":
+            atoms_with_ads = atoms.copy()
+        else:
+            raise ValueError(
+                "initialization_mode must be 'clean_surface', 'fixed_count', or 'preloaded'."
+            )
+
+        self._write_initial_traj(atoms_with_ads)
+        return (
+            atoms_with_ads,
+            init_summary,
+            substrate_elements,
+            functional_elements,
+            adsorbate_template,
+            anchor_index,
+        )
+
+    def _mc_kwargs(
+        self,
+        *,
+        substrate_elements: tuple[str, ...],
+        functional_elements: tuple[str, ...],
+        adsorbate_template: Atoms,
+        anchor_index: int,
+    ) -> dict:
+        cfg = self.config
+        return {
+            "adsorbate_element": adsorbate_template[anchor_index].symbol,
+            "adsorbate": adsorbate_template,
+            "adsorbate_anchor_index": anchor_index,
+            "substrate_elements": substrate_elements,
+            "functional_elements": functional_elements,
+            "top_layer_element": getattr(cfg, "top_layer_element", None),
+            "site_elements": _parse_symbols(getattr(cfg, "site_elements", ())),
+            "surface_side": getattr(cfg, "surface_side", "top"),
+            "site_type": cfg.site_type,
+            "move_mode": cfg.move_mode,
+            "site_hop_prob": cfg.site_hop_prob,
+            "reorientation_prob": getattr(cfg, "reorientation_prob", 0.2),
+            "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
+            "displacement_sigma": cfg.displacement_sigma,
+            "max_displacement_trials": cfg.max_displacement_trials,
+            "max_reorientation_trials": getattr(cfg, "max_reorientation_trials", None),
+            "min_clearance": cfg.min_clearance,
+            "site_match_tol": cfg.site_match_tol,
+            "support_xy_tol": _resolve_support_xy_tol(cfg),
+            "termination_site_xy_tol": _resolve_termination_site_xy_tol(cfg),
+            "surface_layer_tol": cfg.surface_layer_tol,
+            "termination_clearance": cfg.termination_clearance,
+            "bridge_cutoff": getattr(cfg, "bridge_cutoff", None),
+            "z_max_support": getattr(cfg, "z_max_support", 3.5),
+            "vertical_offset": cfg.vertical_offset,
+            "vertical_adjust_step": getattr(cfg, "vertical_adjust_step", 0.25),
+            "max_vertical_adjust": getattr(cfg, "max_vertical_adjust", 1.5),
+            "detach_tol": getattr(cfg, "detach_tol", 3.0),
+            "relax": bool(cfg.relax),
+            "relax_steps": int(cfg.relax_steps),
+            "relax_z_only": bool(getattr(cfg, "relax_z_only", False)),
+            "fmax": float(cfg.fmax),
+            "verbose_relax": bool(getattr(cfg, "verbose_relax", False)),
+            "checkpoint_interval": int(
+                getattr(cfg, "worker_checkpoint_interval", 0)
+            ),
+            "enable_hybrid_md": bool(getattr(cfg, "enable_hybrid_md", False)),
+            "md_move_prob": float(getattr(cfg, "md_move_prob", 0.1)),
+            "md_steps": int(getattr(cfg, "md_steps", 50)),
+            "md_timestep_fs": float(getattr(cfg, "md_timestep_fs", 1.0)),
+            "md_ensemble": str(getattr(cfg, "md_ensemble", "nve")),
+            "md_accept_mode": str(getattr(cfg, "md_accept_mode", "potential")),
+            "md_friction": float(getattr(cfg, "md_friction", 0.01)),
+            "md_planar": bool(getattr(cfg, "md_planar", False)),
+            "md_planar_axis": int(getattr(cfg, "md_planar_axis", 2)),
+            "md_init_momenta": bool(getattr(cfg, "md_init_momenta", True)),
+            "md_remove_drift": bool(getattr(cfg, "md_remove_drift", True)),
+        }
+
+    def _ray_num_gpus_per_task(self) -> float | None:
+        value = getattr(self.config, "ray_num_gpus_per_task", None)
+        if value is None:
+            return None
+        return float(value)
+
+    def _replica_pool_config(self) -> tuple[int, int]:
+        cfg = self.config
+        backend = str(cfg.backend).lower()
+
+        n_gpus = getattr(cfg, "n_gpus", None)
+        workers_per_gpu = getattr(cfg, "workers_per_gpu", None)
+
+        if backend == "ray":
+            if n_gpus is None:
+                n_gpus = _infer_total_gpus_from_environment()
+            if n_gpus is None or int(n_gpus) < 1:
+                raise ValueError(
+                    "For backend='ray', n_gpus could not be inferred from the environment. "
+                    "Set backend.n_gpus explicitly or run under Slurm with GPU environment variables."
+                )
+            if workers_per_gpu is None:
+                num_gpus_per_task = self._ray_num_gpus_per_task()
+                if num_gpus_per_task is None or num_gpus_per_task <= 0.0:
+                    workers_per_gpu = 1
+                else:
+                    workers_per_gpu = max(
+                        1, int(np.floor((1.0 / float(num_gpus_per_task)) + 1.0e-8))
+                    )
+        else:
+            if n_gpus is None:
+                n_gpus = 1
+            if workers_per_gpu is None:
+                workers_per_gpu = 1
+
+        return int(n_gpus), int(workers_per_gpu)
+
+    def _backend_kwargs(self) -> dict | None:
+        if str(self.config.backend).lower() != "ray":
+            return None
+
+        actor_options = {
+            "num_cpus": float(getattr(self.config, "ray_num_cpus_per_task", 1)),
+        }
+        num_gpus = self._ray_num_gpus_per_task()
+        if num_gpus is not None:
+            actor_options["num_gpus"] = num_gpus
+
+        return {
+            "init_kwargs": {
+                "address": getattr(self.config, "ray_address", None) or "auto",
+                "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
+            },
+            "actor_options": actor_options,
+            "max_restarts": int(
+                getattr(self.config, "ray_actor_max_restarts", 0)
+            ),
+            "max_task_retries": int(
+                getattr(self.config, "ray_actor_max_task_retries", 0)
+            ),
+            "get_result_timeout_s": getattr(
+                self.config, "ray_get_timeout_s", None
+            ),
+            "use_placement_group": bool(
+                getattr(self.config, "use_placement_group", False)
+            ),
+            "placement_group_strategy": str(
+                getattr(self.config, "placement_group_strategy", "SPREAD")
+            ),
+            "remove_placement_group_on_stop": bool(
+                getattr(self.config, "remove_placement_group_on_stop", True)
+            ),
+            "shutdown_on_stop": bool(getattr(self.config, "shutdown_on_stop", False)),
+        }
+
+    def _temperatures(self) -> list[float]:
+        cfg = self.config
+        if getattr(cfg, "n_replicas", None) is not None:
+            return generate_nonuniform_temperature_grid(
+                T_start=float(cfg.T_start),
+                T_end=float(cfg.T_end),
+                n_replicas=int(cfg.n_replicas),
+                focus_temps=list(getattr(cfg, "fine_grid_temps", []) or []),
+                focus_weights=list(getattr(cfg, "fine_grid_weights", []) or []),
+                focus_strength=float(getattr(cfg, "fine_grid_strength", 4.0)),
+                focus_width=getattr(cfg, "fine_grid_width", None),
+                grid_space=str(getattr(cfg, "grid_space", "temperature")),
+            )
+
+        T_step = getattr(cfg, "T_step", None)
+        if T_step is None or np.isclose(float(T_step), 0.0):
+            raise ValueError("T_step must be non-zero when n_replicas is not set.")
+        step = abs(float(T_step))
+        if float(cfg.T_start) > float(cfg.T_end):
+            return np.arange(
+                float(cfg.T_start), float(cfg.T_end) - step / 2.0, -step
+            ).tolist()
+        return np.arange(float(cfg.T_start), float(cfg.T_end) + step / 2.0, step).tolist()
+
+    def _relocate_replica_outputs(self, pt: ReplicaExchange, out_dir: Path) -> None:
+        for state in pt.replica_states:
+            state["traj_file"] = str(out_dir / Path(state["traj_file"]).name)
+            state["thermo_file"] = str(out_dir / Path(state["thermo_file"]).name)
+            state["checkpoint_file"] = str(out_dir / Path(state["checkpoint_file"]).name)
+
+    def run(self) -> ReplicaExchange:
+        cfg = self.config
+        (
+            atoms,
+            init_summary,
+            substrate_elements,
+            functional_elements,
+            adsorbate_template,
+            anchor_index,
+        ) = self._initialize_atoms()
+        calc_class, calc_kwargs = build_replica_calculator_spec(cfg)
+        mc_kwargs = self._mc_kwargs(
+            substrate_elements=substrate_elements,
+            functional_elements=functional_elements,
+            adsorbate_template=adsorbate_template,
+            anchor_index=anchor_index,
+        )
+
+        out_dir = Path(cfg.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Loaded snapshot: {init_summary['snapshot']}")
+        print(f"Frame: {init_summary['frame']}")
+        print(f"Initialization mode: {init_summary['initialization_mode']}")
+        print(f"Initialization seed: {init_summary['initialization_seed']}")
+        if "coverage" in init_summary:
+            print(f"Coverage: {init_summary['coverage']}")
+        if "n_adsorbates" in init_summary:
+            print(f"Fixed loading: {init_summary['n_adsorbates']}")
+            print(
+                "Candidate top-surface support atoms: "
+                f"{init_summary['candidate_support_count']}"
+            )
+            print(
+                "Initial support indices: "
+                f"{tuple(init_summary['selected_support_indices'])}"
+            )
+        print(f"Initial structure: {init_summary['initial_traj_file']}")
+        print(f"Move mode: {cfg.move_mode}")
+        print(
+            "Hybrid MD:",
+            bool(getattr(cfg, "enable_hybrid_md", False)),
+            (
+                f"(prob={getattr(cfg, 'md_move_prob', 0.0)}, "
+                f"steps={getattr(cfg, 'md_steps', 0)}, "
+                f"dt_fs={getattr(cfg, 'md_timestep_fs', 1.0)}, "
+                f"planar={getattr(cfg, 'md_planar', False)})"
+            ),
+        )
+
+        temps = self._temperatures()
+        n_gpus, workers_per_gpu = self._replica_pool_config()
+        print(format_alloy_pt_status(temps))
+        print(f"Backend: {cfg.backend}")
+        print(f"GPUs: {n_gpus} | Workers/GPU: {workers_per_gpu}")
+        if str(cfg.backend).lower() == "ray":
+            print(f"Ray task CPUs: {float(getattr(cfg, 'ray_num_cpus_per_task', 1))}")
+            print(f"Ray task GPUs: {self._ray_num_gpus_per_task()}")
+
+        pt = ReplicaExchange.from_auto_config(
+            atoms_template=atoms,
+            T_start=float(cfg.T_start),
+            T_end=float(cfg.T_end),
+            T_step=None if getattr(cfg, "n_replicas", None) is not None else float(cfg.T_step),
+            calculator_class=calc_class,
+            mc_class=AdsorbateCMC,
+            calc_kwargs=calc_kwargs,
+            mc_kwargs=mc_kwargs,
+            n_gpus=n_gpus,
+            workers_per_gpu=workers_per_gpu,
+            swap_stride=int(cfg.swap_stride),
+            resume=bool(cfg.resume),
+            results_file=str(cfg.results_file),
+            stats_file=str(cfg.stats_file),
+            checkpoint_file=str(cfg.checkpoint_file),
+            seed_nonce=int(getattr(cfg, "seed_nonce", 0)),
+            n_replicas=getattr(cfg, "n_replicas", None),
+            fine_grid_temps=list(getattr(cfg, "fine_grid_temps", []) or []),
+            fine_grid_weights=list(getattr(cfg, "fine_grid_weights", []) or []),
+            fine_grid_strength=float(getattr(cfg, "fine_grid_strength", 4.0)),
+            fine_grid_width=getattr(cfg, "fine_grid_width", None),
+            grid_space=str(getattr(cfg, "grid_space", "temperature")),
+            execution_backend=str(cfg.backend),
+            backend_kwargs=self._backend_kwargs(),
+            swap_interval=int(cfg.swap_interval),
+            report_interval=int(cfg.report_interval),
+            sampling_interval=int(cfg.sampling_interval),
+            local_eq_fraction=float(cfg.local_eq_fraction),
+            checkpoint_interval=int(cfg.checkpoint_interval),
+        )
+        self._relocate_replica_outputs(pt, out_dir)
+        pt.run(
+            n_cycles=int(cfg.n_cycles),
+            equilibration_cycles=int(getattr(cfg, "equilibration_cycles", 0)),
+        )
+        return pt
 
 
 class AdsorbateGCMCWorkflow:
@@ -2008,6 +2895,7 @@ class AdsorbateGCMCWorkflow:
             "traj_file": str(prefix.with_suffix(".traj")),
             "thermo_file": str(prefix.with_suffix(".dat")),
             "checkpoint_file": str(prefix.with_suffix(".pkl")),
+            "site_overlay_file": str(prefix.parent / f"{prefix.name}_sites.traj"),
         }
         if bool(getattr(self.config, "write_attempted_traj", False)):
             output_paths["attempted_traj_file"] = str(
@@ -2032,6 +2920,12 @@ class AdsorbateGCMCWorkflow:
         output_paths = self._build_output_paths()
         substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
         functional_elements = _infer_functional_elements_from_config(atoms, cfg, {})
+        _write_site_overlay_if_requested(
+            atoms,
+            cfg,
+            output_file=output_paths["site_overlay_file"],
+            functional_elements=functional_elements,
+        )
         adsorbate_template, anchor_index = self._build_adsorbate_template()
 
         sim = AdsorbateGCMC(
@@ -2315,7 +3209,9 @@ class AlloyReplicaExchangeWorkflow:
             "local_relax": bool(getattr(cfg, "local_relax", False)),
             "relax_radius": float(getattr(cfg, "relax_radius", 4.0)),
             "fmax": float(cfg.fmax),
-            "checkpoint_interval": int(getattr(cfg, "checkpoint_interval", 10)),
+            "checkpoint_interval": int(
+                getattr(cfg, "worker_checkpoint_interval", 0)
+            ),
             "enable_hybrid_md": bool(getattr(cfg, "enable_hybrid_md", False)),
             "md_move_prob": float(getattr(cfg, "md_move_prob", 0.1)),
             "md_steps": int(getattr(cfg, "md_steps", 50)),
@@ -2384,6 +3280,15 @@ class AlloyReplicaExchangeWorkflow:
                 "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
             },
             "actor_options": actor_options,
+            "max_restarts": int(
+                getattr(self.config, "ray_actor_max_restarts", 0)
+            ),
+            "max_task_retries": int(
+                getattr(self.config, "ray_actor_max_task_retries", 0)
+            ),
+            "get_result_timeout_s": getattr(
+                self.config, "ray_get_timeout_s", None
+            ),
             "use_placement_group": bool(
                 getattr(self.config, "use_placement_group", False)
             ),

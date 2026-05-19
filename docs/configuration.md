@@ -19,8 +19,10 @@ The authoritative defaults live in `gcmc/workflows.py`.
 | Alloy CMC | `AlloyCMCWorkflow` | `system`, `mc`, `calculator`, `output` |
 | Alloy replica exchange | `AlloyReplicaExchangeWorkflow` | `system`, `pt`, `mc`, `backend`, `calculator`, `output` |
 | Adsorbate CMC | `AdsorbateCMCWorkflow` | `system`, `cmc`, `calculator`, `output` |
+| Adsorbate replica exchange | `AdsorbateReplicaExchangeWorkflow` | `system`, `pt`, `cmc`, `backend`, `calculator`, `output` |
 | Adsorbate GCMC | `AdsorbateGCMCWorkflow` | `system`, `gcmc`, `calculator`, `output` |
 | Adsorbate GCMC scan | `AdsorbateGCMCScanWorkflow` | `system`, `gcmc`, `backend`, `calculator`, `output` |
+| Reaction post-processing | `ReactionPostProcessingWorkflow` | `parent`, `site_analysis`, `selection`, `calculator`, `output`, `candidate_generation`, `state_relaxation`, `vibrations`, `reference_thermo`, `che` |
 
 ## Important parsing rules
 
@@ -34,8 +36,9 @@ The authoritative defaults live in `gcmc/workflows.py`.
 ## Section reference
 
 - Shared keys used across multiple workflows: `docs/configuration/shared.md`
-- Adsorbate CMC / GCMC / mu-exchange keys: `docs/configuration/adsorbate.md`
+- Adsorbate CMC / replica exchange / GCMC / mu-exchange keys: `docs/configuration/adsorbate.md`
 - Alloy CMC / replica-exchange keys: `docs/configuration/alloy.md`
+- Reaction post-processing keys: `docs/configuration/reaction_postprocess.md`
 
 ## Typical layouts
 

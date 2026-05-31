@@ -31,7 +31,7 @@ speedups = [
 Homepage = "https://github.com/wch3n/gcmc"
 
 [project.scripts]
-gcmc-reaction-postprocess = "reaction.cli:main"
+gcmc-oer-workflow = "reaction.cli:main"
 gcmc-reference-thermo = "reaction.reference_thermo:main"
 
 [tool.setuptools.packages.find]

@@ -9,8 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
 
+import numpy as np
 from ase.build import molecule
+from ase.geometry import get_distances
+from ase.io import iread, read
 from ase.thermochemistry import IdealGasThermo
+
+from gcmc.utils import build_surface_site_registry
 
 from .output_files import output_path
 from .parent_sites import write_csv
@@ -71,9 +76,18 @@ _DEFAULT_CHE_CONFIG = {
         "symmetrynumber": 2,
         "spin": 1.0,
     },
-    "boltzmann_weight_states": False,
-    "boltzmann_temperature_K": 303.0,
-    "boltzmann_energy_cluster_tol_eV": 0.0,
+    "route_ensemble": True,
+    "route_pairing_mode": "compatible",
+    "route_parent_weight_model": "population",
+    "route_temperature_K": 303.0,
+    "basin_cluster_mode": "geometry",
+    "basin_energy_cluster_tol_eV": 0.0,
+    "basin_geometry_rmsd_tol_A": 0.25,
+    "basin_geometry_site_tol_A": None,
+    "basin_local_env_enabled": True,
+    "basin_local_env_cutoff_A": 3.5,
+    "basin_local_env_rmsd_tol_A": 0.20,
+    "basin_weight_source": "trajectory",
 }
 
 _KB_EV_PER_K = 8.617333262145e-5
@@ -134,8 +148,6 @@ class OERCHESummarizer:
                 shared_clean,
                 boltzmann=False,
             )
-            weighted: dict[str, object] | None = None
-            weighted_electronic: dict[str, object] | None = None
             if selected["ready"]:
                 min_row = self._che_row(site_id, by_state, selected)
             else:
@@ -153,60 +165,40 @@ class OERCHESummarizer:
                     by_state,
                     selected_electronic,
                 )
-            if self._boltzmann_enabled():
-                weighted = self._select_site_boltzmann_states(
-                    site_id,
-                    by_state,
-                    shared_clean,
-                )
-                weighted_electronic = self._select_site_electronic_states(
-                    site_id,
-                    by_state,
-                    shared_clean,
-                    boltzmann=True,
-                )
-                if weighted["ready"]:
-                    boltzmann_row = self._boltzmann_che_row(site_id, by_state, weighted)
-                else:
-                    boltzmann_row = self._incomplete_boltzmann_row(
-                        site_id,
-                        by_state,
-                        weighted,
+            explicit_rows = self._explicit_route_rows(
+                site_id,
+                by_state,
+                shared_clean,
+            )
+            if explicit_rows and min_electronic_row is not None:
+                for row in explicit_rows:
+                    self._fill_route_electronic_columns(
+                        row,
+                        "min",
+                        min_electronic_row,
                     )
-                if weighted_electronic["ready"]:
-                    boltzmann_electronic_row = self._boltzmann_che_row(
-                        site_id,
-                        by_state,
-                        weighted_electronic,
-                        electronic_only=True,
+            route_rows.extend(
+                explicit_rows
+                or [
+                    self._route_output_row(
+                        min_row,
+                        None,
+                        min_electronic_row,
+                        None,
                     )
-                else:
-                    boltzmann_electronic_row = self._incomplete_boltzmann_row(
-                        site_id,
-                        by_state,
-                        weighted_electronic,
-                    )
-            else:
-                boltzmann_row = None
-                boltzmann_electronic_row = None
-            route_rows.append(
-                self._route_output_row(
-                    min_row,
-                    boltzmann_row,
-                    min_electronic_row,
-                    boltzmann_electronic_row,
-                )
+                ]
             )
             state_rows.extend(
                 self._state_output_rows(
                     site_id,
                     selected,
-                    weighted,
+                    None,
                     selected_electronic,
-                    weighted_electronic,
+                    None,
                 )
             )
 
+        self._normalize_route_weights(route_rows)
         routes_path = output_path(self.config, "oer_routes_csv")
         write_csv(routes_path, route_rows)
         states_path = output_path(self.config, "oer_states_csv")
@@ -215,12 +207,11 @@ class OERCHESummarizer:
             "oer_routes_csv": str(routes_path),
             "oer_states_csv": str(states_path),
         }
-        if self._boltzmann_enabled():
-            ensemble_rows = self._ensemble_summary_rows(route_rows)
-            if ensemble_rows:
-                ensemble_path = output_path(self.config, "oer_ensemble_csv")
-                write_csv(ensemble_path, ensemble_rows)
-                outputs["oer_ensemble_csv"] = str(ensemble_path)
+        ensemble_rows = self._ensemble_summary_rows(route_rows)
+        if ensemble_rows:
+            ensemble_path = output_path(self.config, "oer_ensemble_csv")
+            write_csv(ensemble_path, ensemble_rows)
+            outputs["oer_ensemble_csv"] = str(ensemble_path)
         return outputs
 
     def _validate_references(self) -> None:
@@ -246,6 +237,9 @@ class OERCHESummarizer:
 
     def _boltzmann_enabled(self) -> bool:
         return bool(self.che_config.get("boltzmann_weight_states", False))
+
+    def _route_ensemble_enabled(self) -> bool:
+        return bool(self.che_config.get("route_ensemble", True))
 
     def _use_vibrational_free_energies(self) -> bool:
         return bool(self.che_config.get("use_vibrational_free_energies", True))
@@ -280,18 +274,148 @@ class OERCHESummarizer:
         return self._vibration_index
 
     def _boltzmann_temperature(self) -> float:
-        temperature = float(self.che_config.get("boltzmann_temperature_K", 303.0))
+        temperature = float(
+            self.che_config.get(
+                "route_temperature_K",
+                self.che_config.get("boltzmann_temperature_K", 303.0),
+            )
+        )
         if temperature <= 0.0 or not math.isfinite(temperature):
-            raise ValueError("che.boltzmann_temperature_K must be a positive number.")
+            raise ValueError("che.route_temperature_K must be a positive number.")
         return temperature
 
-    def _boltzmann_energy_cluster_tol(self) -> float:
-        tol = float(self.che_config.get("boltzmann_energy_cluster_tol_eV", 0.0))
+    def _basin_energy_cluster_tol(self) -> float:
+        tol = float(
+            self.che_config.get(
+                "basin_energy_cluster_tol_eV",
+                self.che_config.get("boltzmann_energy_cluster_tol_eV", 0.0),
+            )
+        )
         if tol < 0.0 or not math.isfinite(tol):
             raise ValueError(
-                "che.boltzmann_energy_cluster_tol_eV must be a non-negative number."
+                "che.basin_energy_cluster_tol_eV must be a non-negative number."
             )
         return tol
+
+    def _basin_cluster_mode(self) -> str:
+        raw = str(
+            self.che_config.get(
+                "basin_cluster_mode",
+                self.che_config.get("boltzmann_cluster_mode", "geometry"),
+            )
+        ).lower()
+        aliases = {
+            "none": "none",
+            "off": "none",
+            "false": "none",
+            "energy": "energy",
+            "energetic": "energy",
+            "geometry": "geometry",
+            "geometric": "geometry",
+            "motif": "geometry",
+            "motifs": "geometry",
+            "geometry_motif": "geometry",
+        }
+        mode = aliases.get(raw)
+        if mode is None:
+            raise ValueError(
+                "che.basin_cluster_mode must be 'geometry', 'energy', or 'none'."
+            )
+        return mode
+
+    def _basin_geometry_rmsd_tol(self) -> float:
+        tol = float(
+            self.che_config.get(
+                "basin_geometry_rmsd_tol_A",
+                self.che_config.get("boltzmann_geometry_rmsd_tol_A", 0.25),
+            )
+        )
+        if tol < 0.0 or not math.isfinite(tol):
+            raise ValueError(
+                "che.basin_geometry_rmsd_tol_A must be a non-negative number."
+            )
+        return tol
+
+    def _basin_geometry_site_tol(self) -> float:
+        value = self.che_config.get(
+            "basin_geometry_site_tol_A",
+            self.che_config.get("boltzmann_geometry_site_tol_A"),
+        )
+        if value in (None, ""):
+            value = getattr(self.config, "site_match_tol", 0.6)
+        tol = float(value)
+        if tol < 0.0 or not math.isfinite(tol):
+            raise ValueError(
+                "che.basin_geometry_site_tol_A must be a non-negative number."
+            )
+        return tol
+
+    def _basin_local_env_enabled(self) -> bool:
+        return bool(self.che_config.get("basin_local_env_enabled", True))
+
+    def _basin_local_env_cutoff(self) -> float:
+        tol = float(self.che_config.get("basin_local_env_cutoff_A", 3.5))
+        if tol < 0.0 or not math.isfinite(tol):
+            raise ValueError(
+                "che.basin_local_env_cutoff_A must be a non-negative number."
+            )
+        return tol
+
+    def _basin_local_env_rmsd_tol(self) -> float:
+        tol = float(self.che_config.get("basin_local_env_rmsd_tol_A", 0.20))
+        if tol < 0.0 or not math.isfinite(tol):
+            raise ValueError(
+                "che.basin_local_env_rmsd_tol_A must be a non-negative number."
+            )
+        return tol
+
+    def _basin_weight_source(self) -> str:
+        raw = str(self.che_config.get("basin_weight_source", "trajectory")).strip().lower()
+        aliases = {
+            "trajectory": "trajectory",
+            "traj": "trajectory",
+            "full_trajectory": "trajectory",
+            "samples": "selected",
+            "selected": "selected",
+            "selected_candidates": "selected",
+            "candidate": "selected",
+            "candidates": "selected",
+        }
+        mode = aliases.get(raw)
+        if mode is None:
+            raise ValueError(
+                "che.basin_weight_source must be 'trajectory' or 'selected'."
+            )
+        return mode
+
+    def _boltzmann_energy_cluster_tol(self) -> float:
+        return self._basin_energy_cluster_tol()
+
+    def _boltzmann_cluster_mode(self) -> str:
+        return self._basin_cluster_mode()
+
+    def _boltzmann_geometry_rmsd_tol(self) -> float:
+        return self._basin_geometry_rmsd_tol()
+
+    def _boltzmann_geometry_site_tol(self) -> float:
+        return self._basin_geometry_site_tol()
+
+    def _route_pairing_mode(self) -> str:
+        raw = str(self.che_config.get("route_pairing_mode", "compatible")).lower()
+        aliases = {
+            "compatible": "compatible",
+            "linked": "compatible",
+            "parent_o": "compatible",
+            "cartesian": "cartesian",
+            "all": "cartesian",
+            "product": "cartesian",
+        }
+        mode = aliases.get(raw)
+        if mode is None:
+            raise ValueError(
+                "che.route_pairing_mode must be 'compatible' or 'cartesian'."
+            )
+        return mode
 
     def _clean_reference_mode(self) -> str:
         raw = str(self.che_config.get("clean_reference_mode", "per_site")).strip().lower()
@@ -523,6 +647,584 @@ class OERCHESummarizer:
             "state_counts": counts,
         }
 
+    def _explicit_route_rows(
+        self,
+        site_id: str,
+        by_state: dict[str, dict[str, object]],
+        shared_clean: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        if not self._route_ensemble_enabled():
+            return []
+        state_map = {
+            "clean": str(self.che_config.get("clean_state", "00_clean")),
+            "oh": str(self.che_config.get("oh_state", "01_OH")),
+            "o": str(self.che_config.get("o_state", "02_O")),
+            "ooh": str(self.che_config.get("ooh_state", "03_OOH")),
+        }
+        clean = shared_clean
+        if clean is None:
+            clean_manifest = by_state.get(state_map["clean"])
+            if clean_manifest is None:
+                return []
+            clean = self._best_energy_row(clean_manifest)
+            if clean is None:
+                return []
+            clean = self._annotate_selected_state(
+                clean,
+                clean_manifest,
+                source_site_id=site_id,
+                reference_mode="per_site",
+            )
+
+        oh_manifest = by_state.get(state_map["oh"])
+        if oh_manifest is None:
+            return []
+        oh = self._best_energy_row(oh_manifest)
+        if oh is None:
+            return []
+        oh = self._annotate_selected_state(
+            oh,
+            oh_manifest,
+            source_site_id=site_id,
+            reference_mode="route_parent",
+        )
+
+        o_manifest = by_state.get(state_map["o"])
+        ooh_manifest = by_state.get(state_map["ooh"])
+        if o_manifest is None or ooh_manifest is None:
+            return []
+        o_basins = self._basin_energy_rows(o_manifest)
+        ooh_basins = self._basin_energy_rows(ooh_manifest)
+        if not o_basins or not ooh_basins:
+            return []
+
+        site_manifest = next(iter(by_state.values()), {})
+        parent_weight = self._as_float(self._site_population(site_manifest))
+        if not math.isfinite(parent_weight) or parent_weight <= 0.0:
+            parent_weight = 1.0
+        o_total = sum(max(0, int(row.get("basin_count", 1))) for row in o_basins)
+        if o_total <= 0:
+            o_total = len(o_basins)
+
+        rows: list[dict[str, object]] = []
+        for o_index, o_state in enumerate(o_basins, start=1):
+            o_count = max(0, int(o_state.get("basin_count", 1))) or 1
+            o_probability = o_count / o_total
+            compatible_ooh = self._compatible_ooh_basins(o_state, ooh_basins)
+            if not compatible_ooh:
+                continue
+            ooh_total = sum(
+                max(0, int(row.get("basin_count", 1))) for row in compatible_ooh
+            )
+            if ooh_total <= 0:
+                ooh_total = len(compatible_ooh)
+            for ooh_index, ooh_state in enumerate(compatible_ooh, start=1):
+                ooh_count = max(0, int(ooh_state.get("basin_count", 1))) or 1
+                ooh_probability = ooh_count / ooh_total
+                selected = {
+                    "ready": True,
+                    "missing_states": [],
+                    "states": {
+                        "clean": clean,
+                        "oh": oh,
+                        "o": o_state,
+                        "ooh": ooh_state,
+                    },
+                }
+                base = self._che_row(site_id, by_state, selected)
+                rows.append(
+                    self._explicit_route_output_row(
+                        base,
+                        oh,
+                        o_state,
+                        ooh_state,
+                        o_index=o_index,
+                        ooh_index=ooh_index,
+                        parent_weight=parent_weight,
+                        o_probability=o_probability,
+                        ooh_probability=ooh_probability,
+                        n_o_basins=len(o_basins),
+                        n_ooh_basins=len(compatible_ooh),
+                    )
+                )
+        return rows
+
+    def _basin_energy_rows(
+        self,
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        _, finite, _ = self._finite_energy_rows(manifest_row)
+        if not finite:
+            return []
+        return self._cluster_basin_rows(finite, manifest_row)
+
+    def _cluster_basin_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        mode = self._basin_cluster_mode()
+        if mode == "geometry":
+            clustered = self._cluster_geometry_basin_rows(rows, manifest_row)
+            if clustered is not None:
+                return clustered
+        if mode == "energy":
+            return self._cluster_energy_basin_rows(rows, manifest_row)
+        return self._finalize_basin_rows(rows, manifest_row)
+
+    def _cluster_energy_basin_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        tol = self._basin_energy_cluster_tol()
+        sorted_rows = sorted(rows, key=lambda row: self._as_float(row.get("energy_eV")))
+        clusters: list[dict[str, object]] = []
+        cluster_energies: list[float] = []
+        for row in sorted_rows:
+            energy = self._as_float(row.get("energy_eV"))
+            match = None
+            if tol > 0.0:
+                for index, reference in enumerate(cluster_energies):
+                    if abs(energy - reference) <= tol:
+                        match = index
+                        break
+            if match is None:
+                clusters.append(dict(row))
+                cluster_energies.append(energy)
+            else:
+                self._add_to_basin_cluster(clusters[match], row)
+        return self._finalize_basin_rows(clusters, manifest_row)
+
+    def _cluster_geometry_basin_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]] | None:
+        state_path = Path(str(manifest_row.get("candidates_csv", ""))).parent
+        relaxed_traj = state_path / "relaxed.traj"
+        candidates_csv = state_path / "candidates.csv"
+        if not relaxed_traj.exists():
+            return None
+        try:
+            structures = self._read_atoms_list(relaxed_traj)
+        except Exception:
+            return None
+        candidate_rows = self._read_csv(candidates_csv) if candidates_csv.exists() else []
+        if not structures:
+            return None
+
+        raw_structures: list | None = None
+        candidates_traj = state_path / "candidates.traj"
+        if candidates_traj.exists():
+            try:
+                raw_structures = self._read_atoms_list(candidates_traj)
+            except Exception:
+                raw_structures = None
+
+        clusters: list[dict[str, object]] = []
+        descriptors: list[dict[str, object]] = []
+        for row in sorted(rows, key=lambda item: self._as_float(item.get("energy_eV"))):
+            candidate_index = self._candidate_index(row)
+            if not (0 <= candidate_index < len(structures)):
+                return None
+            candidate_row = (
+                candidate_rows[candidate_index]
+                if candidate_index < len(candidate_rows)
+                else {}
+            )
+            descriptor = self._geometry_descriptor(
+                structures[candidate_index],
+                row,
+                candidate_row,
+            )
+            if descriptor is None:
+                return None
+            match = None
+            for index, existing in enumerate(descriptors):
+                if self._same_geometry_cluster(descriptor, existing):
+                    match = index
+                    break
+            if match is None:
+                output = dict(row)
+                output["geometry_cluster_key"] = descriptor["site_key"]
+                clusters.append(output)
+                descriptors.append(descriptor)
+            else:
+                self._add_to_basin_cluster(clusters[match], row)
+        self._assign_basin_counts_from_trajectories(
+            clusters,
+            descriptors,
+            candidate_rows,
+            structures,
+            raw_structures,
+        )
+        return self._finalize_basin_rows(clusters, manifest_row)
+
+    def _finalize_basin_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        state_dir = str(manifest_row.get("state_dir", "state"))
+        total = 0
+        output_rows: list[dict[str, object]] = []
+        for index, row in enumerate(rows, start=1):
+            output = dict(row)
+            count = max(1, int(output.get("basin_count", 1)))
+            output["basin_count"] = count
+            output["basin_id"] = output.get("basin_id") or f"{state_dir}:basin{index:03d}"
+            output["basin_candidate_ids"] = output.get(
+                "basin_candidate_ids",
+                str(output.get("candidate_id", "")),
+            )
+            output["basin_representative_candidate_id"] = output.get("candidate_id", "")
+            output = self._annotate_selected_state(
+                output,
+                manifest_row,
+                source_site_id=str(manifest_row.get("site_id", "")),
+                reference_mode="basin_representative",
+            )
+            total += count
+            output_rows.append(output)
+        if total <= 0:
+            total = len(output_rows)
+        for row in output_rows:
+            row["basin_probability"] = int(row.get("basin_count", 1)) / total
+        return output_rows
+
+    def _assign_basin_counts_from_trajectories(
+        self,
+        clusters: list[dict[str, object]],
+        descriptors: list[dict[str, object]],
+        candidate_rows: Sequence[dict[str, object]],
+        structures: Sequence,
+        raw_structures: Sequence | None,
+    ) -> None:
+        if self._basin_weight_source() != "trajectory":
+            return
+        if not clusters or len(clusters) != len(descriptors):
+            return
+
+        representative_descriptors = [
+            self._assignment_descriptor(
+                self._representative_structure(
+                    cluster,
+                    structures,
+                    raw_structures,
+                )
+            )
+            for cluster in clusters
+        ]
+        if any(item is None for item in representative_descriptors):
+            return
+
+        trajectory_sources = self._basin_assignment_frame_sources(candidate_rows)
+        if not trajectory_sources:
+            return
+
+        counts = [0 for _ in clusters]
+        assigned = 0
+        total = 0
+        for frame in self._iter_assignment_frames(trajectory_sources):
+            total += 1
+            descriptor = self._assignment_descriptor(frame)
+            if descriptor is None:
+                continue
+            distances = [
+                self._assignment_descriptor_distance(descriptor, representative)
+                for representative in representative_descriptors
+            ]
+            if not distances or not any(math.isfinite(value) for value in distances):
+                continue
+            index = min(range(len(distances)), key=lambda item: distances[item])
+            counts[index] += 1
+            assigned += 1
+
+        if total <= 0 or assigned <= 0:
+            return
+
+        for cluster, count in zip(clusters, counts):
+            cluster["basin_selected_count"] = int(cluster.get("basin_count", 1))
+            cluster["basin_count"] = int(count)
+            cluster["basin_trajectory_count"] = int(count)
+            cluster["basin_trajectory_total_count"] = int(total)
+            cluster["basin_trajectory_assigned_count"] = int(assigned)
+            cluster["basin_trajectory_unassigned_count"] = int(total - assigned)
+            cluster["basin_weight_source"] = "trajectory"
+
+    def _representative_structure(
+        self,
+        cluster: dict[str, object],
+        structures: Sequence,
+        raw_structures: Sequence | None,
+    ):
+        candidate_index = self._candidate_index(cluster)
+        if raw_structures is not None and 0 <= candidate_index < len(raw_structures):
+            return raw_structures[candidate_index]
+        if 0 <= candidate_index < len(structures):
+            return structures[candidate_index]
+        return None
+
+    def _assignment_descriptor(self, atoms) -> dict[str, object] | None:
+        if atoms is None:
+            return None
+        ads_indices = self._adsorbate_indices(atoms, {})
+        if not ads_indices:
+            return None
+        anchor_idx = int(ads_indices[0])
+        rel = np.asarray(
+            atoms.get_distances(anchor_idx, ads_indices, mic=True, vector=True),
+            dtype=float,
+        )
+        return {
+            "symbols": tuple(atoms[int(idx)].symbol for idx in ads_indices),
+            "anchor_xy": np.asarray(atoms.positions[anchor_idx, :2], dtype=float),
+            "relative_positions": rel,
+            "local_environment": self._local_environment_descriptor(
+                atoms,
+                ads_indices,
+                anchor_idx,
+            ),
+            "cell": np.asarray(atoms.get_cell(), dtype=float),
+            "pbc": np.asarray(atoms.get_pbc(), dtype=bool),
+        }
+
+    def _assignment_descriptor_distance(
+        self,
+        left: dict[str, object],
+        right: dict[str, object],
+    ) -> float:
+        if left.get("symbols") != right.get("symbols"):
+            return float("inf")
+        rel_left = np.asarray(left.get("relative_positions", ()), dtype=float)
+        rel_right = np.asarray(right.get("relative_positions", ()), dtype=float)
+        if rel_left.shape != rel_right.shape:
+            return float("inf")
+        anchor_distance = self._assignment_anchor_distance(left, right)
+        adsorbate_rmsd = float(
+            np.sqrt(np.mean(np.sum((rel_left - rel_right) ** 2, axis=1)))
+        )
+        distance = anchor_distance + adsorbate_rmsd
+        env_distance = self._local_environment_distance(
+            left.get("local_environment"),
+            right.get("local_environment"),
+        )
+        if math.isfinite(env_distance):
+            distance += env_distance
+        return float(distance)
+
+    @staticmethod
+    def _assignment_anchor_distance(
+        left: dict[str, object],
+        right: dict[str, object],
+    ) -> float:
+        xy_left = np.asarray(left.get("anchor_xy", (np.nan, np.nan)), dtype=float)
+        xy_right = np.asarray(right.get("anchor_xy", (np.nan, np.nan)), dtype=float)
+        if xy_left.shape[0] < 2 or xy_right.shape[0] < 2:
+            return float("inf")
+        point_left = np.array([xy_left[0], xy_left[1], 0.0], dtype=float)
+        point_right = np.array([xy_right[0], xy_right[1], 0.0], dtype=float)
+        pbc = np.asarray(left.get("pbc", (False, False, False)), dtype=bool)
+        if any(pbc[:2]):
+            delta = get_distances(
+                point_left.reshape(1, 3),
+                point_right.reshape(1, 3),
+                cell=np.asarray(left.get("cell"), dtype=float),
+                pbc=pbc,
+            )[0][0, 0]
+            return float(np.linalg.norm(delta[:2]))
+        return float(np.linalg.norm(point_left[:2] - point_right[:2]))
+
+    def _raw_candidate_descriptor(
+        self,
+        cluster: dict[str, object],
+        candidate_rows: Sequence[dict[str, object]],
+        raw_structures: Sequence | None,
+    ) -> dict[str, object] | None:
+        if raw_structures is None:
+            return None
+        candidate_index = self._candidate_index(cluster)
+        if not (0 <= candidate_index < len(raw_structures)):
+            return None
+        candidate_row = (
+            candidate_rows[candidate_index]
+            if candidate_index < len(candidate_rows)
+            else {}
+        )
+        return self._geometry_descriptor(
+            raw_structures[candidate_index],
+            cluster,
+            candidate_row,
+        )
+
+    def _basin_assignment_frame_sources(
+        self,
+        candidate_rows: Sequence[dict[str, object]],
+    ) -> list[Path]:
+        sources: list[Path] = []
+        seen: set[Path] = set()
+        for row in candidate_rows:
+            path = self._candidate_assignment_trajectory(row)
+            if path is None or path in seen or not path.exists():
+                continue
+            sources.append(path)
+            seen.add(path)
+        return sources
+
+    def _iter_assignment_frames(self, sources: Sequence[Path]):
+        for path in sources:
+            try:
+                yield from iread(str(path), index=":")
+            except Exception:
+                continue
+
+    def _candidate_assignment_trajectory(
+        self,
+        candidate_row: dict[str, object],
+    ) -> Path | None:
+        pt_dir = str(candidate_row.get("local_cmc_pt_dir", "")).strip()
+        if pt_dir:
+            temperature = self._as_float(
+                candidate_row.get("local_cmc_pt_temperature_K")
+            )
+            if math.isfinite(temperature):
+                return Path(pt_dir) / f"replica_{self._temperature_label(temperature)}.traj"
+
+        seed_index = candidate_row.get("local_cmc_seed_index")
+        if seed_index in (None, ""):
+            return None
+        try:
+            seed = int(float(seed_index))
+        except (TypeError, ValueError):
+            return None
+        csv_path = candidate_row.get("local_cmc_dir")
+        if csv_path in (None, ""):
+            return None
+        return Path(str(csv_path)) / f"seed{seed:03d}_samples.traj"
+
+    def _frame_anchor_index(self, atoms) -> int:
+        ads_indices = self._adsorbate_indices(atoms, {})
+        if ads_indices:
+            return int(ads_indices[0])
+        return -1
+
+    def _frame_representative_distance(self, frame, representative) -> float:
+        frame_ads = self._adsorbate_indices(frame, {})
+        representative_ads = self._adsorbate_indices(representative, {})
+        if not frame_ads or not representative_ads:
+            return float("inf")
+        if len(frame_ads) != len(representative_ads):
+            return float("inf")
+        frame_symbols = tuple(frame[int(idx)].symbol for idx in frame_ads)
+        representative_symbols = tuple(
+            representative[int(idx)].symbol for idx in representative_ads
+        )
+        if frame_symbols != representative_symbols:
+            return float("inf")
+
+        frame_anchor = int(frame_ads[0])
+        representative_anchor = int(representative_ads[0])
+        anchor_distance = self._xy_distance(
+            frame,
+            np.asarray(frame.positions[frame_anchor, :2], dtype=float),
+            np.asarray(representative.positions[representative_anchor, :2], dtype=float),
+        )
+        frame_rel = np.asarray(
+            frame.get_distances(frame_anchor, frame_ads, mic=True, vector=True),
+            dtype=float,
+        )
+        representative_rel = np.asarray(
+            representative.get_distances(
+                representative_anchor,
+                representative_ads,
+                mic=True,
+                vector=True,
+            ),
+            dtype=float,
+        )
+        if frame_rel.shape != representative_rel.shape:
+            return float("inf")
+        adsorbate_rmsd = float(
+            np.sqrt(np.mean(np.sum((frame_rel - representative_rel) ** 2, axis=1)))
+        )
+
+        distance = float(anchor_distance + adsorbate_rmsd)
+        env_distance = self._local_environment_distance(
+            self._local_environment_descriptor(frame, frame_ads, frame_anchor),
+            self._local_environment_descriptor(
+                representative,
+                representative_ads,
+                representative_anchor,
+            ),
+        )
+        if math.isfinite(env_distance):
+            distance += env_distance
+        return distance
+
+    @staticmethod
+    def _temperature_label(temperature: float) -> str:
+        text = f"{float(temperature):.6g}".replace(".", "p")
+        return f"{text}K"
+
+    @staticmethod
+    def _add_to_basin_cluster(cluster: dict[str, object], row: dict[str, object]) -> None:
+        cluster["basin_count"] = int(cluster.get("basin_count", 1)) + 1
+        existing = str(cluster.get("basin_candidate_ids", cluster.get("candidate_id", "")))
+        candidate_id = str(row.get("candidate_id", ""))
+        values = [value for value in existing.split() if value]
+        if candidate_id and candidate_id not in values:
+            values.append(candidate_id)
+        cluster["basin_candidate_ids"] = " ".join(values)
+
+    def _compatible_ooh_basins(
+        self,
+        o_state: dict[str, object],
+        ooh_basins: Sequence[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        if self._route_pairing_mode() == "cartesian":
+            return [dict(row) for row in ooh_basins]
+        linked = [
+            row
+            for row in ooh_basins
+            if str(row.get("parent_o_candidate_id", "")).strip()
+        ]
+        if not linked:
+            return [dict(row) for row in ooh_basins]
+        return [
+            dict(row)
+            for row in linked
+            if self._ooh_matches_o_basin(o_state, row)
+        ]
+
+    @staticmethod
+    def _ooh_matches_o_basin(
+        o_state: dict[str, object],
+        ooh_state: dict[str, object],
+    ) -> bool:
+        parent_id = str(ooh_state.get("parent_o_candidate_id", "")).strip()
+        if not parent_id:
+            return True
+        ids = {
+            str(o_state.get("candidate_id", "")).strip(),
+            str(o_state.get("basin_representative_candidate_id", "")).strip(),
+        }
+        ids.update(
+            value.strip()
+            for value in str(o_state.get("basin_candidate_ids", "")).split()
+            if value.strip()
+        )
+        for candidate_id in ids:
+            if not candidate_id:
+                continue
+            if parent_id == candidate_id:
+                return True
+            if candidate_id.startswith(parent_id + "_"):
+                return True
+            if parent_id.startswith(candidate_id + "_"):
+                return True
+        return False
+
     def _annotate_selected_state(
         self,
         best: dict[str, object],
@@ -562,7 +1264,7 @@ class OERCHESummarizer:
         energies_csv, finite, _ = self._finite_energy_rows(manifest_row)
         if not finite:
             return None
-        clustered = self._cluster_energy_rows(finite)
+        clustered = self._cluster_boltzmann_rows(finite, manifest_row)
         energies = [self._as_float(row.get("energy_eV")) for row in clustered]
         free_energy = self._logsumexp_free_energy(energies)
         best = min(clustered, key=lambda row: self._as_float(row.get("energy_eV")))
@@ -570,6 +1272,8 @@ class OERCHESummarizer:
         output["energy_eV"] = free_energy
         output["energies_csv"] = str(energies_csv)
         output["n_boltzmann_states"] = len(clustered)
+        output["n_raw_boltzmann_states"] = len(finite)
+        output["boltzmann_cluster_mode"] = self._boltzmann_cluster_mode()
         output["min_energy_eV"] = min(energies)
         output["used_unconverged_fallback"] = bool(
             self.che_config.get("use_converged_only", True)
@@ -600,7 +1304,7 @@ class OERCHESummarizer:
         energies_csv, finite, _ = self._finite_electronic_energy_rows(manifest_row)
         if not finite:
             return None
-        clustered = self._cluster_energy_rows(finite)
+        clustered = self._cluster_boltzmann_rows(finite, manifest_row)
         energies = [self._as_float(row.get("energy_eV")) for row in clustered]
         free_energy = self._logsumexp_free_energy(energies)
         best = min(clustered, key=lambda row: self._as_float(row.get("energy_eV")))
@@ -608,6 +1312,8 @@ class OERCHESummarizer:
         output["energy_eV"] = free_energy
         output["energies_csv"] = str(energies_csv)
         output["n_boltzmann_states"] = len(clustered)
+        output["n_raw_boltzmann_states"] = len(finite)
+        output["boltzmann_cluster_mode"] = self._boltzmann_cluster_mode()
         output["min_energy_eV"] = min(energies)
         output["used_unconverged_fallback"] = bool(
             self.che_config.get("use_converged_only", True)
@@ -729,6 +1435,20 @@ class OERCHESummarizer:
         output["vibration_summary_csv"] = str(self._vibration_summary_path())
         return output
 
+    def _cluster_boltzmann_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]]:
+        mode = self._boltzmann_cluster_mode()
+        if mode == "none":
+            return [dict(row) for row in rows]
+        if mode == "geometry":
+            clustered = self._cluster_geometry_rows(rows, manifest_row)
+            if clustered is not None:
+                return clustered
+        return self._cluster_energy_rows(rows)
+
     def _cluster_energy_rows(
         self,
         rows: Sequence[dict[str, object]],
@@ -745,6 +1465,280 @@ class OERCHESummarizer:
                 clusters.append(dict(row))
                 last_energy = energy
         return clusters
+
+    def _cluster_geometry_rows(
+        self,
+        rows: Sequence[dict[str, object]],
+        manifest_row: dict[str, object],
+    ) -> list[dict[str, object]] | None:
+        state_path = Path(str(manifest_row.get("candidates_csv", ""))).parent
+        relaxed_traj = state_path / "relaxed.traj"
+        candidates_csv = state_path / "candidates.csv"
+        if not relaxed_traj.exists():
+            return None
+        try:
+            structures = self._read_atoms_list(relaxed_traj)
+        except Exception:
+            return None
+        candidate_rows = self._read_csv(candidates_csv) if candidates_csv.exists() else []
+        if not structures:
+            return None
+
+        clusters: list[dict[str, object]] = []
+        descriptors: list[dict[str, object]] = []
+        for row in sorted(rows, key=lambda item: self._as_float(item.get("energy_eV"))):
+            candidate_index = self._candidate_index(row)
+            if not (0 <= candidate_index < len(structures)):
+                return None
+            candidate_row = (
+                candidate_rows[candidate_index]
+                if candidate_index < len(candidate_rows)
+                else {}
+            )
+            descriptor = self._geometry_descriptor(
+                structures[candidate_index],
+                row,
+                candidate_row,
+            )
+            if descriptor is None:
+                return None
+
+            matched = False
+            for existing in descriptors:
+                if self._same_geometry_cluster(descriptor, existing):
+                    matched = True
+                    break
+            if not matched:
+                output = dict(row)
+                output["geometry_cluster_key"] = descriptor["site_key"]
+                clusters.append(output)
+                descriptors.append(descriptor)
+        return clusters
+
+    def _geometry_descriptor(
+        self,
+        atoms,
+        energy_row: dict[str, object],
+        candidate_row: dict[str, object],
+    ) -> dict[str, object] | None:
+        ads_indices = self._adsorbate_indices(atoms, candidate_row)
+        if not ads_indices:
+            return None
+        anchor_idx = int(self._as_float(energy_row.get("anchor_index")))
+        if not (0 <= anchor_idx < len(atoms)) or anchor_idx not in ads_indices:
+            anchor_idx = int(ads_indices[0])
+        site_key = self._anchor_site_key(atoms, ads_indices, anchor_idx)
+        rel = np.asarray(
+            atoms.get_distances(anchor_idx, ads_indices, mic=True, vector=True),
+            dtype=float,
+        )
+        symbols = tuple(atoms[int(idx)].symbol for idx in ads_indices)
+        return {
+            "site_key": site_key,
+            "symbols": symbols,
+            "relative_positions": rel,
+            "local_environment": self._local_environment_descriptor(
+                atoms,
+                ads_indices,
+                anchor_idx,
+            ),
+        }
+
+    def _local_environment_descriptor(
+        self,
+        atoms,
+        ads_indices: Sequence[int],
+        anchor_idx: int,
+    ) -> dict[str, object] | None:
+        if not self._basin_local_env_enabled():
+            return None
+
+        cutoff = self._basin_local_env_cutoff()
+        if cutoff <= 0.0:
+            return None
+
+        ads_set = {int(idx) for idx in ads_indices}
+        elements = set(getattr(self.config, "substrate_elements", ()) or ())
+        elements.update(getattr(self.config, "functional_elements", ()) or ())
+        elements.update(getattr(self.config, "site_elements", ()) or ())
+        if not elements:
+            elements = {atom.symbol for atom in atoms}
+
+        indices: list[int] = []
+        symbols: list[str] = []
+        for idx, atom in enumerate(atoms):
+            if idx in ads_set or idx == anchor_idx or atom.symbol not in elements:
+                continue
+            indices.append(int(idx))
+            symbols.append(str(atom.symbol))
+        if not indices:
+            return {
+                "symbols": (),
+                "relative_positions": np.empty((0, 3), dtype=float),
+            }
+
+        vectors = np.asarray(
+            atoms.get_distances(anchor_idx, indices, mic=True, vector=True),
+            dtype=float,
+        )
+        distances = np.linalg.norm(vectors, axis=1)
+        entries: list[tuple[str, float, tuple[float, float, float]]] = []
+        for symbol, distance, vector in zip(symbols, distances, vectors):
+            distance = float(distance)
+            if distance <= cutoff:
+                entries.append(
+                    (
+                        symbol,
+                        distance,
+                        (float(vector[0]), float(vector[1]), float(vector[2])),
+                    )
+                )
+
+        entries.sort(key=lambda item: (item[0], round(item[1], 8), item[2]))
+        return {
+            "symbols": tuple(entry[0] for entry in entries),
+            "relative_positions": np.asarray(
+                [entry[2] for entry in entries],
+                dtype=float,
+            ),
+        }
+
+    def _anchor_site_key(
+        self,
+        atoms,
+        ads_indices: Sequence[int],
+        anchor_idx: int,
+    ) -> str:
+        slab = atoms.copy()
+        for idx in sorted((int(i) for i in ads_indices), reverse=True):
+            del slab[idx]
+        try:
+            registry = build_surface_site_registry(
+                slab,
+                site_elements=tuple(getattr(self.config, "site_elements", ())),
+                substrate_elements=tuple(getattr(self.config, "substrate_elements", ())),
+                surface_side=str(getattr(self.config, "surface_side", "top")),
+                site_types=tuple(getattr(self.config, "site_types", ("atop", "fcc", "hcp"))),
+                layer_tol=float(getattr(self.config, "surface_layer_tol", 0.5)),
+                xy_tol=float(getattr(self.config, "site_match_tol", 0.6)),
+                support_xy_tol=float(getattr(self.config, "support_xy_tol", 1.2)),
+                termination_site_xy_tol=getattr(
+                    self.config,
+                    "termination_site_xy_tol",
+                    None,
+                ),
+                vertical_offset=float(getattr(self.config, "vertical_offset", 1.5)),
+                termination_elements=tuple(
+                    getattr(self.config, "functional_elements", ())
+                ),
+                min_termination_dist=float(
+                    getattr(self.config, "termination_clearance", 0.8)
+                ),
+            )
+        except Exception:
+            registry = []
+
+        anchor_xy = atoms.positions[anchor_idx, :2]
+        best: tuple[float, dict[str, object]] | None = None
+        for site in registry:
+            xy = np.asarray(site.get("xy", (np.nan, np.nan)), dtype=float)
+            if xy.shape[0] < 2 or not np.all(np.isfinite(xy[:2])):
+                continue
+            dist = self._xy_distance(atoms, anchor_xy, xy[:2])
+            if best is None or dist < best[0]:
+                best = (dist, site)
+        if best is not None and best[0] <= self._boltzmann_geometry_site_tol():
+            support = "-".join(
+                str(int(idx)) for idx in sorted(best[1].get("support_indices", []))
+            )
+            return f"{best[1].get('site_type', 'site')}:{support}"
+
+        tol = max(self._boltzmann_geometry_site_tol(), 1.0e-8)
+        rounded = tuple(int(round(float(value) / tol)) for value in anchor_xy[:2])
+        return f"anchor_xy:{rounded[0]}:{rounded[1]}"
+
+    def _same_geometry_cluster(
+        self,
+        left: dict[str, object],
+        right: dict[str, object],
+    ) -> bool:
+        if left["site_key"] != right["site_key"]:
+            return False
+        if left["symbols"] != right["symbols"]:
+            return False
+        rel_left = np.asarray(left["relative_positions"], dtype=float)
+        rel_right = np.asarray(right["relative_positions"], dtype=float)
+        if rel_left.shape != rel_right.shape:
+            return False
+        rmsd = float(np.sqrt(np.mean(np.sum((rel_left - rel_right) ** 2, axis=1))))
+        if rmsd > self._boltzmann_geometry_rmsd_tol():
+            return False
+
+        return self._same_local_environment(
+            left.get("local_environment"),
+            right.get("local_environment"),
+        )
+
+    def _geometry_descriptor_distance(
+        self,
+        left: dict[str, object],
+        right: dict[str, object],
+    ) -> float:
+        if left.get("symbols") != right.get("symbols"):
+            return float("inf")
+        rel_left = np.asarray(left.get("relative_positions", ()), dtype=float)
+        rel_right = np.asarray(right.get("relative_positions", ()), dtype=float)
+        if rel_left.shape != rel_right.shape:
+            return float("inf")
+        distance = float(np.sqrt(np.mean(np.sum((rel_left - rel_right) ** 2, axis=1))))
+        if left.get("site_key") != right.get("site_key"):
+            distance += 10.0
+        env_distance = self._local_environment_distance(
+            left.get("local_environment"),
+            right.get("local_environment"),
+        )
+        if math.isfinite(env_distance):
+            distance += env_distance
+        return distance
+
+    def _same_local_environment(
+        self,
+        left: object,
+        right: object,
+    ) -> bool:
+        if left is None and right is None:
+            return True
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        if left.get("symbols") != right.get("symbols"):
+            return False
+        rel_left = np.asarray(left.get("relative_positions", ()), dtype=float)
+        rel_right = np.asarray(right.get("relative_positions", ()), dtype=float)
+        if rel_left.shape != rel_right.shape:
+            return False
+        if rel_left.size == 0:
+            return True
+        rmsd = float(np.sqrt(np.mean(np.sum((rel_left - rel_right) ** 2, axis=1))))
+        return rmsd <= self._basin_local_env_rmsd_tol()
+
+    @staticmethod
+    def _local_environment_distance(
+        left: object,
+        right: object,
+    ) -> float:
+        if left is None and right is None:
+            return 0.0
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return float("inf")
+        if left.get("symbols") != right.get("symbols"):
+            return float("inf")
+        rel_left = np.asarray(left.get("relative_positions", ()), dtype=float)
+        rel_right = np.asarray(right.get("relative_positions", ()), dtype=float)
+        if rel_left.shape != rel_right.shape:
+            return float("inf")
+        if rel_left.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.sum((rel_left - rel_right) ** 2, axis=1))))
 
     def _logsumexp_free_energy(self, energies: Sequence[float]) -> float:
         temperature = self._boltzmann_temperature()
@@ -916,6 +1910,123 @@ class OERCHESummarizer:
             "limiting_DeltaG_at_U_eV": "",
             "missing_states": base["missing_states"],
         }
+
+    def _explicit_route_output_row(
+        self,
+        base: dict[str, object],
+        oh_state: dict[str, object],
+        o_state: dict[str, object],
+        ooh_state: dict[str, object],
+        *,
+        o_index: int,
+        ooh_index: int,
+        parent_weight: float,
+        o_probability: float,
+        ooh_probability: float,
+        n_o_basins: int,
+        n_ooh_basins: int,
+    ) -> dict[str, object]:
+        route_weight_raw = parent_weight * o_probability * ooh_probability
+        route_id = (
+            f"{base.get('site_id', '')}|"
+            f"O{o_index:03d}|OOH{ooh_index:03d}"
+        )
+        return {
+            "site_id": base.get("site_id", ""),
+            "route_id": route_id,
+            "route_mode": "explicit_basin",
+            "site_population_rank": base.get("site_population_rank", ""),
+            "population_total": base.get("population_total", ""),
+            "clean_reference_site_id": base.get("clean_reference_site_id", ""),
+            "ready": base.get("ready", False),
+            "parent_weight": parent_weight,
+            "o_basin_probability": o_probability,
+            "ooh_basin_probability": ooh_probability,
+            "route_weight_raw": route_weight_raw,
+            "route_weight": "",
+            "ready_min": base.get("ready", False),
+            "oh_candidate_id": oh_state.get("candidate_id", ""),
+            "o_candidate_id": o_state.get("candidate_id", ""),
+            "o_basin_id": o_state.get("basin_id", ""),
+            "o_basin_count": o_state.get("basin_count", ""),
+            "o_basin_selected_count": o_state.get("basin_selected_count", ""),
+            "o_basin_trajectory_count": o_state.get("basin_trajectory_count", ""),
+            "o_basin_trajectory_total_count": o_state.get(
+                "basin_trajectory_total_count",
+                "",
+            ),
+            "o_basin_trajectory_assigned_count": o_state.get(
+                "basin_trajectory_assigned_count",
+                "",
+            ),
+            "o_basin_weight_source": o_state.get("basin_weight_source", "selected"),
+            "n_O_candidates": n_o_basins,
+            "o_basin_candidate_ids": o_state.get("basin_candidate_ids", ""),
+            "ooh_candidate_id": ooh_state.get("candidate_id", ""),
+            "ooh_basin_id": ooh_state.get("basin_id", ""),
+            "ooh_basin_count": ooh_state.get("basin_count", ""),
+            "ooh_basin_selected_count": ooh_state.get("basin_selected_count", ""),
+            "ooh_basin_trajectory_count": ooh_state.get(
+                "basin_trajectory_count",
+                "",
+            ),
+            "ooh_basin_trajectory_total_count": ooh_state.get(
+                "basin_trajectory_total_count",
+                "",
+            ),
+            "ooh_basin_trajectory_assigned_count": ooh_state.get(
+                "basin_trajectory_assigned_count",
+                "",
+            ),
+            "ooh_basin_weight_source": ooh_state.get(
+                "basin_weight_source",
+                "selected",
+            ),
+            "n_OOH_candidates": n_ooh_basins,
+            "ooh_basin_candidate_ids": ooh_state.get("basin_candidate_ids", ""),
+            "parent_o_candidate_id": ooh_state.get("parent_o_candidate_id", ""),
+            "DeltaG1_eV": base.get("DeltaG1_eV", ""),
+            "DeltaG2_eV": base.get("DeltaG2_eV", ""),
+            "DeltaG3_eV": base.get("DeltaG3_eV", ""),
+            "DeltaG4_eV": base.get("DeltaG4_eV", ""),
+            "DeltaG1_min_eV": base.get("DeltaG1_eV", ""),
+            "DeltaG2_min_eV": base.get("DeltaG2_eV", ""),
+            "DeltaG3_min_eV": base.get("DeltaG3_eV", ""),
+            "DeltaG4_min_eV": base.get("DeltaG4_eV", ""),
+            "limiting_step": base.get("limiting_step", ""),
+            "limiting_DeltaG_eV": base.get("limiting_DeltaG_eV", ""),
+            "overpotential_V": base.get("overpotential_V", ""),
+            "limiting_step_min": base.get("limiting_step", ""),
+            "limiting_DeltaG_min_eV": base.get("limiting_DeltaG_eV", ""),
+            "overpotential_min_V": base.get("overpotential_V", ""),
+            "potential_V": base.get("potential_V", ""),
+            "limiting_DeltaG_at_U_eV": base.get("limiting_DeltaG_at_U_eV", ""),
+            "limiting_DeltaG_min_at_U_eV": base.get("limiting_DeltaG_at_U_eV", ""),
+            "missing_states": base.get("missing_states", ""),
+            "missing_states_min": base.get("missing_states", ""),
+        }
+
+    def _normalize_route_weights(self, rows: Sequence[dict[str, object]]) -> None:
+        total = sum(
+            max(0.0, self._as_float(row.get("route_weight_raw")))
+            for row in rows
+            if self._as_bool(row.get("ready", row.get("ready_min", False)))
+        )
+        if total <= 0.0:
+            ready = [
+                row
+                for row in rows
+                if self._as_bool(row.get("ready", row.get("ready_min", False)))
+            ]
+            if not ready:
+                return
+            uniform = 1.0 / len(ready)
+            for row in ready:
+                row["route_weight"] = uniform
+            return
+        for row in rows:
+            raw = max(0.0, self._as_float(row.get("route_weight_raw")))
+            row["route_weight"] = raw / total if raw > 0.0 else 0.0
 
     def _route_output_row(
         self,
@@ -1207,40 +2318,33 @@ class OERCHESummarizer:
         ready = [
             row
             for row in rows
-            if self._as_bool(row.get("ready_boltzmann"))
-            and math.isfinite(self._as_float(row.get("overpotential_boltzmann_V")))
+            if self._as_bool(row.get("ready", row.get("ready_min", False)))
+            and math.isfinite(
+                self._as_float(row.get("overpotential_V", row.get("overpotential_min_V")))
+            )
         ]
         if not ready:
             return []
 
         population_sum = sum(
-            max(0.0, self._as_float(row.get("population_total"))) for row in ready
+            max(0.0, self._as_float(row.get("route_weight_raw")))
+            for row in ready
         )
         if population_sum > 0.0:
             population_missing = max(0.0, 1.0 - population_sum)
         else:
             population_missing = 0.0
 
-        temperature = self._boltzmann_temperature()
-        kbt = _KB_EV_PER_K * temperature
-        delta_g1 = [self._as_float(row.get("DeltaG1_boltzmann_eV")) for row in ready]
-        minimum = min(delta_g1)
-        raw_weights = [
-            math.exp(-(value - minimum) / kbt)
-            for value in delta_g1
-        ]
-        weight_sum = sum(raw_weights)
-        if weight_sum > 0.0:
-            weights = [value / weight_sum for value in raw_weights]
-        else:
+        weights = [self._as_float(row.get("route_weight")) for row in ready]
+        if any(not math.isfinite(value) for value in weights) or sum(weights) <= 0.0:
             weights = [1.0 / len(ready)] * len(ready)
         eta_weighted_mean = sum(
-            weight * self._as_float(row.get("overpotential_boltzmann_V"))
+            weight * self._as_float(row.get("overpotential_V", row.get("overpotential_min_V")))
             for weight, row in zip(weights, ready)
         )
         min_eta_row = min(
             ready,
-            key=lambda row: self._as_float(row.get("overpotential_boltzmann_V")),
+            key=lambda row: self._as_float(row.get("overpotential_V", row.get("overpotential_min_V"))),
         )
         dominant_weight, dominant_row = max(
             zip(weights, ready),
@@ -1250,23 +2354,21 @@ class OERCHESummarizer:
         return [
             {
                 "source": "oer_routes.csv",
-                "n_ready_sites": len(ready),
+                "n_ready_routes": len(ready),
                 "population_sum_ready": population_sum,
                 "population_missing": population_missing,
-                "site_weight_model": "dilute_oh_deltag1",
-                "site_degeneracy_model": "uniform",
-                "boltzmann_temperature_K": ready[0].get("boltzmann_temperature_K", ""),
-                "boltzmann_energy_cluster_tol_eV": ready[0].get(
-                    "boltzmann_energy_cluster_tol_eV",
-                    "",
-                ),
+                "route_weight_model": "parent_population_times_child_basin_counts",
+                "basin_cluster_mode": self._basin_cluster_mode(),
+                "basin_energy_cluster_tol_eV": self._basin_energy_cluster_tol(),
                 "route_weighted_mean_overpotential_V": eta_weighted_mean,
                 "min_site_overpotential_V": self._as_float(
-                    min_eta_row.get("overpotential_boltzmann_V"),
+                    min_eta_row.get("overpotential_V", min_eta_row.get("overpotential_min_V")),
                 ),
-                "min_site_overpotential_site_id": min_eta_row.get("site_id", ""),
-                "dominant_weight_site_id": dominant_row.get("site_id", ""),
-                "dominant_weight_fraction": dominant_weight,
+                "min_overpotential_route_id": min_eta_row.get("route_id", ""),
+                "min_overpotential_site_id": min_eta_row.get("site_id", ""),
+                "dominant_route_id": dominant_row.get("route_id", ""),
+                "dominant_route_site_id": dominant_row.get("site_id", ""),
+                "dominant_route_weight": dominant_weight,
             }
         ]
 
@@ -1341,6 +2443,54 @@ class OERCHESummarizer:
                 f"che.{label}_thermo.atoms is required when no built-in reference is available."
             )
         return molecule(name)
+
+    @staticmethod
+    def _read_atoms_list(path: Path):
+        atoms = read(str(path), index=":")
+        if isinstance(atoms, list):
+            return atoms
+        return [atoms]
+
+    @staticmethod
+    def _candidate_index(row: dict[str, object]) -> int:
+        try:
+            return int(float(str(row.get("candidate_index", ""))))
+        except (TypeError, ValueError):
+            return -1
+
+    @staticmethod
+    def _adsorbate_indices(atoms, candidate_row: dict[str, object]) -> list[int]:
+        if "reaction_is_adsorbate" in atoms.arrays:
+            mask = np.asarray(atoms.arrays["reaction_is_adsorbate"], dtype=bool)
+            return [int(idx) for idx, value in enumerate(mask) if value]
+
+        text = str(candidate_row.get("atom_is_adsorbate", "")).strip()
+        if text:
+            try:
+                values = [int(part) for part in text.split()]
+            except ValueError:
+                values = []
+            if len(values) == len(atoms):
+                return [idx for idx, value in enumerate(values) if value]
+
+        tags = atoms.get_tags()
+        if len(tags):
+            return [int(idx) for idx, value in enumerate(tags) if int(value) != 0]
+        return []
+
+    @staticmethod
+    def _xy_distance(atoms, xy_a: np.ndarray, xy_b: np.ndarray) -> float:
+        point_a = np.array([float(xy_a[0]), float(xy_a[1]), 0.0], dtype=float)
+        point_b = np.array([float(xy_b[0]), float(xy_b[1]), 0.0], dtype=float)
+        if any(atoms.pbc[:2]):
+            delta = get_distances(
+                point_a.reshape(1, 3),
+                point_b.reshape(1, 3),
+                cell=atoms.get_cell(),
+                pbc=atoms.get_pbc(),
+            )[0][0, 0]
+            return float(np.linalg.norm(delta[:2]))
+        return float(np.linalg.norm((point_b - point_a)[:2]))
 
     @staticmethod
     def _site_population(manifest_row: dict[str, object]) -> object:

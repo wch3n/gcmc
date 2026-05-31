@@ -11,6 +11,7 @@ _OUTPUT_NAMES = {
     "representatives_traj": "representatives.traj",
     "site_manifest_csv": "site_manifest.csv",
     "candidate_manifest_csv": "candidate_manifest.csv",
+    "local_cmc_manifest_csv": "local_cmc_manifest.csv",
     "state_relaxation_manifest_csv": "state_relaxation_manifest.csv",
     "state_relaxation_log": "state_relaxation.log",
     "vibration_summary_csv": "vibration_summary.csv",

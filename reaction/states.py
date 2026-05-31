@@ -11,7 +11,9 @@ from typing import Iterable, Sequence
 import numpy as np
 from ase import Atoms
 from ase.io import read, write
+from ase.optimize import LBFGS
 
+from gcmc.workflows import build_adsorbate_gcmc_calculator
 from gcmc.utils import build_surface_site_registry
 
 from .output_files import output_path
@@ -29,6 +31,15 @@ _DEFAULT_CANDIDATE_CONFIG = {
     "oo_bond_A": 1.45,
     "terminal_oh_bond_A": 0.98,
     "ooh_tilt_z": 0.45,
+    "child_slab_mode": "parent_conditioned",
+    "child_slab_relax_fmax": 0.05,
+    "child_slab_relax_steps": 300,
+    "child_slab_relax_log_file": None,
+    "calculator": None,
+    "model": None,
+    "model_file": None,
+    "device": None,
+    "use_kokkos": None,
 }
 
 _ORIGIN_INDEX_ARRAY = "reaction_origin_index"
@@ -240,6 +251,37 @@ class ReactionCandidateGenerator:
             adsorbate_indices = self._adsorbate_indices(atoms, anchor_idx)
             self._ensure_provenance_arrays(atoms, adsorbate_indices)
 
+            child_slab_mode = self._child_slab_mode()
+            if child_slab_mode != "parent_conditioned":
+                slab, _ = self._delete_indices(atoms, adsorbate_indices, anchor_idx)
+                if child_slab_mode == "relaxed_parent_stripped":
+                    slab = self._relax_child_slab(slab, site_row, rep_index)
+
+                if bool(self.candidate_config.get("include_original_o_site", True)):
+                    direct = self._generate_direct_o_on_slab(
+                        slab,
+                        atoms,
+                        row,
+                        site_row,
+                        rep_index,
+                        anchor_idx,
+                    )
+                    if direct is not None:
+                        candidates.append(direct)
+
+                if bool(self.candidate_config.get("include_nearby_o_sites", True)):
+                    candidates.extend(
+                        self._generate_shifted_o_on_slab(
+                            slab,
+                            atoms,
+                            row,
+                            site_row,
+                            rep_index,
+                            anchor_idx,
+                        )
+                    )
+                continue
+
             if bool(self.candidate_config.get("include_original_o_site", True)):
                 o_atoms, o_anchor = self._delete_indices(atoms, [h_idx], anchor_idx)
                 metadata = self._base_metadata(
@@ -266,6 +308,99 @@ class ReactionCandidateGenerator:
                 )
         return candidates
 
+    def _child_slab_mode(self) -> str:
+        mode = str(
+            self.candidate_config.get("child_slab_mode", "parent_conditioned")
+        ).lower()
+        aliases = {
+            "parent": "parent_conditioned",
+            "oh_parent": "parent_conditioned",
+            "stripped": "parent_stripped",
+            "clean": "parent_stripped",
+            "relaxed_clean": "relaxed_parent_stripped",
+            "relaxed": "relaxed_parent_stripped",
+        }
+        mode = aliases.get(mode, mode)
+        allowed = {
+            "parent_conditioned",
+            "parent_stripped",
+            "relaxed_parent_stripped",
+        }
+        if mode not in allowed:
+            raise ValueError(
+                "candidate_generation.child_slab_mode must be one of "
+                "'parent_conditioned', 'parent_stripped', or "
+                "'relaxed_parent_stripped'."
+            )
+        return mode
+
+    def _generate_direct_o_on_slab(
+        self,
+        slab: Atoms,
+        source: Atoms,
+        representative_row: dict[str, object],
+        site_row: dict[str, object],
+        rep_index: int,
+        anchor_idx: int,
+    ) -> tuple[Atoms, dict[str, object]] | None:
+        registry = self._surface_site_registry(slab)
+        site = self._matching_parent_site(registry, site_row)
+        if site is None:
+            return None
+        candidate = slab.copy()
+        position = np.array(
+            [
+                float(np.asarray(site["xy"])[0]),
+                float(np.asarray(site["xy"])[1]),
+                float(site["suggested_z_A"]),
+            ],
+            dtype=float,
+        )
+        anchor_new = self._append_adsorbate_atoms(
+            candidate,
+            Atoms("O", positions=[position]),
+            source,
+        )[0]
+        metadata = self._base_metadata(
+            site_row,
+            representative_row,
+            state="02_O",
+            species="O",
+            candidate_id=f"rep{rep_index:03d}_o_direct",
+            candidate_kind="direct_parent_stripped",
+            anchor_index=anchor_new,
+        )
+        metadata.update(
+            {
+                "source_anchor_index": int(anchor_idx),
+                "candidate_site_type": site.get("site_type", ""),
+                "candidate_support_indices": " ".join(
+                    str(int(idx)) for idx in site.get("support_indices", [])
+                ),
+                "candidate_site_xy_distance_A": 0.0,
+                "candidate_site_suggested_z_A": float(site["suggested_z_A"]),
+                "child_slab_mode": self._child_slab_mode(),
+            }
+        )
+        self._annotate_candidate(candidate, metadata)
+        return candidate, metadata
+
+    def _matching_parent_site(
+        self,
+        registry: Sequence[dict[str, object]],
+        site_row: dict[str, object],
+    ) -> dict[str, object] | None:
+        parent_support = self._support_tuple(site_row.get("support_indices_sorted", ""))
+        parent_site_type = str(site_row.get("site_type", ""))
+        for site in registry:
+            if bool(site.get("blocked_by_termination", False)):
+                continue
+            support = tuple(sorted(int(idx) for idx in site.get("support_indices", [])))
+            site_type = str(site.get("site_type", ""))
+            if site_type == parent_site_type and support == parent_support:
+                return dict(site)
+        return None
+
     def _generate_shifted_o_candidates(
         self,
         atoms: Atoms,
@@ -276,8 +411,26 @@ class ReactionCandidateGenerator:
     ) -> list[tuple[Atoms, dict[str, object]]]:
         adsorbate_indices = self._adsorbate_indices(atoms, anchor_idx)
         slab, _ = self._delete_indices(atoms, adsorbate_indices, anchor_idx)
+        return self._generate_shifted_o_on_slab(
+            slab,
+            atoms,
+            representative_row,
+            site_row,
+            rep_index,
+            anchor_idx,
+        )
+
+    def _generate_shifted_o_on_slab(
+        self,
+        slab: Atoms,
+        source: Atoms,
+        representative_row: dict[str, object],
+        site_row: dict[str, object],
+        rep_index: int,
+        anchor_idx: int,
+    ) -> list[tuple[Atoms, dict[str, object]]]:
         registry = self._surface_site_registry(slab)
-        anchor_xy = atoms.positions[anchor_idx, :2]
+        anchor_xy = source.positions[anchor_idx, :2]
         parent_support = self._support_tuple(site_row.get("support_indices_sorted", ""))
         parent_site_type = str(site_row.get("site_type", ""))
 
@@ -310,7 +463,7 @@ class ReactionCandidateGenerator:
             anchor_new = self._append_adsorbate_atoms(
                 candidate,
                 Atoms("O", positions=[position]),
-                atoms,
+                source,
             )[0]
             support = " ".join(str(int(idx)) for idx in site.get("support_indices", []))
             metadata = self._base_metadata(
@@ -330,9 +483,47 @@ class ReactionCandidateGenerator:
                     "candidate_site_suggested_z_A": float(site["suggested_z_A"]),
                 }
             )
+            if self._child_slab_mode() != "parent_conditioned":
+                metadata["child_slab_mode"] = self._child_slab_mode()
             self._annotate_candidate(candidate, metadata)
             candidates.append((candidate, metadata))
         return candidates
+
+    def _relax_child_slab(
+        self,
+        slab: Atoms,
+        site_row: dict[str, object],
+        rep_index: int,
+    ) -> Atoms:
+        atoms = slab.copy()
+        atoms.calc = self._build_child_slab_calculator()
+        log_file = self.candidate_config.get("child_slab_relax_log_file")
+        logfile = None
+        if log_file not in (None, "", False):
+            path = Path(str(log_file))
+            if not path.is_absolute():
+                path = Path(str(site_row.get("reactions_dir", "."))) / path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            logfile = str(path.with_name(f"{path.stem}_rep{rep_index:03d}{path.suffix}"))
+        dyn = LBFGS(atoms, logfile=logfile)
+        dyn.run(
+            fmax=float(self.candidate_config.get("child_slab_relax_fmax", 0.05)),
+            steps=int(self.candidate_config.get("child_slab_relax_steps", 300)),
+        )
+        atoms.calc = None
+        return atoms
+
+    def _build_child_slab_calculator(self):
+        values = vars(self.config).copy()
+        for key in ("calculator", "model", "model_file", "device", "use_kokkos"):
+            value = self.candidate_config.get(key)
+            if value not in (None, ""):
+                values[key] = value
+        cfg = SimpleNamespace(**values)
+        return build_adsorbate_gcmc_calculator(
+            cfg,
+            {"device": values.get("device") or getattr(self.config, "device", None)},
+        )
 
     def _generate_ooh_candidates(
         self,

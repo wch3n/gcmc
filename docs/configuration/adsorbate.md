@@ -39,11 +39,16 @@ This page documents the YAML keys used by:
 
 | Key | Workflows | Default | Meaning |
 | --- | --- | --- | --- |
-| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. Supported values: `displacement`, `site_hop`, `reorientation`, `hybrid`. |
+| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. Supported values: `displacement`, `site_hop`, `reorientation`, `puckering`, `puckering_hop`, `hybrid`. |
 | `displacement_sigma` | all | `0.6` for CMC, `0.25` for GCMC | Step size for local displacement moves. |
 | `max_displacement_trials` | all | `20` | Retry budget for generating a valid displacement proposal. |
 | `site_hop_prob` | all | `0.5` for CMC, `0.25` for GCMC | In `move_mode: hybrid`, probability of selecting a site hop. |
 | `reorientation_prob` | all | `0.2` for CMC, `0.0` for GCMC | In `move_mode: hybrid`, probability of selecting a rigid-body reorientation. |
+| `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, probability of selecting a coupled local surface-atom puckering move. |
+| `puckering_hop_prob` | all | `0.0` | In `move_mode: hybrid`, probability of resetting the current puckered support atom to its initial local-CMC height, hopping to another site, and puckering a support atom at the target site. |
+| `puckering_elements` | all | `None` | Elements eligible for puckering. `None` uses `site_elements`; for MXenes set this to the metal elements, e.g. `[Ti]` or `[Ti, Zr, Mo]`. |
+| `puckering_height_A` | all | `0.15` | Maximum outward displacement relative to the initial local-CMC support-atom height for puckering proposals. |
+| `max_puckering_trials` | all | `None` | Retry budget for puckering proposals. `None` uses the displacement retry budget. |
 | `rotation_max_angle_deg` | all | `25.0` | Maximum absolute rotation angle used for reorientation. |
 | `max_reorientation_trials` | all | `None` | Retry budget for rigid-body reorientation proposals. `None` lets the engine use its internal default. |
 

@@ -52,6 +52,64 @@ candidate_generation:
   nearby_site_radius_A: 3.0
   max_nearby_sites: 8
   ooh_orientations: 8
+  child_slab_mode: parent_conditioned
+  child_slab_relax_fmax: 0.05
+  child_slab_relax_steps: 300
+  child_slab_relax_log_file: null
+
+parent_stability_screen:
+  enabled: false
+  state: 01_OH
+  output_manifest: candidate_manifest_parent_stable.csv
+  skip_existing: false
+
+local_cmc:
+  enabled: false
+  states: [02_O, 03_OOH]
+  region:
+    center_state: 01_OH
+    radius_A: 3.0
+    distance_metric: xy
+  sampling:
+    temperature_K: 303.0
+    n_cycles: 500
+    sample_interval: 25
+    equilibration_cycles: 100
+    max_seed_candidates_per_state: 1
+    max_output_candidates_per_state: 50
+    output_selection: diverse
+    replace_candidates: true
+  pt:
+    enabled: false
+    temperatures_K: [303.0, 400.0, 500.0, 600.0]
+    target_temperature_K: 303.0
+    swap_interval: 10
+  backend:
+    backend: multiprocessing
+    n_gpus: 1
+    workers_per_gpu: 1
+  moves:
+    mode: hybrid
+    site_hop_prob: 0.6
+    reorientation_prob: 0.3
+    displacement_sigma: 0.2
+    puckering:
+      prob: 0.0
+      hop_prob: 0.0
+      elements: null
+      height_A: 0.15
+  md:
+    enabled: false
+    move_prob: 0.05
+    steps: 20
+    timestep_fs: 0.5
+  output:
+    write_debug_trajs: false
+    write_attempted_traj: false
+    write_accepted_traj: false
+    write_rejected_traj: false
+    progress_log: local_cmc.log
+    progress_stdout: true
 
 state_relaxation:
   enabled: false
@@ -74,6 +132,9 @@ vibrations:
   delta_A: 0.01
   nfree: 2
   ignore_imag_modes: false
+  imag_mode_policy: threshold
+  imag_frequency_threshold_cm1: 50.0
+  max_imag_modes: 1
   states: [clean, oh, o, ooh]
   skip_existing: true
   progress_log: vibration.log
@@ -124,4 +185,11 @@ che:
   equilibrium_potential_V: 1.23
   boltzmann_weight_states: true
   boltzmann_temperature_K: 303.0
+  boltzmann_cluster_mode: geometry
+  boltzmann_geometry_rmsd_tol_A: 0.25
+  boltzmann_geometry_site_tol_A: null
+  basin_local_env_enabled: true
+  basin_local_env_cutoff_A: 3.5
+  basin_local_env_rmsd_tol_A: 0.20
+  basin_weight_source: trajectory
   boltzmann_energy_cluster_tol_eV: 0.01

@@ -824,6 +824,196 @@ class TestAdsorbateCMCReorientation(unittest.TestCase):
         self.assertLess(np.linalg.norm(rotated[1] - rotated[0]), 1.0)
 
 
+class TestAdsorbateCMCPuckering(unittest.TestCase):
+    def _make_sim(self, **overrides) -> AdsorbateCMC:
+        data = dict(
+            atoms=_make_oh_surface(),
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate_element="O",
+            adsorbate=Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)]),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="puckering",
+            puckering_height_A=0.2,
+            max_puckering_trials=4,
+            min_clearance=1.0,
+            termination_clearance=0.0,
+            seed=29,
+        )
+        data.update(overrides)
+        return AdsorbateCMC(**data)
+
+    def test_puckering_lifts_support_atom_and_adsorbate_group_together(self):
+        sim = self._make_sim()
+        original = sim.atoms.positions.copy()
+
+        trial = sim._propose_puckering()
+
+        self.assertIsNotNone(trial)
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        support_idx = 0
+        support_dz = trial.positions[support_idx, 2] - original[support_idx, 2]
+
+        self.assertGreater(support_dz, 0.0)
+        self.assertLessEqual(support_dz, sim.puckering_height_A)
+        self.assertTrue(np.allclose(trial.positions[group, :2], original[group, :2]))
+        self.assertTrue(
+            np.allclose(trial.positions[group, 2] - original[group, 2], support_dz)
+        )
+        self.assertAlmostEqual(
+            trial.positions[group[0], 2] - trial.positions[support_idx, 2],
+            sim.vertical_offset,
+            places=10,
+        )
+
+    def test_puckering_reseats_far_atop_anchor_to_vertical_offset(self):
+        atoms = Atoms(
+            "TiOH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 3.5),
+                (0.0, 0.0, 4.48),
+            ],
+            cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[False, False, False],
+        )
+        atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Ti",),
+            site_elements=("Ti",),
+            support_xy_tol=1.2,
+            z_max_support=5.0,
+            min_clearance=0.7,
+        )
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        original = sim.atoms.positions.copy()
+
+        trial = sim._propose_puckering()
+
+        self.assertIsNotNone(trial)
+        self.assertGreater(trial.positions[0, 2] - original[0, 2], 0.0)
+        self.assertLess(trial.positions[group[0], 2] - original[group[0], 2], 0.0)
+        self.assertAlmostEqual(
+            trial.positions[group[0], 2] - trial.positions[0, 2],
+            sim.vertical_offset,
+            places=10,
+        )
+
+    def test_hybrid_probabilities_include_puckering_probability(self):
+        with self.assertRaisesRegex(ValueError, "puckering_prob"):
+            self._make_sim(
+                move_mode="hybrid",
+                site_hop_prob=0.6,
+                reorientation_prob=0.3,
+                puckering_prob=0.2,
+            )
+
+    def test_puckering_elements_restrict_support_atom_selection(self):
+        atoms = Atoms(
+            "OPtOH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (0.4, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.0, 0.0, 2.78),
+            ],
+            cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[False, False, False],
+        )
+        atoms.set_tags([0, 0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Pt", "O"),
+            site_elements=("Pt", "O"),
+            puckering_elements=("Pt",),
+            support_xy_tol=1.2,
+            min_clearance=0.7,
+        )
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+
+        self.assertEqual(sim._nearest_support_atom_for_anchor(group), 1)
+
+    def test_puckering_requires_atop_anchor(self):
+        atoms = Atoms(
+            "PtOH",
+            positions=[
+                (1.6, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.0, 0.0, 2.78),
+            ],
+            cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[False, False, False],
+        )
+        atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Pt",),
+            site_elements=("Pt",),
+            puckering_elements=("Pt",),
+            support_xy_tol=1.2,
+            termination_site_xy_tol=2.2,
+            min_clearance=0.7,
+        )
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+
+        self.assertIsNone(sim._nearest_support_atom_for_anchor(group))
+        self.assertIsNone(sim._propose_puckering())
+
+    def test_puckering_hop_transfers_pucker_to_another_site(self):
+        atoms = Atoms(
+            "Pt2OH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (3.0, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.0, 0.0, 2.78),
+            ],
+            cell=[[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[True, True, False],
+        )
+        atoms.set_tags([0, 0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Pt",),
+            site_elements=("Pt",),
+            site_type="atop",
+            move_mode="puckering_hop",
+            support_xy_tol=1.2,
+            min_clearance=0.7,
+        )
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        sim.atoms.positions[0, 2] += 0.4
+        sim.atoms.positions[group, 2] += 0.4
+        original = sim.atoms.positions.copy()
+
+        trial = sim._propose_puckering_hop()
+
+        self.assertIsNotNone(trial)
+        dz0 = trial.positions[0, 2] - original[0, 2]
+        dz1 = trial.positions[1, 2] - original[1, 2]
+        anchor_idx = sim.ads_anchor_indices[0]
+
+        self.assertLess(dz0, 0.0)
+        self.assertGreater(dz1, 0.0)
+        self.assertAlmostEqual(
+            trial.positions[0, 2],
+            sim._puckering_reference_positions[0, 2],
+            places=10,
+        )
+        self.assertLessEqual(dz1, sim.puckering_height_A)
+        self.assertAlmostEqual(trial.positions[anchor_idx, 0], 3.0, places=10)
+        self.assertAlmostEqual(
+            trial.positions[anchor_idx, 2] - trial.positions[1, 2],
+            sim.vertical_offset,
+            places=10,
+        )
+
+
 class TestAmbiguousEmptyMolecularAdsorbates(unittest.TestCase):
     def test_clean_trial_without_tags_is_treated_as_empty(self):
         slab = Atoms(

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Iterable, Sequence
 
 import numpy as np
-from ase import Atoms
+from ase import Atoms, units
 from ase.io import read
 from ase.thermochemistry import HarmonicThermo
 from ase.vibrations import Vibrations
@@ -30,6 +30,9 @@ _DEFAULT_VIBRATION_CONFIG = {
     "delta_A": 0.01,
     "nfree": 2,
     "ignore_imag_modes": False,
+    "imag_mode_policy": "strict",
+    "imag_frequency_threshold_cm1": 50.0,
+    "max_imag_modes": 1,
     "states": ["00_clean", "01_OH", "02_O", "03_OOH"],
     "skip_existing": True,
     "progress_stdout": True,
@@ -54,6 +57,11 @@ _STATE_ALIASES = {
 }
 
 _CLEAN_STATE_DIR = "00_clean"
+_IMAG_TOL_EV = 1.0e-12
+
+
+class ImaginaryModeError(ValueError):
+    """Raised when a vibration result fails the configured imaginary-mode gate."""
 
 
 def default_vibration_config() -> dict[str, object]:
@@ -310,12 +318,24 @@ class ReactionStateVibrationWorkflow:
             )
             vib.run()
             vib_energies = vib.get_energies()
+            imag_summary = self._imaginary_mode_summary(vib_energies)
+            output.update(
+                {
+                    "imag_mode_policy": self._imag_mode_policy(),
+                    "imag_frequency_threshold_cm1": self._imag_frequency_threshold_cm1(),
+                    "max_imag_modes_allowed": self._max_imag_modes(),
+                    "n_imag_modes": imag_summary["n_imag_modes"],
+                    "max_imag_frequency_cm1": imag_summary["max_imag_frequency_cm1"],
+                    "imag_mode_status": imag_summary["status"],
+                }
+            )
+            thermo_energies = self._thermo_vib_energies(vib_energies, imag_summary)
             temperature = float(self.vibration_config.get("temperature_K", 303.0))
             potential = float(energy_row.get("energy_eV"))
             thermo = HarmonicThermo(
-                vib_energies=vib_energies,
+                vib_energies=thermo_energies,
                 potentialenergy=potential,
-                ignore_imag_modes=bool(self.vibration_config.get("ignore_imag_modes", False)),
+                ignore_imag_modes=False,
             )
             zpe = float(thermo.get_ZPE_correction())
             internal = float(thermo.get_internal_energy(temperature, verbose=False))
@@ -334,7 +354,7 @@ class ReactionStateVibrationWorkflow:
                     "minus_TS_eV": -temperature * entropy,
                     "harmonic_free_energy_eV": free_energy,
                     "harmonic_correction_eV": free_energy - potential,
-                    "n_imag_modes": int(getattr(thermo, "n_imag", 0)),
+                    "n_imag_modes": imag_summary["n_imag_modes"],
                     "vibrated_indices": " ".join(str(idx) for idx in vib_indices),
                     "adsorbate_indices": " ".join(str(idx) for idx in adsorbate_indices),
                     "error": "",
@@ -354,13 +374,139 @@ class ReactionStateVibrationWorkflow:
                     "minus_TS_eV": "",
                     "harmonic_free_energy_eV": "",
                     "harmonic_correction_eV": "",
-                    "n_imag_modes": "",
+                    "n_imag_modes": output.get("n_imag_modes", ""),
+                    "imag_mode_policy": output.get("imag_mode_policy", self._imag_mode_policy()),
+                    "imag_frequency_threshold_cm1": output.get(
+                        "imag_frequency_threshold_cm1",
+                        self._imag_frequency_threshold_cm1(),
+                    ),
+                    "max_imag_modes_allowed": output.get(
+                        "max_imag_modes_allowed",
+                        self._max_imag_modes(),
+                    ),
+                    "max_imag_frequency_cm1": output.get("max_imag_frequency_cm1", ""),
+                    "imag_mode_status": output.get("imag_mode_status", "failed"),
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
 
         self._write_csv(result_csv, [output])
         return self._summary_row(output)
+
+    def _imag_mode_policy(self) -> str:
+        raw_policy = self.vibration_config.get("imag_mode_policy")
+        if raw_policy in (None, "", "strict") and bool(
+            self.vibration_config.get("ignore_imag_modes", False)
+        ):
+            raw_policy = "ignore"
+        raw = str(raw_policy or "strict").strip().lower()
+        aliases = {
+            "strict": "strict",
+            "fail": "strict",
+            "error": "strict",
+            "false": "strict",
+            "threshold": "threshold",
+            "loose": "threshold",
+            "soft": "threshold",
+            "ignore": "ignore",
+            "true": "ignore",
+            "remove": "ignore",
+        }
+        policy = aliases.get(raw)
+        if policy is None:
+            raise ValueError(
+                "vibrations.imag_mode_policy must be 'strict', 'threshold', or 'ignore'."
+            )
+        return policy
+
+    def _imag_frequency_threshold_cm1(self) -> float:
+        value = self.vibration_config.get("imag_frequency_threshold_cm1")
+        if value in (None, ""):
+            value = self.vibration_config.get("imag_frequency_threshold_cm-1")
+        if value in (None, ""):
+            value = self.vibration_config.get("max_imag_frequency_cm1")
+        if value in (None, ""):
+            value = self.vibration_config.get("max_imag_frequency_cm-1", 50.0)
+        threshold = float(value)
+        if threshold < 0.0 or not np.isfinite(threshold):
+            raise ValueError(
+                "vibrations.imag_frequency_threshold_cm1 must be a non-negative number."
+            )
+        return threshold
+
+    def _max_imag_modes(self) -> int:
+        count = int(self.vibration_config.get("max_imag_modes", 1))
+        if count < 0:
+            raise ValueError("vibrations.max_imag_modes must be non-negative.")
+        return count
+
+    def _imaginary_mode_summary(self, vib_energies: Sequence[object]) -> dict[str, object]:
+        frequencies = [
+            self._imag_frequency_cm1(value)
+            for value in vib_energies
+            if self._is_imaginary_mode(value)
+        ]
+        max_frequency = max(frequencies) if frequencies else 0.0
+        return {
+            "n_imag_modes": len(frequencies),
+            "max_imag_frequency_cm1": max_frequency,
+            "status": "none" if not frequencies else "unchecked",
+        }
+
+    def _thermo_vib_energies(
+        self,
+        vib_energies: Sequence[object],
+        imag_summary: dict[str, object],
+    ) -> np.ndarray:
+        policy = self._imag_mode_policy()
+        n_imag = int(imag_summary.get("n_imag_modes", 0))
+        max_frequency = self._as_float(imag_summary.get("max_imag_frequency_cm1", 0.0))
+        if n_imag <= 0:
+            imag_summary["status"] = "none"
+            return np.real(np.asarray(vib_energies, dtype=complex))
+
+        if policy == "strict":
+            imag_summary["status"] = "rejected"
+            raise ImaginaryModeError(
+                f"{n_imag} imaginary vibrational mode(s) present "
+                f"(max {max_frequency:.2f} cm^-1); policy is strict."
+            )
+
+        if policy == "threshold":
+            threshold = self._imag_frequency_threshold_cm1()
+            max_modes = self._max_imag_modes()
+            if n_imag > max_modes or max_frequency > threshold:
+                imag_summary["status"] = "rejected"
+                raise ImaginaryModeError(
+                    f"{n_imag} imaginary vibrational mode(s) present "
+                    f"(max {max_frequency:.2f} cm^-1), exceeding threshold "
+                    f"{threshold:.2f} cm^-1 or max_imag_modes={max_modes}."
+                )
+            imag_summary["status"] = "accepted_soft"
+        else:
+            imag_summary["status"] = "ignored"
+
+        cleaned = [
+            complex(value).real
+            for value in vib_energies
+            if not self._is_imaginary_mode(value)
+        ]
+        if not cleaned:
+            raise ImaginaryModeError("No real vibrational modes remain after filtering.")
+        return np.asarray(cleaned, dtype=float)
+
+    @staticmethod
+    def _is_imaginary_mode(value: object) -> bool:
+        energy = complex(value)
+        if abs(energy.imag) > _IMAG_TOL_EV:
+            return True
+        return energy.real < -_IMAG_TOL_EV
+
+    @staticmethod
+    def _imag_frequency_cm1(value: object) -> float:
+        energy = complex(value)
+        magnitude = abs(energy.imag) if abs(energy.imag) > _IMAG_TOL_EV else abs(energy.real)
+        return float(magnitude / units.invcm)
 
     def _resolve_clean_mask(
         self,
@@ -454,6 +600,11 @@ class ReactionStateVibrationWorkflow:
             "harmonic_free_energy_eV",
             "harmonic_correction_eV",
             "n_imag_modes",
+            "max_imag_frequency_cm1",
+            "imag_mode_policy",
+            "imag_frequency_threshold_cm1",
+            "max_imag_modes_allowed",
+            "imag_mode_status",
             "error",
         )
         return {column: result_row.get(column, "") for column in columns}

@@ -1,4 +1,4 @@
-"""Command-line entry points for reaction workflows."""
+"""Command-line entry points for OER reaction workflows."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from .workflow import ReactionPostProcessingWorkflow
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run reaction post-processing from a YAML config.",
+        description="Run the OER workflow from a YAML config.",
     )
     parser.add_argument(
         "--config",
         type=Path,
         required=True,
-        help="Reaction post-processing YAML config.",
+        help="OER workflow YAML config.",
     )
     args = parser.parse_args()
 

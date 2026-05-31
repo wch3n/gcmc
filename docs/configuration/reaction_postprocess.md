@@ -1,6 +1,6 @@
-# Reaction Post-Processing Workflow
+# OER Workflow
 
-The reaction post-processing workflow turns MC/PT adsorbate trajectories into
+The OER workflow turns MC/PT adsorbate trajectories into
 site-resolved parent adsorbate ensembles. It is intended as the reusable first
 stage for parent-conditioned reaction analysis, including OER.
 
@@ -19,7 +19,7 @@ Current implemented stages:
 ## Runner
 
 ```bash
-gcmc-reaction-postprocess --config reaction_postprocess.yaml
+gcmc-oer-workflow --config reaction_postprocess.yaml
 ```
 
 ## Layout
@@ -62,6 +62,25 @@ candidate_generation:
   nearby_site_radius_A: 3.0
   max_nearby_sites: 8
   ooh_orientations: 8
+  child_slab_mode: parent_conditioned
+
+parent_stability_screen:
+  enabled: false
+  state: 01_OH
+  output_manifest: candidate_manifest_parent_stable.csv
+  skip_existing: false
+
+local_cmc:
+  enabled: false
+  states: [02_O, 03_OOH]
+  center_state: 01_OH
+  radius_A: 3.0
+  distance_metric: xy
+  temperature_K: 303.0
+  n_cycles: 500
+  sample_interval: 25
+  output_selection: diverse
+  write_debug_trajs: false
 
 state_relaxation:
   enabled: false
@@ -84,6 +103,9 @@ vibrations:
   delta_A: 0.01
   nfree: 2
   ignore_imag_modes: false
+  imag_mode_policy: threshold
+  imag_frequency_threshold_cm1: 50.0
+  max_imag_modes: 1
   states: [clean, oh, o, ooh]
   skip_existing: true
   progress_log: vibration.log
@@ -132,9 +154,18 @@ che:
   oer_reference_mode: auto
   total_oer_free_energy_eV: 4.92
   equilibrium_potential_V: 1.23
-  boltzmann_weight_states: true
-  boltzmann_temperature_K: 303.0
-  boltzmann_energy_cluster_tol_eV: 0.01
+  route_ensemble: true
+  route_pairing_mode: compatible
+  route_parent_weight_model: population
+  route_temperature_K: 303.0
+  basin_cluster_mode: geometry
+  basin_geometry_rmsd_tol_A: 0.25
+  basin_geometry_site_tol_A: null
+  basin_local_env_enabled: true
+  basin_local_env_cutoff_A: 3.5
+  basin_local_env_rmsd_tol_A: 0.20
+  basin_weight_source: trajectory
+  basin_energy_cluster_tol_eV: 0.01
 ```
 
 ## Sections
@@ -209,6 +240,96 @@ the tagged parent adsorbate from the representative OH* frame.
 | `max_nearby_sites` | Maximum nearby O* sites per parent representative. |
 | `ooh_orientations` | Number of OOH* orientations generated from each O* candidate. |
 | `oo_bond_A`, `terminal_oh_bond_A` | Initial O-O and terminal O-H distances for OOH* candidates. |
+| `child_slab_mode` | Slab used for O*/OOH* child candidates. `parent_conditioned` keeps current behavior; `parent_stripped` removes the parent OH* before placing O; `relaxed_parent_stripped` also relaxes that stripped slab before placing O. |
+| `child_slab_relax_fmax`, `child_slab_relax_steps`, `child_slab_relax_log_file` | Relaxation controls used only when `child_slab_mode: relaxed_parent_stripped`. |
+
+### `parent_stability_screen`
+
+This optional stage runs after candidate generation and before local CMC. It
+relaxes and vibrates only the parent state, usually `01_OH`, using the existing
+`state_relaxation` and `vibrations` settings. Sites whose parent row is not
+`ready` in `vibration_summary.csv` are removed from a filtered candidate
+manifest, and downstream local CMC, full relaxation, vibrations, and CHE use
+that filtered manifest.
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | If true, perform the early parent stability screen. |
+| `state` | Parent state to screen, typically `01_OH`. |
+| `output_manifest` | Filtered candidate manifest path. Relative paths are written under `output_dir`. |
+| `skip_existing` | Applied to the early parent relaxation and vibration stages. Keep `false` when changing the imaginary-mode criterion. |
+
+### `local_cmc`
+
+This optional stage replaces or augments selected generated candidates with
+local adsorbate CMC samples constrained around the matched parent OH* anchor.
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | If true, run local adsorbate CMC for selected state candidates. |
+| `states` | State directories or species to process, typically `[02_O, 03_OOH]`. |
+| `center_state` | State used to find the local-region center, typically `01_OH`. |
+| `radius_A`, `distance_metric` | Local region around the parent anchor. `xy` uses lateral distance. |
+| `temperature_K`, `n_cycles`, `sample_interval`, `equilibration_cycles` | Single-temperature CMC sampling controls. |
+| `pt_enabled`, `temperatures_K`, `target_temperature_K`, `swap_interval`, `swap_stride`, `pt_n_cycles`, `pt_equilibration_cycles`, `pt_local_eq_fraction` | Optional localized temperature replica exchange. `n_cycles` remains the approximate total sweeps when `pt_n_cycles` is unset; only the target-temperature replica is promoted back to candidates. |
+| `backend`, `n_gpus`, `workers_per_gpu`, `ray_*` | Replica execution backend controls for local PT. Use `backend: ray` to reuse the existing Ray replica backend. |
+| `max_seed_candidates_per_state` | Maximum generated candidates used as local-CMC seeds for each state block. |
+| `max_output_candidates_per_state` | Maximum local-CMC samples retained in each state block's `candidates.traj`/`candidates.csv`. |
+| `output_selection` | How retained samples are chosen when more frames are available than `max_output_candidates_per_state`. `diverse` performs farthest-point selection in adsorbate position/shape space; `stride` spreads frames through the trajectory; `first` preserves the old first-N behavior; `last` and `random` are also available. |
+| `move_mode`, `site_hop_prob`, `reorientation_prob`, `puckering_prob`, `puckering_hop_prob`, `puckering_elements`, `puckering_height_A`, `max_puckering_trials`, `displacement_sigma` | Adsorbate CMC proposal controls. |
+| `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
+| `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. |
+| `write_attempted_traj`, `write_accepted_traj`, `write_rejected_traj` | Individually enable specific debug trajectory files. |
+| `skip_existing` | If true, do not rerun CMC/PT for state blocks whose `local_cmc/done` marker exists. Existing local trajectories are still re-promoted into `candidates.traj` using the current `output_selection` and `max_output_candidates_per_state` settings when possible. |
+
+`local_cmc` also accepts grouped subsections. Grouped keys override the
+equivalent flat keys, so old flat configs remain valid.
+
+```yaml
+local_cmc:
+  enabled: true
+  states: [02_O, 03_OOH]
+  region:
+    center_state: 01_OH
+    radius_A: 3.0
+    distance_metric: xy
+  sampling:
+    temperature_K: 298.0
+    n_cycles: 100
+    sample_interval: 5
+    max_seed_candidates_per_state: 1
+    max_output_candidates_per_state: 10
+    output_selection: diverse
+  pt:
+    enabled: true
+    temperatures_K: [298.0, 350.0, 450.0, 600.0]
+    target_temperature_K: 298.0
+    swap_interval: 10
+  backend:
+    backend: ray
+    n_gpus: 1
+    workers_per_gpu: 1
+    ray_num_gpus_per_task: 1.0
+  moves:
+    mode: hybrid
+    site_hop_prob: 0.25
+    reorientation_prob: 0.1
+    displacement_sigma: 0.2
+    puckering:
+      prob: 0.2
+      hop_prob: 0.1
+      elements: [Ti]
+      height_A: 0.15
+  relaxation:
+    enabled: true
+    steps: 50
+    fmax: 0.05
+  md:
+    enabled: false
+  output:
+    write_debug_trajs: true
+    progress_log: local_cmc.log
+```
 
 ### `state_relaxation`
 
@@ -249,7 +370,10 @@ matched exactly across `00_clean`, `01_OH`, `02_O`, and `03_OOH`.
 | `slab_cutoff_A` | Radius around the clean-state parent support site used to define the reusable local slab mask. |
 | `delta_A` | Finite-difference displacement for ASE `Vibrations`. |
 | `nfree` | Number of finite-difference points (`2` or `4`). |
-| `ignore_imag_modes` | Passed to `HarmonicThermo`; keep `false` to fail on non-minima, or set `true` to ignore residual soft imaginary modes. |
+| `ignore_imag_modes` | Legacy switch. If true, all imaginary modes are removed before harmonic thermochemistry. Prefer `imag_mode_policy: threshold` for production screening. |
+| `imag_mode_policy` | `strict` rejects any imaginary mode, `threshold` accepts only soft modes within the configured limits, and `ignore` removes all imaginary modes. |
+| `imag_frequency_threshold_cm1` | Maximum accepted imaginary frequency magnitude in cm^-1 when `imag_mode_policy: threshold`. Values around `20-50` are typical soft-mode tolerances. |
+| `max_imag_modes` | Maximum number of imaginary modes accepted by the threshold policy. |
 | `states` | Optional label filter from `clean`, `oh`, `o`, `ooh`. |
 | `skip_existing` | If true, reuse an existing `reactions/<state>/vibrations/<candidate_id>/result.csv`. |
 | `progress_log` | Progress log path. If omitted, writes `vibration.log` under `output_dir`; set to `false` to disable the file. |
@@ -274,7 +398,7 @@ the configured calculator is used instead.
 | `skip_existing` | If true, reuse existing `summary.yaml` and `che_snippet.yaml` for a molecule. If a molecule-specific `energy_eV` no longer matches the cached summary, the molecule is recomputed. |
 | `overwrite_che_references` | Legacy escape hatch. Direct CHE reference entries are normally omitted; molecule-specific `energy_eV` or `correction_eV` values in `reference_thermo` always take precedence. |
 | `vacuum_A` | Vacuum added around built-in ASE molecule geometries. |
-| `temperature_K`, `pressure_Pa` | Default gas-phase thermodynamic state. If `temperature_K` is omitted, the stage uses `che.boltzmann_temperature_K`, then `303.0` K. |
+| `temperature_K`, `pressure_Pa` | Default gas-phase thermodynamic state. If `temperature_K` is omitted, the stage uses `che.route_temperature_K`, then `303.0` K. |
 | `relaxation` | LBFGS settings for each isolated molecule. |
 | `vibrations` | ASE `Vibrations` settings for each isolated molecule. |
 | `calculator`, `h2`, `h2o`, `o2` | Optional overrides. Use `calculator` for a different model/device; use molecule-specific blocks for `energy_eV`, `correction_eV`, custom `atoms`, `geometry`, `symmetrynumber`, `spin`, or pressure. |
@@ -309,9 +433,18 @@ state is intentionally site-conditioned.
 | `potential_V` | Optional applied potential; reported as shifted step free energies. |
 | `use_converged_only` | If true, choose only converged relaxed candidates for each state. |
 | `allow_unconverged_fallback` | If true, fall back to the lowest finite-energy unconverged candidate when no converged candidate exists. |
-| `boltzmann_weight_states` | If true, also fill Boltzmann route columns in `oer_routes.csv` where OH/O/OOH state energies are finite-temperature log-sum-exp free energies over relaxed candidates. |
-| `boltzmann_temperature_K` | Temperature used for Boltzmann weighting. Use the target OER analysis temperature, e.g. `303.0`. |
-| `boltzmann_energy_cluster_tol_eV` | Optional energy clustering tolerance before Boltzmann weighting. Use a small value, e.g. `0.01`, to reduce artificial degeneracy from trial orientations that relax to the same basin. |
+| `route_ensemble` | If true, write explicit parent-conditioned basin routes instead of collapsing O*/OOH* states into one Boltzmann-averaged state free energy. |
+| `route_pairing_mode` | `compatible` pairs OOH* basins with the O* basin recorded in `parent_o_candidate_id` when available, otherwise falls back to all local combinations. `cartesian` always uses all O* x OOH* basin combinations. |
+| `route_parent_weight_model` | Parent contribution to route weights. The current implementation uses the sampled parent `population_total`; the field is recorded for explicitness. |
+| `route_temperature_K` | Temperature used by route-level thermodynamic helpers. Kept separate from the explicit sample-count basin probabilities. |
+| `basin_cluster_mode` | Candidate de-duplication before route construction. `geometry` clusters by assigned adsorption motif, adsorbate relative geometry, and optionally the local substrate/termination environment; `energy` clusters only by energy; `none` keeps all candidates. |
+| `basin_geometry_rmsd_tol_A` | RMSD tolerance for adsorbate relative positions when `basin_cluster_mode: geometry`. |
+| `basin_geometry_site_tol_A` | Anchor-to-registry-site tolerance for motif assignment. `null` uses `site_match_tol`. |
+| `basin_local_env_enabled` | Include nearby non-adsorbate atoms in the geometry basin descriptor. This separates basins with different local chemistry or puckering around the same adsorbate motif. |
+| `basin_local_env_cutoff_A` | Anchor-centered cutoff for local-environment atoms included in geometry clustering. |
+| `basin_local_env_rmsd_tol_A` | RMSD tolerance for the local-environment descriptor. |
+| `basin_weight_source` | Source of basin populations after representative selection. `trajectory` assigns every saved local CMC/PT frame to the nearest selected basin and uses those counts for route weights; `selected` uses only the selected representative counts. |
+| `basin_energy_cluster_tol_eV` | Energy clustering tolerance used when `basin_cluster_mode: energy`. |
 
 Aggregate outputs:
 
@@ -427,37 +560,29 @@ If CHE is enabled:
 
 - `oer_routes.csv`
 - `oer_states.csv`
-- `oer_ensemble.csv` when `boltzmann_weight_states: true`
+- `oer_ensemble.csv`
 
-`oer_routes.csv` is the primary site-resolved OER table. It has one row per
-parent site and reports the single-minimum route columns
-(`DeltaG*_min_eV`, `overpotential_min_V`) side-by-side with the Boltzmann
-route columns (`DeltaG*_boltzmann_eV`, `overpotential_boltzmann_V`) when
-Boltzmann weighting is enabled.
-It also writes electronic-only route columns without vibrational/ideal-gas
-thermo contributions, such as `DeltaG*_min_electronic_eV` and
-`DeltaG*_boltzmann_electronic_eV`, so the with- and without-vibration profiles
-can be compared without reconstructing them from lower-level files.
+`oer_routes.csv` is the primary OER table. It has one row per explicit
+parent-conditioned basin route: one OH* parent site, one grouped O* child
+basin, and one compatible grouped OOH* child basin. The table reports route
+weights from parent population and child basin sample counts, candidate/basin
+provenance, `DeltaG*_eV`, limiting step, and overpotential.
 
 `oer_states.csv` is the compact provenance table. It has one row per
 `site_id + state_label` and records the selected minimum candidate, effective
 state free energy, energy source (`electronic` or `harmonic`), convergence
-metadata, source `energies.csv`, and the Boltzmann state free energy/count
-when enabled.
-The state table also records electronic-only state free energies
-(`min_electronic_free_energy_eV` and
-`boltzmann_electronic_free_energy_eV`) for provenance.
+metadata, and source `energies.csv`. The state table also records
+electronic-only state free energies (`min_electronic_free_energy_eV`) for
+provenance.
 
 When `use_vibrational_free_energies: true`, the state energies in these OER
 tables are the harmonic free energies for the relaxed candidates whenever a
 ready `vibration_summary.csv` row exists.
 
 `oer_ensemble.csv` is the single top-level ensemble descriptor. It uses the
-site-resolved `DeltaG1_boltzmann_eV` values from `oer_routes.csv` to build a
-dilute-limit OH adsorption weighting,
-`w_p ∝ exp[-DeltaG1,p / (k_B T)]`, with uniform site degeneracy, and reports the
-route-weighted mean of the site-specific overpotentials rather than the
-overpotential of an averaged free-energy profile.
+normalized route weights from `oer_routes.csv` and reports the route-weighted
+mean overpotential, the lowest-overpotential route, and the dominant-weight
+route. This avoids taking the overpotential of an averaged free-energy profile.
 
 The CHE expressions are:
 

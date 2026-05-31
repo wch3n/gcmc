@@ -260,43 +260,50 @@ At minimum, keep the energy bookkeeping explicit:
 If only MLIP energies are used, report the result as a screening-level OER
 profile, not a final DFT-quality overpotential.
 
-## 6. Parent-Conditioned Ensemble Free Energies
+## 6. Parent-Conditioned Basin Routes
 
-For one parent `OH*_p`, the parent free energy is:
-
-```text
-G_OH,p
-```
-
-The child ensemble free energies are:
+For one parent `OH*_p`, first group raw local samples into distinct retained
+basins:
 
 ```text
-G_O|p    = -kBT ln sum_j g_O,j|p    exp[-G_O,j|p    / kBT]
-G_OOH|p = -kBT ln sum_k g_OOH,k|p exp[-G_OOH,k|p / kBT]
+O*_{j|p}
+OOH*_{k|p}
 ```
 
-where:
+where `j` and `k` label unique adsorption configurations after local CMC/PT,
+quenching, and geometry/energy de-duplication. The current workflow keeps a
+representative free energy for each basin rather than reducing the whole child
+ensemble to one log-sum-exp state free energy.
 
-- `j` labels accessible `O*` basins from parent `p`;
-- `k` labels accessible `OOH*` basins from parent `p`;
-- `g` is a degeneracy factor.
+The explicit route is:
 
-If explicit degeneracy is unknown, use `g = 1` for each distinct retained
-basin and report that approximation. If motif populations or symmetry
-degeneracies are available, use them consistently.
+```text
+r = (p, j, k)
+```
 
-For numerical stability, compute this with log-sum-exp, not direct exponentials
-when energies differ substantially.
+OOH* candidates generated from a specific O* candidate carry
+`parent_o_candidate_id`; in that case the workflow pairs only compatible
+`O*_{j|p}` and `OOH*_{k|p}` basins. If no such provenance is available, all
+local O* x OOH* basin combinations for the parent are allowed.
+
+The route weight is based on the sampled parent population and child basin
+counts:
+
+```text
+W_r(raw) = P(OH*_p) P(O*_j | p) P(OOH*_k | p, O*_j)
+```
+
+and is normalized over all ready routes before ensemble reporting.
 
 ## 7. Parent-Conditioned OER Free-Energy Steps
 
-For each parent `p`, define:
+For each explicit route `r=(p,j,k)`, define:
 
 ```text
-DeltaG1_p = G_OH,p - G_* + CHE_reference_1
-DeltaG2_p = G_O|p - G_OH,p + CHE_reference_2
-DeltaG3_p = G_OOH|p - G_O|p + CHE_reference_3
-DeltaG4_p = G_* - G_OOH|p + CHE_reference_4
+DeltaG1_r = G_OH,p - G_* + CHE_reference_1
+DeltaG2_r = G_O,j|p - G_OH,p + CHE_reference_2
+DeltaG3_r = G_OOH,k|p - G_O,j|p + CHE_reference_3
+DeltaG4_r = G_* - G_OOH,k|p + CHE_reference_4
 ```
 
 The exact CHE reference terms depend on the chosen convention. In the common
@@ -317,13 +324,14 @@ DeltaG_i(U) = DeltaG_i(0) - e U
 
 for each one-electron PCET step under the standard CHE convention.
 
-The parent-specific overpotential is:
+The route-specific overpotential is:
 
 ```text
-eta_p = max(DeltaG1_p, DeltaG2_p, DeltaG3_p, DeltaG4_p) / e - 1.23 V
+eta_r = max(DeltaG1_r, DeltaG2_r, DeltaG3_r, DeltaG4_r) / e - 1.23 V
 ```
 
-This gives one OER profile per populated `OH*` parent basin.
+This gives a distribution of OER profiles per populated `OH*` parent basin
+instead of one profile from averaged child states.
 
 ## 8. Full Parent Ensemble
 
@@ -423,12 +431,12 @@ slabs only as diagnostics for adsorbate-induced hysteresis.
 
 ### Recommended Reporting
 
-- site-resolved `DeltaG_i,p` and `eta_p` from the Boltzmann-weighted
+- route-resolved `DeltaG_i,r` and `eta_r` from the explicit grouped-basin
   parent-conditioned table;
-- the dilute-limit route-weighted ensemble overpotential `eta_ens`;
-- the dominant weighted parent basin under the dilute-limit model;
+- the route-weighted ensemble overpotential `eta_ens`;
+- the dominant weighted route and its parent basin;
 - the sensitivity of the ensemble result to the assumed degeneracy model;
-- the distribution of `eta_p` values across parent basins.
+- the distribution of `eta_r` values across parent basins and child basins.
 
 ## 9. Role Of Independent O and OOH PT Runs
 
@@ -488,9 +496,9 @@ dominates and all child basins collapse to one thermodynamic path.
 For the current code outputs, the recommended hierarchy is:
 
 - `oer_routes.csv`: primary site-resolved parent-conditioned route table,
-  including both single-minimum and Boltzmann-weighted route columns;
-- `oer_ensemble.csv`: single top-level ensemble descriptor using the
-  dilute-limit `OH*` weighting model;
+  with one row per explicit grouped-basin route;
+- `oer_ensemble.csv`: single top-level ensemble descriptor using normalized
+  route weights from parent populations and child basin counts;
 - `oer_states.csv`: compact state-level provenance and free-energy table;
 - `vibration_summary.csv`: optional harmonic corrections for every relaxed
   clean/`OH*`/`O*`/`OOH*` candidate, with the local slab mask defined from the
@@ -516,7 +524,6 @@ For the current code outputs, the recommended hierarchy is:
 8. Compute gas-phase `H2` and `H2O` vibrational/IdealGasThermo reference terms
    with the same calculator when the CHE table should avoid manual reference
    corrections.
-9. Compute parent-conditioned basin free energies and Boltzmann-weighted child
-   free energies within each parent.
-10. Build the site-resolved CHE table and the dilute-limit `OH*` ensemble
+9. Group parent-conditioned child samples into unique O* and OOH* basins.
+10. Build explicit grouped-basin CHE routes and the route-weighted ensemble
    summary.

@@ -5,6 +5,7 @@ from .config import (
     DEFAULT_REACTION_POSTPROCESS_CONFIG,
     load_reaction_postprocess_config,
 )
+from .local_cmc import ReactionLocalCMCWorkflow
 from .parent_sites import (
     aggregate_parent_site_rows,
     canonical_parent_site_id,
@@ -25,6 +26,7 @@ __all__ = [
     "OERCHESummarizer",
     "ReferenceThermoWorkflow",
     "ReactionCandidateGenerator",
+    "ReactionLocalCMCWorkflow",
     "ReactionStateRelaxer",
     "ReactionStateVibrationWorkflow",
     "ReactionPostProcessingWorkflow",

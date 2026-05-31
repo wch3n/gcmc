@@ -8,14 +8,17 @@ from unittest.mock import patch
 
 import numpy as np
 import yaml
-from ase import Atoms
+from ase import Atoms, units
 from ase.build import molecule
 from ase.io import read, write
 from ase.thermochemistry import IdealGasThermo
+from gcmc.constants import ADSORBATE_TAG_OFFSET
 from reaction import (
     OERCHESummarizer,
     ReferenceThermoWorkflow,
     ReactionCandidateGenerator,
+    ReactionLocalCMCWorkflow,
+    ReactionPostProcessingWorkflow,
     ReactionStateRelaxer,
     ReactionStateVibrationWorkflow,
     aggregate_parent_site_rows,
@@ -37,6 +40,38 @@ class ReactionWorkflowTests(unittest.TestCase):
             site_directory_name("fcc:320-380-385"),
             "fcc_320-380-385",
         )
+
+    def test_parent_stability_screen_filters_candidate_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / "candidate_manifest.csv"
+            manifest.write_text(
+                "site_id,state_dir,species,candidates_csv,candidates_traj\n"
+                "site_a,01_OH,OH,a_oh.csv,a_oh.traj\n"
+                "site_a,02_O,O,a_o.csv,a_o.traj\n"
+                "site_b,01_OH,OH,b_oh.csv,b_oh.traj\n"
+                "site_b,02_O,O,b_o.csv,b_o.traj\n"
+            )
+            vib = root / "vibration_summary.csv"
+            vib.write_text(
+                "site_id,state_dir,candidate_id,ready\n"
+                "site_a,01_OH,a_oh,True\n"
+                "site_b,01_OH,b_oh,False\n"
+            )
+            cfg = SimpleNamespace(output_dir=str(root))
+            workflow = ReactionPostProcessingWorkflow(cfg)
+
+            filtered = workflow._filter_candidate_manifest_by_parent_vibrations(
+                manifest,
+                vib,
+                "01_OH",
+                {"output_manifest": "stable.csv"},
+            )
+
+            with filtered.open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["site_id"] for row in rows}, {"site_a"})
+            self.assertEqual({row["state_dir"] for row in rows}, {"01_OH", "02_O"})
 
     def test_aggregate_parent_site_rows_combines_equivalent_support_orderings(self):
         rows = [
@@ -204,6 +239,76 @@ relaxation:
             self.assertEqual(rows[0]["atom_origin_indices"], "0")
             self.assertEqual(rows[0]["atom_is_adsorbate"], "0")
 
+    def test_candidate_generator_can_place_o_on_parent_stripped_slab(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            reactions_dir = site_dir / "reactions"
+            site_dir.mkdir(parents=True)
+            reps_traj = site_dir / "representatives.traj"
+            reps_csv = site_dir / "representatives.csv"
+            atoms = Atoms(
+                "Pt4OH",
+                positions=[
+                    [0.0, 0.0, 0.0],
+                    [2.8, 0.0, 0.0],
+                    [0.0, 2.8, 0.0],
+                    [2.8, 2.8, 0.0],
+                    [0.0, 0.0, 2.8],
+                    [0.0, 0.0, 3.8],
+                ],
+                cell=[5.6, 5.6, 10.0],
+                pbc=[True, True, False],
+            )
+            atoms.set_tags([0, 0, 0, 0, 7, 7])
+            write(str(reps_traj), [atoms])
+            reps_csv.write_text(
+                "representative_traj,representative_frame,"
+                "representative_anchor_index,representative_rank_within_group\n"
+                f"{reps_traj},0,4,0\n"
+            )
+            site_manifest = root / "site_manifest.csv"
+            site_manifest.write_text(
+                "site_id,site_dir,reactions_dir,site_representatives_traj,"
+                "site_representatives_csv,reaction_state_dirs,site_type,"
+                "support_indices_sorted\n"
+                f"atop:0,{site_dir},{reactions_dir},{reps_traj},{reps_csv},"
+                "02_O,atop,0\n"
+            )
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                out_prefix="oh_parent_sites",
+                reaction_state_dirs=("02_O",),
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                candidate_generation={
+                    "enabled": True,
+                    "child_slab_mode": "parent_stripped",
+                    "include_original_o_site": True,
+                    "include_nearby_o_sites": False,
+                },
+            )
+
+            ReactionCandidateGenerator(cfg).generate(site_manifest)
+
+            o_traj = reactions_dir / "02_O" / "candidates.traj"
+            candidate = read(str(o_traj), index=":")[0]
+            self.assertEqual(candidate.get_chemical_formula(), "OPt4")
+            self.assertAlmostEqual(candidate.positions[4, 2], 1.8)
+            with (reactions_dir / "02_O" / "candidates.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["candidate_kind"], "direct_parent_stripped")
+            self.assertEqual(rows[0]["child_slab_mode"], "parent_stripped")
+
     def test_oer_che_summarizer_writes_site_free_energies(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -270,61 +375,16 @@ relaxation:
             self.assertTrue(Path(outputs["oer_routes_csv"]).exists())
             with Path(outputs["oer_routes_csv"]).open() as handle:
                 rows = list(csv.DictReader(handle))
-            self.assertEqual(
-                list(rows[0].keys()),
-                [
-                    "site_id",
-                    "site_population_rank",
-                    "population_total",
-                    "clean_reference_site_id",
-                    "ready_min",
-                    "DeltaG1_min_eV",
-                    "DeltaG2_min_eV",
-                    "DeltaG3_min_eV",
-                    "DeltaG4_min_eV",
-                    "ready_min_electronic",
-                    "DeltaG1_min_electronic_eV",
-                    "DeltaG2_min_electronic_eV",
-                    "DeltaG3_min_electronic_eV",
-                    "DeltaG4_min_electronic_eV",
-                    "limiting_step_min_electronic",
-                    "limiting_DeltaG_min_electronic_eV",
-                    "overpotential_min_electronic_V",
-                    "limiting_step_min",
-                    "limiting_DeltaG_min_eV",
-                    "overpotential_min_V",
-                    "missing_states_min",
-                    "missing_states_min_electronic",
-                    "ready_boltzmann",
-                    "boltzmann_temperature_K",
-                    "boltzmann_energy_cluster_tol_eV",
-                    "n_OH_candidates",
-                    "n_O_candidates",
-                    "n_OOH_candidates",
-                    "DeltaG1_boltzmann_eV",
-                    "DeltaG2_boltzmann_eV",
-                    "DeltaG3_boltzmann_eV",
-                    "DeltaG4_boltzmann_eV",
-                    "ready_boltzmann_electronic",
-                    "DeltaG1_boltzmann_electronic_eV",
-                    "DeltaG2_boltzmann_electronic_eV",
-                    "DeltaG3_boltzmann_electronic_eV",
-                    "DeltaG4_boltzmann_electronic_eV",
-                    "limiting_step_boltzmann_electronic",
-                    "limiting_DeltaG_boltzmann_electronic_eV",
-                    "overpotential_boltzmann_electronic_V",
-                    "limiting_step_boltzmann",
-                    "limiting_DeltaG_boltzmann_eV",
-                    "overpotential_boltzmann_V",
-                    "missing_states_boltzmann",
-                    "missing_states_boltzmann_electronic",
-                    "potential_V",
-                    "limiting_DeltaG_min_at_U_eV",
-                    "limiting_DeltaG_min_electronic_at_U_eV",
-                    "limiting_DeltaG_boltzmann_at_U_eV",
-                    "limiting_DeltaG_boltzmann_electronic_at_U_eV",
-                ],
-            )
+            for column in (
+                "route_id",
+                "route_mode",
+                "o_basin_id",
+                "ooh_basin_id",
+                "route_weight",
+                "DeltaG1_eV",
+                "overpotential_V",
+            ):
+                self.assertIn(column, rows[0])
             self.assertEqual(rows[0]["ready_min"], "True")
             self.assertAlmostEqual(float(rows[0]["DeltaG1_min_eV"]), 2.0)
             self.assertAlmostEqual(float(rows[0]["overpotential_min_V"]), 0.77)
@@ -852,7 +912,7 @@ relaxation:
             self.assertEqual(rows[0]["limiting_step_min"], "4")
             self.assertAlmostEqual(float(rows[0]["overpotential_min_V"]), 4.77)
 
-    def test_oer_che_summarizer_writes_boltzmann_weighted_summary(self):
+    def test_oer_che_summarizer_writes_explicit_route_ensemble(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             site_dir = root / "sites" / "fcc_1-2-3"
@@ -925,8 +985,7 @@ relaxation:
                 out_prefix="oh_parent_sites",
                 che={
                     "enabled": True,
-                    "boltzmann_weight_states": True,
-                    "boltzmann_temperature_K": 300.0,
+                    "route_temperature_K": 300.0,
                     "h2_energy_eV": 0.0,
                     "h2o_energy_eV": 0.0,
                     "total_oer_free_energy_eV": 4.92,
@@ -940,41 +999,1001 @@ relaxation:
             self.assertTrue(Path(outputs["oer_ensemble_csv"]).exists())
             with Path(outputs["oer_routes_csv"]).open() as handle:
                 rows = list(csv.DictReader(handle))
-            kbt = 8.617333262145e-5 * 300.0
+            self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["n_O_candidates"], "2")
             self.assertAlmostEqual(
-                float(rows[0]["DeltaG2_boltzmann_eV"]),
-                1.0 - kbt * math.log(2.0),
+                sum(float(row["route_weight"]) for row in rows),
+                1.0,
             )
-            self.assertAlmostEqual(
-                float(rows[0]["DeltaG2_boltzmann_electronic_eV"]),
-                1.0 - kbt * math.log(2.0),
-            )
+            self.assertAlmostEqual(float(rows[0]["DeltaG2_eV"]), 1.0)
             with Path(outputs["oer_ensemble_csv"]).open() as handle:
                 ensemble = list(csv.DictReader(handle))
             self.assertEqual(
                 list(ensemble[0].keys()),
                 [
                     "source",
-                    "n_ready_sites",
+                    "n_ready_routes",
                     "population_sum_ready",
                     "population_missing",
-                    "site_weight_model",
-                    "site_degeneracy_model",
-                    "boltzmann_temperature_K",
-                    "boltzmann_energy_cluster_tol_eV",
+                    "route_weight_model",
+                    "basin_cluster_mode",
+                    "basin_energy_cluster_tol_eV",
                     "route_weighted_mean_overpotential_V",
                     "min_site_overpotential_V",
-                    "min_site_overpotential_site_id",
-                    "dominant_weight_site_id",
-                    "dominant_weight_fraction",
+                    "min_overpotential_route_id",
+                    "min_overpotential_site_id",
+                    "dominant_route_id",
+                    "dominant_route_site_id",
+                    "dominant_route_weight",
                 ],
             )
             self.assertAlmostEqual(
                 float(ensemble[0]["route_weighted_mean_overpotential_V"]),
                 0.77,
             )
-            self.assertEqual(ensemble[0]["site_weight_model"], "dilute_oh_deltag1")
+            self.assertEqual(
+                ensemble[0]["route_weight_model"],
+                "parent_population_times_child_basin_counts",
+            )
+
+    def test_oer_che_geometry_clustering_collapses_duplicate_basin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            reactions_dir = site_dir / "reactions"
+            site_dir.mkdir(parents=True)
+            manifest = root / "candidate_manifest.csv"
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "site_id",
+                        "site_dir",
+                        "state_dir",
+                        "species",
+                        "n_candidates",
+                        "candidates_traj",
+                        "candidates_csv",
+                    ],
+                )
+                writer.writeheader()
+                state_rows = {
+                    "00_clean": ("CLEAN", [0.0]),
+                    "01_OH": ("OH", [2.0]),
+                    "02_O": ("O", [3.0, 3.0]),
+                    "03_OOH": ("OOH", [4.0]),
+                }
+                for state, (species, energies) in state_rows.items():
+                    state_path = reactions_dir / state
+                    state_path.mkdir(parents=True)
+                    with (state_path / "candidates.csv").open("w", newline="") as ch:
+                        candidate_writer = csv.DictWriter(
+                            ch,
+                            fieldnames=[
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                            ],
+                        )
+                        candidate_writer.writeheader()
+                        for index in range(len(energies)):
+                            candidate_writer.writerow(
+                                {
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                }
+                            )
+                    with (state_path / "energies.csv").open("w", newline="") as eh:
+                        energy_writer = csv.DictWriter(
+                            eh,
+                            fieldnames=[
+                                "candidate_index",
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                                "converged",
+                                "energy_eV",
+                                "fmax_eV_A",
+                                "nsteps",
+                                "adsorbate_intact",
+                                "error",
+                            ],
+                        )
+                        energy_writer.writeheader()
+                        for index, energy in enumerate(energies):
+                            energy_writer.writerow(
+                                {
+                                    "candidate_index": index,
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                    "converged": True,
+                                    "energy_eV": energy,
+                                    "fmax_eV_A": 0.01,
+                                    "nsteps": 5,
+                                    "adsorbate_intact": True,
+                                    "error": "",
+                                }
+                            )
+                    writer.writerow(
+                        {
+                            "site_id": "atop:0",
+                            "site_dir": str(site_dir),
+                            "state_dir": state,
+                            "species": species,
+                            "n_candidates": len(energies),
+                            "candidates_traj": str(state_path / "candidates.traj"),
+                            "candidates_csv": str(state_path / "candidates.csv"),
+                        }
+                    )
+
+            slab = [[0.0, 0.0, 0.0], [2.8, 0.0, 0.0], [0.0, 2.8, 0.0], [2.8, 2.8, 0.0]]
+            duplicate_o = []
+            for _ in range(2):
+                atoms = Atoms(
+                    "Pt4O",
+                    positions=[*slab, [0.0, 0.0, 1.8]],
+                    cell=[5.6, 5.6, 10.0],
+                    pbc=[True, True, False],
+                )
+                atoms.set_tags([0, 0, 0, 0, 1_000_000])
+                duplicate_o.append(atoms)
+            write(str(reactions_dir / "02_O" / "relaxed.traj"), duplicate_o)
+
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                out_prefix="oh_parent_sites",
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                che={
+                    "enabled": True,
+                    "basin_cluster_mode": "geometry",
+                    "basin_energy_cluster_tol_eV": 0.0,
+                    "route_temperature_K": 300.0,
+                    "h2_energy_eV": 0.0,
+                    "h2o_energy_eV": 0.0,
+                    "total_oer_free_energy_eV": 4.92,
+                    "equilibrium_potential_V": 1.23,
+                },
+            )
+
+            outputs = OERCHESummarizer(cfg).summarize(manifest)
+
+            with Path(outputs["oer_routes_csv"]).open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["n_O_candidates"], "1")
+            self.assertAlmostEqual(float(row["DeltaG2_eV"]), 1.0)
+
+    def test_oer_che_geometry_clustering_keeps_distinct_local_environment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            reactions_dir = site_dir / "reactions"
+            site_dir.mkdir(parents=True)
+            manifest = root / "candidate_manifest.csv"
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "site_id",
+                        "site_dir",
+                        "state_dir",
+                        "species",
+                        "n_candidates",
+                        "candidates_traj",
+                        "candidates_csv",
+                    ],
+                )
+                writer.writeheader()
+                state_rows = {
+                    "00_clean": ("CLEAN", [0.0]),
+                    "01_OH": ("OH", [2.0]),
+                    "02_O": ("O", [3.0, 3.1]),
+                    "03_OOH": ("OOH", [4.0]),
+                }
+                for state, (species, energies) in state_rows.items():
+                    state_path = reactions_dir / state
+                    state_path.mkdir(parents=True)
+                    with (state_path / "candidates.csv").open("w", newline="") as ch:
+                        candidate_writer = csv.DictWriter(
+                            ch,
+                            fieldnames=[
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                            ],
+                        )
+                        candidate_writer.writeheader()
+                        for index in range(len(energies)):
+                            candidate_writer.writerow(
+                                {
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                }
+                            )
+                    with (state_path / "energies.csv").open("w", newline="") as eh:
+                        energy_writer = csv.DictWriter(
+                            eh,
+                            fieldnames=[
+                                "candidate_index",
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                                "converged",
+                                "energy_eV",
+                                "fmax_eV_A",
+                                "nsteps",
+                                "adsorbate_intact",
+                                "error",
+                            ],
+                        )
+                        energy_writer.writeheader()
+                        for index, energy in enumerate(energies):
+                            energy_writer.writerow(
+                                {
+                                    "candidate_index": index,
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                    "converged": True,
+                                    "energy_eV": energy,
+                                    "fmax_eV_A": 0.01,
+                                    "nsteps": 5,
+                                    "adsorbate_intact": True,
+                                    "error": "",
+                                }
+                            )
+                    writer.writerow(
+                        {
+                            "site_id": "atop:0",
+                            "site_dir": str(site_dir),
+                            "state_dir": state,
+                            "species": species,
+                            "n_candidates": len(energies),
+                            "candidates_traj": str(state_path / "candidates.traj"),
+                            "candidates_csv": str(state_path / "candidates.csv"),
+                        }
+                    )
+
+            slab = [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+                [2.8, 2.8, 0.0],
+            ]
+            distinct_o = []
+            for z_offset in (0.0, 0.5):
+                atoms = Atoms(
+                    "Pt4O",
+                    positions=[
+                        slab[0],
+                        [2.8, 0.0, z_offset],
+                        slab[2],
+                        slab[3],
+                        [0.0, 0.0, 1.8],
+                    ],
+                    cell=[5.6, 5.6, 10.0],
+                    pbc=[True, True, False],
+                )
+                atoms.set_tags([0, 0, 0, 0, 1_000_000])
+                distinct_o.append(atoms)
+            write(str(reactions_dir / "02_O" / "relaxed.traj"), distinct_o)
+
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                out_prefix="oh_parent_sites",
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                che={
+                    "enabled": True,
+                    "basin_cluster_mode": "geometry",
+                    "basin_geometry_rmsd_tol_A": 0.25,
+                    "basin_local_env_enabled": True,
+                    "basin_local_env_cutoff_A": 3.5,
+                    "basin_local_env_rmsd_tol_A": 0.20,
+                    "route_temperature_K": 300.0,
+                    "h2_energy_eV": 0.0,
+                    "h2o_energy_eV": 0.0,
+                    "total_oer_free_energy_eV": 4.92,
+                    "equilibrium_potential_V": 1.23,
+                },
+            )
+
+            outputs = OERCHESummarizer(cfg).summarize(manifest)
+
+            with Path(outputs["oer_routes_csv"]).open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["n_O_candidates"], "2")
+            self.assertEqual(rows[0]["o_basin_count"], "1")
+
+    def test_oer_che_assigns_basin_weights_from_pt_trajectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            reactions_dir = site_dir / "reactions"
+            site_dir.mkdir(parents=True)
+            manifest = root / "candidate_manifest.csv"
+            slab = [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+                [2.8, 2.8, 0.0],
+            ]
+
+            def adsorbate_at(xy):
+                atoms = Atoms(
+                    "Pt4O",
+                    positions=[*slab, [float(xy[0]), float(xy[1]), 1.8]],
+                    cell=[5.6, 5.6, 10.0],
+                    pbc=[True, True, False],
+                )
+                atoms.set_tags([0, 0, 0, 0, ADSORBATE_TAG_OFFSET])
+                return atoms
+
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "site_id",
+                        "site_dir",
+                        "state_dir",
+                        "species",
+                        "n_candidates",
+                        "candidates_traj",
+                        "candidates_csv",
+                    ],
+                )
+                writer.writeheader()
+                state_rows = {
+                    "00_clean": ("CLEAN", [0.0]),
+                    "01_OH": ("OH", [2.0]),
+                    "02_O": ("O", [3.0, 3.1]),
+                    "03_OOH": ("OOH", [4.0]),
+                }
+                for state, (species, energies) in state_rows.items():
+                    state_path = reactions_dir / state
+                    state_path.mkdir(parents=True)
+                    pt_dir = state_path / "local_cmc" / "seed000_pt"
+                    pt_dir.mkdir(parents=True)
+                    with (state_path / "candidates.csv").open("w", newline="") as ch:
+                        candidate_writer = csv.DictWriter(
+                            ch,
+                            fieldnames=[
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                                "local_cmc_pt_dir",
+                                "local_cmc_pt_temperature_K",
+                            ],
+                        )
+                        candidate_writer.writeheader()
+                        for index in range(len(energies)):
+                            candidate_writer.writerow(
+                                {
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                    "local_cmc_pt_dir": str(pt_dir),
+                                    "local_cmc_pt_temperature_K": 300.0,
+                                }
+                            )
+                    with (state_path / "energies.csv").open("w", newline="") as eh:
+                        energy_writer = csv.DictWriter(
+                            eh,
+                            fieldnames=[
+                                "candidate_index",
+                                "candidate_id",
+                                "candidate_kind",
+                                "anchor_index",
+                                "converged",
+                                "energy_eV",
+                                "fmax_eV_A",
+                                "nsteps",
+                                "adsorbate_intact",
+                                "error",
+                            ],
+                        )
+                        energy_writer.writeheader()
+                        for index, energy in enumerate(energies):
+                            energy_writer.writerow(
+                                {
+                                    "candidate_index": index,
+                                    "candidate_id": f"{state}_{index}",
+                                    "candidate_kind": "test",
+                                    "anchor_index": 4,
+                                    "converged": True,
+                                    "energy_eV": energy,
+                                    "fmax_eV_A": 0.01,
+                                    "nsteps": 5,
+                                    "adsorbate_intact": True,
+                                    "error": "",
+                                }
+                            )
+                    writer.writerow(
+                        {
+                            "site_id": "atop:0",
+                            "site_dir": str(site_dir),
+                            "state_dir": state,
+                            "species": species,
+                            "n_candidates": len(energies),
+                            "candidates_traj": str(state_path / "candidates.traj"),
+                            "candidates_csv": str(state_path / "candidates.csv"),
+                        }
+                    )
+
+            selected_o = [adsorbate_at((0.0, 0.0)), adsorbate_at((2.8, 0.0))]
+            write(str(reactions_dir / "02_O" / "candidates.traj"), selected_o)
+            write(str(reactions_dir / "02_O" / "relaxed.traj"), selected_o)
+            trajectory_frames = [
+                adsorbate_at((0.0, 0.0)),
+                adsorbate_at((0.05, 0.0)),
+                adsorbate_at((0.0, 0.05)),
+                adsorbate_at((0.05, 0.05)),
+                adsorbate_at((2.8, 0.0)),
+            ]
+            write(
+                str(
+                    reactions_dir
+                    / "02_O"
+                    / "local_cmc"
+                    / "seed000_pt"
+                    / "replica_300K.traj"
+                ),
+                trajectory_frames,
+            )
+
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                out_prefix="oh_parent_sites",
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                che={
+                    "enabled": True,
+                    "basin_cluster_mode": "geometry",
+                    "basin_geometry_rmsd_tol_A": 0.25,
+                    "basin_local_env_enabled": False,
+                    "basin_weight_source": "trajectory",
+                    "route_pairing_mode": "cartesian",
+                    "route_temperature_K": 300.0,
+                    "h2_energy_eV": 0.0,
+                    "h2o_energy_eV": 0.0,
+                    "total_oer_free_energy_eV": 4.92,
+                    "equilibrium_potential_V": 1.23,
+                },
+            )
+
+            registry_calls = 0
+
+            def counting_registry(*args, **kwargs):
+                nonlocal registry_calls
+                registry_calls += 1
+                from gcmc.utils import build_surface_site_registry
+
+                return build_surface_site_registry(*args, **kwargs)
+
+            with patch(
+                "reaction.che.build_surface_site_registry",
+                counting_registry,
+            ):
+                outputs = OERCHESummarizer(cfg).summarize(manifest)
+
+            with Path(outputs["oer_routes_csv"]).open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(registry_calls, 2)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual([row["o_basin_count"] for row in rows], ["4", "1"])
+            self.assertEqual(rows[0]["o_basin_weight_source"], "trajectory")
+            self.assertEqual(rows[0]["o_basin_selected_count"], "1")
+            self.assertEqual(rows[0]["o_basin_trajectory_total_count"], "5")
+            self.assertEqual(rows[0]["o_basin_trajectory_assigned_count"], "5")
+            self.assertAlmostEqual(float(rows[0]["o_basin_probability"]), 0.8)
+            self.assertAlmostEqual(float(rows[1]["o_basin_probability"]), 0.2)
+
+    def test_reaction_local_cmc_replaces_selected_state_candidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            reactions_dir = site_dir / "reactions"
+            oh_dir = reactions_dir / "01_OH"
+            o_dir = reactions_dir / "02_O"
+            oh_dir.mkdir(parents=True)
+            o_dir.mkdir(parents=True)
+
+            slab_positions = [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+                [2.8, 2.8, 0.0],
+            ]
+            oh_atoms = Atoms(
+                "Pt4OH",
+                positions=[*slab_positions, [0.0, 0.0, 1.8], [0.0, 0.0, 2.8]],
+                cell=[5.6, 5.6, 10.0],
+                pbc=[True, True, False],
+            )
+            oh_atoms.set_tags([0, 0, 0, 0, 1_000_000, 1_000_000])
+            o_atoms = Atoms(
+                "Pt4O",
+                positions=[*slab_positions, [0.0, 0.0, 1.8]],
+                cell=[5.6, 5.6, 10.0],
+                pbc=[True, True, False],
+            )
+            o_atoms.set_tags([0, 0, 0, 0, 1_000_000])
+            write(str(oh_dir / "candidates.traj"), [oh_atoms])
+            write(str(o_dir / "candidates.traj"), [o_atoms])
+            for path, state, species in (
+                (oh_dir, "01_OH", "OH"),
+                (o_dir, "02_O", "O"),
+            ):
+                (path / "candidates.csv").write_text(
+                    "site_id,state,species,candidate_id,candidate_kind,anchor_index,"
+                    "source_representative_rank\n"
+                    f"atop:0,{state},{species},{state}_seed,seed,4,0\n"
+                )
+
+            manifest = root / "candidate_manifest.csv"
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "site_id",
+                        "site_dir",
+                        "state_dir",
+                        "species",
+                        "n_candidates",
+                        "candidates_traj",
+                        "candidates_csv",
+                    ],
+                )
+                writer.writeheader()
+                for state, species, path in (
+                    ("01_OH", "OH", oh_dir),
+                    ("02_O", "O", o_dir),
+                ):
+                    writer.writerow(
+                        {
+                            "site_id": "atop:0",
+                            "site_dir": str(site_dir),
+                            "state_dir": state,
+                            "species": species,
+                            "n_candidates": 1,
+                            "candidates_traj": str(path / "candidates.traj"),
+                            "candidates_csv": str(path / "candidates.csv"),
+                        }
+                    )
+
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                calculator="lj",
+                lj_cutoff=6.0,
+                model=None,
+                model_file=None,
+                device="cpu",
+                use_kokkos=True,
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                local_cmc={
+                    "enabled": True,
+                    "states": ["02_O"],
+                    "n_cycles": 1,
+                    "sample_interval": 1,
+                    "equilibration_cycles": 0,
+                    "radius_A": 3.0,
+                    "move_mode": "site_hop",
+                    "write_debug_trajs": True,
+                    "progress_stdout": False,
+                    "replace_candidates": True,
+                },
+            )
+
+            outputs = ReactionLocalCMCWorkflow(cfg).run(manifest)
+
+            self.assertTrue(Path(outputs["local_cmc_manifest_csv"]).exists())
+            with (o_dir / "candidates.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["candidate_kind"], "local_cmc_sample")
+            self.assertIn("_localcmc000", rows[0]["candidate_id"])
+            with manifest.open() as handle:
+                manifest_rows = {row["state_dir"]: row for row in csv.DictReader(handle)}
+            self.assertEqual(manifest_rows["02_O"]["n_candidates"], "1")
+            local_dir = o_dir / "local_cmc"
+            self.assertTrue((local_dir / "seed000_attempted.traj").exists())
+            self.assertTrue((local_dir / "seed000_accepted.traj").exists())
+            self.assertTrue((local_dir / "seed000_rejected.traj").exists())
+
+    def test_reaction_local_cmc_passes_puckering_controls_to_driver(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            local_dir = root / "local_cmc"
+            local_dir.mkdir()
+            candidate_path = root / "sites" / "atop_0" / "reactions" / "03_OOH" / "candidates.traj"
+            candidate_path.parent.mkdir(parents=True)
+            atoms = Atoms(
+                "PtOOH",
+                positions=[
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.8],
+                    [0.0, 0.0, 2.9],
+                    [0.0, 0.0, 3.8],
+                ],
+                cell=[8.0, 8.0, 12.0],
+                pbc=[False, False, False],
+            )
+            atoms.set_tags([0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+            captured = {}
+
+            class RecordingCMC:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+                    self.atoms = kwargs["atoms"].copy()
+
+                def run(self, nsweeps, traj_file, **kwargs):
+                    write(traj_file, [self.atoms])
+
+            cfg = SimpleNamespace(
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                local_cmc={
+                    "enabled": True,
+                    "move_mode": "hybrid",
+                    "site_hop_prob": 0.3,
+                    "reorientation_prob": 0.2,
+                    "puckering_prob": 0.4,
+                    "puckering_hop_prob": 0.1,
+                    "puckering_elements": ["Pt"],
+                    "puckering_height_A": 0.7,
+                    "max_puckering_trials": 9,
+                    "progress_stdout": False,
+                },
+            )
+
+            with patch("reaction.local_cmc.AdsorbateCMC", RecordingCMC):
+                ReactionLocalCMCWorkflow(cfg)._run_seed(
+                    atoms,
+                    {"candidate_id": "ooh0"},
+                    {"candidates_traj": str(candidate_path)},
+                    local_dir,
+                    0,
+                    calculator=None,
+                )
+
+            self.assertEqual(captured["puckering_prob"], 0.4)
+            self.assertEqual(captured["puckering_hop_prob"], 0.1)
+            self.assertEqual(captured["puckering_elements"], ("Pt",))
+            self.assertEqual(captured["puckering_height_A"], 0.7)
+            self.assertEqual(captured["max_puckering_trials"], 9)
+
+    def test_reaction_local_cmc_accepts_structured_config_sections(self):
+        cfg = SimpleNamespace(
+            local_cmc={
+                "enabled": True,
+                "states": ["03_OOH"],
+                "region": {
+                    "center_state": "01_OH",
+                    "radius_A": 3.5,
+                    "distance_metric": "xy",
+                },
+                "sampling": {
+                    "temperature_K": 298.0,
+                    "n_cycles": 80,
+                    "sample_interval": 4,
+                    "max_seed_candidates_per_state": 2,
+                },
+                "pt": {
+                    "enabled": True,
+                    "temperatures_K": [298.0, 400.0],
+                    "target_temperature_K": 298.0,
+                    "swap_interval": 8,
+                    "local_eq_fraction": 0.1,
+                },
+                "backend": {
+                    "backend": "ray",
+                    "n_gpus": 2,
+                    "workers_per_gpu": 1,
+                    "ray_num_gpus_per_task": 1.0,
+                },
+                "moves": {
+                    "mode": "hybrid",
+                    "site_hop_prob": 0.25,
+                    "reorientation_prob": 0.1,
+                    "puckering": {
+                        "prob": 0.2,
+                        "hop_prob": 0.1,
+                        "elements": ["Pt"],
+                        "height_A": 0.15,
+                    },
+                },
+                "relaxation": {"enabled": True, "steps": 30, "fmax": 0.04},
+                "md": {"enabled": False, "move_prob": 0.0},
+                "output": {"write_debug_trajs": True, "progress_stdout": False},
+            }
+        )
+
+        local = ReactionLocalCMCWorkflow(cfg).local_config
+
+        self.assertTrue(local["pt_enabled"])
+        self.assertEqual(local["temperatures_K"], [298.0, 400.0])
+        self.assertEqual(local["backend"], "ray")
+        self.assertEqual(local["n_gpus"], 2)
+        self.assertEqual(local["move_mode"], "hybrid")
+        self.assertEqual(local["puckering_prob"], 0.2)
+        self.assertEqual(local["puckering_hop_prob"], 0.1)
+        self.assertEqual(local["puckering_elements"], ["Pt"])
+        self.assertTrue(local["relax"])
+        self.assertFalse(local["enable_hybrid_md"])
+        self.assertTrue(local["write_debug_trajs"])
+
+    def test_reaction_local_cmc_diverse_output_selection_keeps_late_basin(self):
+        cfg = SimpleNamespace(
+            local_cmc={
+                "output_selection": "diverse",
+                "max_output_candidates_per_state": 3,
+            }
+        )
+        workflow = ReactionLocalCMCWorkflow(cfg)
+        samples = []
+        for index in range(20):
+            if index == 15:
+                ads_pos = [1.4, 1.4, 1.8]
+            else:
+                ads_pos = [0.02 * index, 0.0, 1.8]
+            atoms = Atoms(
+                "PtO",
+                positions=[[0.0, 0.0, 0.0], ads_pos],
+                cell=[8.0, 8.0, 12.0],
+                pbc=[False, False, False],
+            )
+            atoms.set_tags([0, ADSORBATE_TAG_OFFSET])
+            samples.append((atoms, {"sample": index}))
+
+        selected = workflow._select_output_samples(samples, 3)
+
+        selected_indices = [metadata["sample"] for _, metadata in selected]
+        self.assertIn(15, selected_indices)
+        self.assertNotEqual(selected_indices, [0, 1, 2])
+
+    def test_reaction_local_cmc_first_output_selection_keeps_legacy_order(self):
+        cfg = SimpleNamespace(local_cmc={"output_selection": "first"})
+        workflow = ReactionLocalCMCWorkflow(cfg)
+        samples = [
+            (Atoms("H", positions=[[float(index), 0.0, 0.0]]), {"sample": index})
+            for index in range(5)
+        ]
+
+        selected = workflow._select_output_samples(samples, 3)
+
+        self.assertEqual([metadata["sample"] for _, metadata in selected], [0, 1, 2])
+
+    def test_reaction_local_cmc_skip_existing_repromotes_pt_trajectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            state_dir = site_dir / "reactions" / "02_O"
+            local_dir = state_dir / "local_cmc"
+            pt_dir = local_dir / "seed000_pt"
+            pt_dir.mkdir(parents=True)
+            local_dir.mkdir(exist_ok=True)
+
+            seed = Atoms(
+                "PtO",
+                positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.8]],
+                cell=[8.0, 8.0, 12.0],
+                pbc=[False, False, False],
+            )
+            seed.set_tags([0, ADSORBATE_TAG_OFFSET])
+            write(str(state_dir / "candidates.traj"), [seed])
+            (state_dir / "candidates.csv").write_text(
+                "site_id,state,species,candidate_id,candidate_kind,anchor_index,"
+                "source_representative_rank\n"
+                "atop:0,02_O,O,o_seed,seed,1,0\n"
+            )
+            frames = []
+            for index in range(5):
+                frame = seed.copy()
+                frame.positions[1, 0] = float(index)
+                frames.append(frame)
+            write(str(pt_dir / "replica_300K.traj"), frames)
+            (local_dir / "done").write_text("existing samples=5\n")
+
+            manifest = root / "candidate_manifest.csv"
+            with manifest.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=[
+                        "site_id",
+                        "site_dir",
+                        "state_dir",
+                        "species",
+                        "n_candidates",
+                        "candidates_traj",
+                        "candidates_csv",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "site_id": "atop:0",
+                        "site_dir": str(site_dir),
+                        "state_dir": "02_O",
+                        "species": "O",
+                        "n_candidates": 1,
+                        "candidates_traj": str(state_dir / "candidates.traj"),
+                        "candidates_csv": str(state_dir / "candidates.csv"),
+                    }
+                )
+
+            cfg = SimpleNamespace(
+                output_dir=str(root),
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                local_cmc={
+                    "enabled": True,
+                    "states": ["02_O"],
+                    "pt_enabled": True,
+                    "temperatures_K": [300.0],
+                    "target_temperature_K": 300.0,
+                    "skip_existing": True,
+                    "max_output_candidates_per_state": 2,
+                    "output_selection": "last",
+                    "progress_stdout": False,
+                },
+            )
+
+            ReactionLocalCMCWorkflow(cfg).run(manifest)
+
+            promoted = read(str(state_dir / "candidates.traj"), ":")
+            with (state_dir / "candidates.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(promoted), 2)
+            self.assertEqual(rows[0]["candidate_id"], "o_seed_localpt003")
+            self.assertEqual(rows[1]["candidate_id"], "o_seed_localpt004")
+            self.assertAlmostEqual(promoted[0].positions[1, 0], 3.0)
+            self.assertAlmostEqual(promoted[1].positions[1, 0], 4.0)
+
+    def test_reaction_local_cmc_pt_uses_replica_exchange(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            local_dir = root / "local_cmc"
+            local_dir.mkdir()
+            candidate_path = (
+                root
+                / "sites"
+                / "atop_0"
+                / "reactions"
+                / "02_O"
+                / "candidates.traj"
+            )
+            candidate_path.parent.mkdir(parents=True)
+            atoms = Atoms(
+                "PtO",
+                positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.8]],
+                cell=[8.0, 8.0, 12.0],
+                pbc=[False, False, False],
+            )
+            atoms.set_tags([0, ADSORBATE_TAG_OFFSET])
+            captured = {}
+
+            class RecordingPT:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+                    self.replica_states = kwargs["replica_states"]
+
+                def run(self, n_cycles, equilibration_cycles=0):
+                    captured["n_cycles"] = n_cycles
+                    captured["equilibration_cycles"] = equilibration_cycles
+                    for state in self.replica_states:
+                        write(state["traj_file"], [state["atoms"]])
+
+            cfg = SimpleNamespace(
+                calculator="lj",
+                lj_cutoff=6.0,
+                model=None,
+                model_file=None,
+                device="cpu",
+                use_kokkos=True,
+                site_elements=("Pt",),
+                substrate_elements=("Pt",),
+                functional_elements=(),
+                site_types=("atop",),
+                surface_side="top",
+                surface_layer_tol=0.5,
+                site_match_tol=0.6,
+                support_xy_tol=1.2,
+                termination_site_xy_tol=2.2,
+                vertical_offset=1.8,
+                termination_clearance=0.0,
+                local_cmc={
+                    "enabled": True,
+                    "pt_enabled": True,
+                    "temperatures_K": [300.0, 450.0],
+                    "temperature_K": 300.0,
+                    "n_cycles": 20,
+                    "swap_interval": 5,
+                    "sample_interval": 1,
+                    "equilibration_cycles": 0,
+                    "backend": "ray",
+                    "n_gpus": 1,
+                    "workers_per_gpu": 1,
+                    "ray_num_gpus_per_task": 1.0,
+                    "progress_stdout": False,
+                },
+            )
+
+            with patch("reaction.local_cmc.ReplicaExchange", RecordingPT):
+                outputs = ReactionLocalCMCWorkflow(cfg)._run_seed(
+                    atoms,
+                    {"candidate_id": "o0"},
+                    {"candidates_traj": str(candidate_path)},
+                    local_dir,
+                    0,
+                    calculator=None,
+                )
+
+            self.assertEqual(captured["execution_backend"], "ray")
+            self.assertEqual(captured["n_gpus"], 1)
+            self.assertEqual(captured["workers_per_gpu"], 1)
+            self.assertEqual(captured["n_cycles"], 4)
+            self.assertEqual(len(captured["replica_states"]), 2)
+            self.assertIn("seed000_pt", captured["replica_states"][0]["traj_file"])
+            self.assertEqual(outputs[0][1]["candidate_kind"], "local_cmc_pt_sample")
+            self.assertEqual(outputs[0][1]["local_cmc_pt_temperature_K"], 300.0)
 
     def test_state_relaxer_writes_relaxed_state_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1152,6 +2171,43 @@ relaxation:
         self.assertEqual(adsorbate_indices, [2, 5])
         self.assertEqual(vib_indices, [0, 1, 2, 4, 5])
 
+    def test_vibration_threshold_policy_accepts_soft_imaginary_modes(self):
+        workflow = ReactionStateVibrationWorkflow(
+            SimpleNamespace(
+                vibrations={
+                    "imag_mode_policy": "threshold",
+                    "imag_frequency_threshold_cm1": 30.0,
+                    "max_imag_modes": 1,
+                }
+            )
+        )
+        vib_energies = [0.10, 1j * 20.0 * units.invcm, 0.20]
+        summary = workflow._imaginary_mode_summary(vib_energies)
+
+        cleaned = workflow._thermo_vib_energies(vib_energies, summary)
+
+        self.assertEqual(summary["n_imag_modes"], 1)
+        self.assertAlmostEqual(summary["max_imag_frequency_cm1"], 20.0)
+        self.assertEqual(summary["status"], "accepted_soft")
+        self.assertEqual(list(cleaned), [0.10, 0.20])
+
+    def test_vibration_threshold_policy_rejects_large_imaginary_modes(self):
+        workflow = ReactionStateVibrationWorkflow(
+            SimpleNamespace(
+                vibrations={
+                    "imag_mode_policy": "threshold",
+                    "imag_frequency_threshold_cm1": 30.0,
+                    "max_imag_modes": 1,
+                }
+            )
+        )
+        vib_energies = [0.10, 1j * 80.0 * units.invcm, 0.20]
+        summary = workflow._imaginary_mode_summary(vib_energies)
+
+        with self.assertRaises(ValueError):
+            workflow._thermo_vib_energies(vib_energies, summary)
+        self.assertEqual(summary["status"], "rejected")
+
     def test_reference_thermo_che_snippet_uses_expected_keys(self):
         summary_h2 = {
             "reference_name": "H2",
@@ -1201,7 +2257,7 @@ relaxation:
                 model_file=None,
                 device="cpu",
                 use_kokkos=True,
-                che={"boltzmann_temperature_K": 303.0},
+                che={"route_temperature_K": 303.0},
                 reference_thermo={
                     "enabled": True,
                     "molecules": ["H2", "H2O"],

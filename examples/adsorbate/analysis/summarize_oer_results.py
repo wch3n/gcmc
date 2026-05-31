@@ -2,7 +2,7 @@
 """Print a compact OER/CHE summary from a reaction workflow directory.
 
 The script is intentionally read-only.  It consumes the standard files written
-by ``gcmc-reaction-postprocess`` and reports the quantities that are usually
+by ``gcmc-oer-workflow`` and reports the quantities that are usually
 needed first: the free-energy profile, limiting step, overpotential, and the
 largest per-site contributors.
 """
@@ -39,11 +39,17 @@ STEP_LABELS = {
 
 @dataclass(frozen=True)
 class RouteProfile:
+    route_id: str
     site_id: str
     population: float
+    weight: float | None
     deltas: tuple[float, float, float, float]
     limiting_step: int
     overpotential: float
+    o_basin_id: str = ""
+    o_basin_count: int | None = None
+    ooh_basin_id: str = ""
+    ooh_basin_count: int | None = None
     n_oh: int | None = None
     n_o: int | None = None
     n_ooh: int | None = None
@@ -53,7 +59,7 @@ class RouteProfile:
 class EnsembleProfile:
     label: str
     deltas: tuple[float, float, float, float]
-    limiting_step: int
+    mean_profile_limiting_step: int
     overpotential: float
     min_site_id: str
     min_site_overpotential: float
@@ -170,14 +176,26 @@ def _route_from_deltas(
     population: float,
     deltas: tuple[float, float, float, float],
     equilibrium: float,
+    route_id: str = "",
+    weight: float | None = None,
+    o_basin_id: str = "",
+    o_basin_count: int | None = None,
+    ooh_basin_id: str = "",
+    ooh_basin_count: int | None = None,
     n_oh: int | None = None,
     n_o: int | None = None,
     n_ooh: int | None = None,
 ) -> RouteProfile:
     limiting = _limiting_step(deltas)
     return RouteProfile(
+        route_id=route_id or site_id,
         site_id=site_id,
         population=population,
+        weight=weight,
+        o_basin_id=o_basin_id,
+        o_basin_count=o_basin_count,
+        ooh_basin_id=ooh_basin_id,
+        ooh_basin_count=ooh_basin_count,
         deltas=deltas,
         limiting_step=limiting,
         overpotential=max(deltas) - equilibrium,
@@ -197,6 +215,12 @@ def _route_with_closed_dg4(
     return _route_from_deltas(
         site_id=route.site_id,
         population=route.population,
+        route_id=route.route_id,
+        weight=route.weight,
+        o_basin_id=route.o_basin_id,
+        o_basin_count=route.o_basin_count,
+        ooh_basin_id=route.ooh_basin_id,
+        ooh_basin_count=route.ooh_basin_count,
         deltas=(dg1, dg2, dg3, total_oer_free_energy - dg1 - dg2 - dg3),
         equilibrium=equilibrium,
         n_oh=route.n_oh,
@@ -228,6 +252,29 @@ def load_harmonic_routes(workflow: Path, equilibrium: float) -> list[RouteProfil
 
     routes = []
     for row in _read_csv(workflow / "oer_routes.csv"):
+        if _is_true(row.get("ready")):
+            deltas = tuple(_as_float(row.get(f"DeltaG{idx}_eV")) for idx in range(1, 5))
+            if len(deltas) != 4 or not all(_finite(value) for value in deltas):
+                continue
+            routes.append(
+                _route_from_deltas(
+                    site_id=str(row.get("site_id", "")),
+                    population=_as_float(row.get("population_total"), 0.0),
+                    weight=_as_float(row.get("route_weight")),
+                    route_id=str(row.get("route_id", "")),
+                    o_basin_id=str(row.get("o_basin_id", "")),
+                    o_basin_count=_as_int(row.get("o_basin_count")),
+                    ooh_basin_id=str(row.get("ooh_basin_id", "")),
+                    ooh_basin_count=_as_int(row.get("ooh_basin_count")),
+                    deltas=deltas,  # type: ignore[arg-type]
+                    equilibrium=equilibrium,
+                    n_oh=_as_int(row.get("n_OH_candidates")),
+                    n_o=_as_int(row.get("n_O_candidates")),
+                    n_ooh=_as_int(row.get("n_OOH_candidates")),
+                )
+            )
+            continue
+
         use_boltzmann = _is_true(row.get("ready_boltzmann"))
         prefix = "boltzmann" if use_boltzmann else "min"
         ready_key = "ready_boltzmann" if use_boltzmann else "ready_min"
@@ -243,6 +290,8 @@ def load_harmonic_routes(workflow: Path, equilibrium: float) -> list[RouteProfil
             _route_from_deltas(
                 site_id=str(row.get("site_id", "")),
                 population=_as_float(row.get("population_total"), 0.0),
+                weight=None,
+                route_id=str(row.get("site_id", "")),
                 deltas=deltas,  # type: ignore[arg-type]
                 equilibrium=equilibrium,
                 n_oh=_as_int(row.get("n_OH_candidates")),
@@ -414,6 +463,14 @@ def dilute_oh_weights(routes: list[RouteProfile], temperature: float) -> list[fl
 
     if not routes:
         return []
+    explicit = [
+        route.weight
+        for route in routes
+        if route.weight is not None and _finite(route.weight) and route.weight >= 0.0
+    ]
+    if len(explicit) == len(routes) and sum(explicit) > 0.0:
+        total = sum(explicit)
+        return [float(weight) / total for weight in explicit]
     kbt = KB_EV_PER_K * temperature
     minimum = min(route.deltas[0] for route in routes)
     raw = [math.exp(-(route.deltas[0] - minimum) / kbt) for route in routes]
@@ -480,14 +537,17 @@ def ensemble_profile(
         sum(weight * route.deltas[idx] for weight, route in zip(weights, routes))
         for idx in range(4)
     )
-    limiting = _limiting_step(deltas)  # type: ignore[arg-type]
+    mean_profile_limiting = _limiting_step(deltas)  # type: ignore[arg-type]
+    route_weighted_eta = sum(
+        weight * route.overpotential for weight, route in zip(weights, routes)
+    )
     min_site = min(routes, key=lambda route: route.overpotential)
     dominant_idx = max(range(len(weights)), key=lambda idx: weights[idx])
     return EnsembleProfile(
         label=label,
         deltas=deltas,  # type: ignore[arg-type]
-        limiting_step=limiting,
-        overpotential=max(deltas) - equilibrium,
+        mean_profile_limiting_step=mean_profile_limiting,
+        overpotential=route_weighted_eta,
         min_site_id=min_site.site_id,
         min_site_overpotential=min_site.overpotential,
         dominant_site_id=routes[dominant_idx].site_id,
@@ -538,16 +598,21 @@ def _profile_row(label: str, profile: EnsembleProfile) -> list[str]:
         _format_float(profile.deltas[1]),
         _format_float(profile.deltas[2]),
         _format_float(profile.deltas[3]),
-        f"{profile.limiting_step}: {STEP_LABELS[profile.limiting_step]}",
+        (
+            f"{profile.mean_profile_limiting_step}: "
+            f"{STEP_LABELS[profile.mean_profile_limiting_step]}"
+        ),
         _format_float(profile.overpotential),
     ]
 
 
 def _site_rows(routes: list[RouteProfile], weights: list[float], top: int) -> list[list[str]]:
     rows: list[list[str]] = []
-    for route, weight in list(zip(routes, weights))[:top]:
+    pairs = sorted(zip(routes, weights), key=lambda item: item[1], reverse=True)
+    for route, weight in pairs[:top]:
         rows.append(
             [
+                route.route_id,
                 route.site_id,
                 _format_float(route.population, 4),
                 _format_float(weight, 4),
@@ -594,6 +659,36 @@ def _uncertainty_rows(
     return rows
 
 
+def _basin_rows(routes: list[RouteProfile], basin: str) -> list[list[str]]:
+    seen: dict[tuple[str, str], tuple[int | None, float]] = {}
+    for route in routes:
+        if basin == "O":
+            basin_id = route.o_basin_id
+            count = route.o_basin_count
+        else:
+            basin_id = route.ooh_basin_id
+            count = route.ooh_basin_count
+        if not basin_id:
+            continue
+        key = (route.site_id, basin_id)
+        seen[key] = (count, seen.get(key, (None, 0.0))[1] + (route.weight or 0.0))
+    rows: list[list[str]] = []
+    for (site_id, basin_id), (count, weight_sum) in sorted(
+        seen.items(),
+        key=lambda item: (-item[1][1], item[0][0], item[0][1]),
+    ):
+        rows.append(
+            [
+                basin,
+                site_id,
+                basin_id,
+                str(count) if count is not None else "?",
+                _format_float(weight_sum, 4),
+            ]
+        )
+    return rows
+
+
 def render_summary(
     workflow: Path,
     *,
@@ -623,31 +718,9 @@ def render_summary(
             equilibrium=equilibrium,
         )
 
-    electronic_routes = load_electronic_routes(
-        workflow,
-        harmonic_routes,
-        temperature=temperature,
-        cluster_tol=cluster_tol,
-        total_oer_free_energy=total_oer_free_energy,
-        equilibrium=equilibrium,
-        o2_energy=o2_energy,
-        oer_reference_mode=resolved_oer_mode,
-    )
-    if resolved_oer_mode == "closure":
-        electronic_routes = close_routes_to_total_oer_free_energy(
-            electronic_routes,
-            total_oer_free_energy=total_oer_free_energy,
-            equilibrium=equilibrium,
-        )
     harmonic_ensemble = ensemble_profile(
         "harmonic",
         harmonic_routes,
-        temperature=temperature,
-        equilibrium=equilibrium,
-    )
-    electronic_ensemble = ensemble_profile(
-        "electronic-only",
-        electronic_routes,
         temperature=temperature,
         equilibrium=equilibrium,
     )
@@ -658,20 +731,22 @@ def render_summary(
         "## Ensemble Profile",
         "",
         (
-            "Weights use the dilute-limit OH adsorption model: "
-            "w_i proportional to exp[-(DeltaG1_i - min(DeltaG1))/kBT]."
+            "Weights use `route_weight` from `oer_routes.csv` when available; "
+            "older outputs fall back to dilute-limit OH adsorption weights."
+        ),
+        (
+            "The reported ensemble eta is the weighted mean of the route-wise "
+            "overpotentials, not max(<DeltaG1>, ..., <DeltaG4>)."
         ),
         (
             "DeltaG4 uses "
             f"{'explicit O2' if resolved_oer_mode == 'explicit_o2' else 'closure to total_oer_free_energy'} "
-            "for both the harmonic profile and the electronic-only reconstruction."
+            "for the harmonic profile."
         ),
         "",
     ]
 
     profile_rows = []
-    if electronic_ensemble is not None:
-        profile_rows.append(_profile_row("electronic-only", electronic_ensemble))
     if harmonic_ensemble is not None:
         profile_rows.append(_profile_row("harmonic", harmonic_ensemble))
     lines.append(
@@ -682,52 +757,14 @@ def render_summary(
                 "DG2/eV",
                 "DG3/eV",
                 "DG4/eV",
-                "limiting step",
-                "eta/V",
+                "mean-profile max step",
+                "route-avg eta/V",
             ],
             profile_rows,
         )
     )
 
-    if electronic_ensemble is not None and harmonic_ensemble is not None:
-        shift = tuple(
-            harmonic_ensemble.deltas[idx] - electronic_ensemble.deltas[idx]
-            for idx in range(4)
-        )
-        lines.extend(
-            [
-                "",
-                "## Vibrational Effect",
-                "",
-                _table(
-                    ["quantity", "harmonic - electronic/eV"],
-                    [
-                        [f"DG{idx + 1}", _format_float(value)]
-                        for idx, value in enumerate(shift)
-                    ]
-                    + [
-                        [
-                            "eta",
-                            _format_float(
-                                harmonic_ensemble.overpotential
-                                - electronic_ensemble.overpotential
-                            ),
-                        ]
-                    ],
-                ),
-            ]
-        )
-
     uncertainty_rows: list[list[str]] = []
-    if electronic_routes:
-        uncertainty_rows.extend(
-            _uncertainty_rows(
-                "electronic-only",
-                electronic_routes,
-                temperature=temperature,
-                interval=uncertainty_interval,
-            )
-        )
     if harmonic_routes:
         uncertainty_rows.extend(
             _uncertainty_rows(
@@ -763,6 +800,30 @@ def render_summary(
             ]
         )
 
+    basin_rows = _basin_rows(harmonic_routes, "O") + _basin_rows(harmonic_routes, "OOH")
+    if basin_rows:
+        lines.extend(
+            [
+                "",
+                "## Basin Provenance",
+                "",
+                (
+                    "Raw O*/OOH* candidates are clustered into relaxed geometry basins "
+                    "before CHE route construction."
+                ),
+                (
+                    "Basin and route weights are empirical retained-sample frequencies; "
+                    "they are not guaranteed to be unbiased thermodynamic probabilities "
+                    "unless local CMC/PT sampling is well equilibrated and well mixed."
+                ),
+                "",
+                _table(
+                    ["state", "site", "basin", "raw samples", "route weight sum"],
+                    basin_rows,
+                ),
+            ]
+        )
+
     if harmonic_ensemble is not None:
         lines.extend(
             [
@@ -778,9 +839,10 @@ def render_summary(
                 "",
                 _table(
                     [
+                        "route",
                         "site",
                         "pop",
-                        "w_OH",
+                        "weight",
                         "DG1",
                         "DG2",
                         "DG3",
@@ -792,34 +854,6 @@ def render_summary(
                     _site_rows(
                         harmonic_routes,
                         dilute_oh_weights(harmonic_routes, temperature),
-                        top_sites,
-                    ),
-                ),
-            ]
-        )
-
-    if electronic_routes:
-        lines.extend(
-            [
-                "",
-                "## Electronic-Only Site Routes",
-                "",
-                _table(
-                    [
-                        "site",
-                        "pop",
-                        "w_OH",
-                        "DG1",
-                        "DG2",
-                        "DG3",
-                        "DG4",
-                        "lim",
-                        "eta",
-                        "n OH/O/OOH",
-                    ],
-                    _site_rows(
-                        electronic_routes,
-                        dilute_oh_weights(electronic_routes, temperature),
                         top_sites,
                     ),
                 ),
@@ -839,8 +873,8 @@ def render_summary(
                     _table(
                         ["field", "value"],
                         [
-                            ["site_weight_model", str(row.get("site_weight_model", ""))],
-                            ["n_ready_sites", str(row.get("n_ready_sites", ""))],
+                            ["route_weight_model", str(row.get("route_weight_model", ""))],
+                            ["n_ready_routes", str(row.get("n_ready_routes", ""))],
                             [
                                 "population_sum_ready",
                                 str(row.get("population_sum_ready", "")),
@@ -848,6 +882,14 @@ def render_summary(
                             [
                                 "population_missing",
                                 str(row.get("population_missing", "")),
+                            ],
+                            [
+                                "dominant_route_id",
+                                str(row.get("dominant_route_id", "")),
+                            ],
+                            [
+                                "dominant_route_weight",
+                                str(row.get("dominant_route_weight", "")),
                             ],
                         ],
                     ),
@@ -863,7 +905,7 @@ def main() -> None:
         "--workflow",
         type=Path,
         required=True,
-        help="Path to a gcmc-reaction-postprocess workflow output directory.",
+        help="Path to a gcmc-oer-workflow output directory.",
     )
     parser.add_argument(
         "--top-sites",

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
@@ -15,6 +17,7 @@ from gcmc.analysis import LocalAdsorptionMotifAnalyzer
 
 from .che import OERCHESummarizer
 from .config import load_reaction_postprocess_config
+from .local_cmc import ReactionLocalCMCWorkflow
 from .output_files import output_path
 from .parent_sites import (
     aggregate_parent_site_rows,
@@ -242,6 +245,16 @@ class ReactionPostProcessingWorkflow:
                 "candidate_manifest_csv",
                 str(output_path(cfg, "candidate_manifest_csv")),
             )
+            screen_outputs = self._run_parent_stability_screen(candidate_manifest)
+            paths.update(screen_outputs)
+            candidate_manifest = screen_outputs.get(
+                "parent_stability_candidate_manifest_csv",
+                candidate_manifest,
+            )
+            if screen_outputs and not self._manifest_has_rows(candidate_manifest):
+                return paths
+            local_cmc = ReactionLocalCMCWorkflow(cfg)
+            paths.update(local_cmc.run(candidate_manifest))
             relaxer = ReactionStateRelaxer(cfg)
             relax_outputs = relaxer.relax(candidate_manifest)
             paths.update(relax_outputs)
@@ -258,6 +271,133 @@ class ReactionPostProcessingWorkflow:
             che = OERCHESummarizer(cfg)
             paths.update(che.summarize(candidate_manifest))
         return paths
+
+    def _run_parent_stability_screen(
+        self,
+        candidate_manifest: str | Path,
+    ) -> dict[str, str]:
+        cfg = self.config
+        screen = getattr(cfg, "parent_stability_screen", {}) or {}
+        if not isinstance(screen, dict) or not bool(screen.get("enabled", False)):
+            return {}
+
+        state = str(screen.get("state", "01_OH"))
+        screen_cfg = self._screen_config(state, screen)
+        relax_outputs = ReactionStateRelaxer(screen_cfg).relax(candidate_manifest)
+        vibration_outputs = ReactionStateVibrationWorkflow(screen_cfg).run(
+            relax_outputs.get(
+                "state_relaxation_manifest_csv",
+                str(output_path(screen_cfg, "state_relaxation_manifest_csv")),
+            )
+        )
+        vibration_summary = vibration_outputs.get(
+            "vibration_summary_csv",
+            str(output_path(screen_cfg, "vibration_summary_csv")),
+        )
+        filtered_manifest = self._filter_candidate_manifest_by_parent_vibrations(
+            candidate_manifest,
+            vibration_summary,
+            state,
+            screen,
+        )
+        outputs = {
+            "parent_stability_candidate_manifest_csv": str(filtered_manifest),
+        }
+        outputs.update(
+            {
+                f"parent_stability_{key}": value
+                for key, value in relax_outputs.items()
+            }
+        )
+        outputs.update(
+            {
+                f"parent_stability_{key}": value
+                for key, value in vibration_outputs.items()
+            }
+        )
+        return outputs
+
+    def _screen_config(self, state: str, screen: dict[str, object]) -> SimpleNamespace:
+        values = deepcopy(vars(self.config))
+        screen_states = ["00_clean", state]
+        state_relaxation = deepcopy(values.get("state_relaxation", {}) or {})
+        state_relaxation["enabled"] = True
+        state_relaxation["states"] = screen_states
+        if "skip_existing" in screen:
+            state_relaxation["skip_existing"] = bool(screen["skip_existing"])
+        values["state_relaxation"] = state_relaxation
+
+        vibrations = deepcopy(values.get("vibrations", {}) or {})
+        vibrations["enabled"] = True
+        vibrations["states"] = screen_states
+        if "skip_existing" in screen:
+            vibrations["skip_existing"] = bool(screen["skip_existing"])
+        values["vibrations"] = vibrations
+        return SimpleNamespace(**values)
+
+    def _filter_candidate_manifest_by_parent_vibrations(
+        self,
+        candidate_manifest: str | Path,
+        vibration_summary: str | Path,
+        state: str,
+        screen: dict[str, object],
+    ) -> Path:
+        candidate_manifest = Path(candidate_manifest)
+        rows = self._read_csv(candidate_manifest)
+        vibration_rows = self._read_csv(vibration_summary)
+        ready_sites = {
+            str(row.get("site_id", ""))
+            for row in vibration_rows
+            if str(row.get("state_dir", "")) == state
+            and self._as_bool(row.get("ready"))
+        }
+        filtered = [
+            row
+            for row in rows
+            if str(row.get("site_id", "")) in ready_sites
+        ]
+        output_manifest = Path(
+            str(screen.get("output_manifest", "candidate_manifest_parent_stable.csv"))
+        )
+        if not output_manifest.is_absolute():
+            output_manifest = Path(str(self.config.output_dir)) / output_manifest
+        self._write_manifest_csv(output_manifest, filtered, rows)
+        return output_manifest
+
+    @staticmethod
+    def _read_csv(path: str | Path) -> list[dict[str, str]]:
+        path = Path(path)
+        if not path.exists():
+            return []
+        with path.open(newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+
+    @staticmethod
+    def _write_manifest_csv(
+        path: Path,
+        rows: Sequence[dict[str, object]],
+        template_rows: Sequence[dict[str, object]],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields: list[str] = []
+        for row in list(template_rows) + list(rows):
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    @classmethod
+    def _manifest_has_rows(cls, path: str | Path) -> bool:
+        return bool(cls._read_csv(path))
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
     def _site_paths(self, site_id: object) -> dict[str, str]:
         cfg = self.config

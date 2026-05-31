@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from .che import default_che_config
+from .local_cmc import default_local_cmc_config
 from .reference_thermo import default_reference_thermo_stage_config
 from .relax import default_state_relaxation_config
 from .states import default_candidate_generation_config
@@ -51,6 +52,13 @@ DEFAULT_REACTION_POSTPROCESS_CONFIG = {
     "device": "cpu",
     "use_kokkos": True,
     "candidate_generation": default_candidate_generation_config(),
+    "parent_stability_screen": {
+        "enabled": False,
+        "state": "01_OH",
+        "output_manifest": "candidate_manifest_parent_stable.csv",
+        "skip_existing": False,
+    },
+    "local_cmc": default_local_cmc_config(),
     "state_relaxation": default_state_relaxation_config(),
     "vibrations": default_vibration_config(),
     "reference_thermo": default_reference_thermo_stage_config(),
@@ -112,6 +120,8 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
             "calculator",
             "output",
             "candidate_generation",
+            "parent_stability_screen",
+            "local_cmc",
             "state_relaxation",
             "vibrations",
             "reference_thermo",
@@ -126,6 +136,8 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
                 "calculator": {},
                 "output": {},
                 "candidate_generation": {},
+                "parent_stability_screen": {},
+                "local_cmc": {},
                 "state_relaxation": {},
                 "vibrations": {},
                 "reference_thermo": {},
@@ -141,6 +153,14 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
         flat["state_relaxation"] = deep_update(
             default_state_relaxation_config(),
             merged["state_relaxation"],
+        )
+        flat["parent_stability_screen"] = deep_update(
+            DEFAULT_REACTION_POSTPROCESS_CONFIG["parent_stability_screen"],
+            merged["parent_stability_screen"],
+        )
+        flat["local_cmc"] = deep_update(
+            default_local_cmc_config(),
+            merged["local_cmc"],
         )
         flat["vibrations"] = deep_update(
             default_vibration_config(),
@@ -169,6 +189,10 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
     else:
         flat = dict(DEFAULT_REACTION_POSTPROCESS_CONFIG)
         flat["candidate_generation"] = default_candidate_generation_config()
+        flat["parent_stability_screen"] = dict(
+            DEFAULT_REACTION_POSTPROCESS_CONFIG["parent_stability_screen"]
+        )
+        flat["local_cmc"] = default_local_cmc_config()
         flat["state_relaxation"] = default_state_relaxation_config()
         flat["vibrations"] = default_vibration_config()
         flat["reference_thermo"] = default_reference_thermo_stage_config()
@@ -178,6 +202,16 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
             flat["candidate_generation"] = deep_update(
                 default_candidate_generation_config(),
                 raw["candidate_generation"],
+            )
+        if isinstance(raw.get("parent_stability_screen"), dict):
+            flat["parent_stability_screen"] = deep_update(
+                DEFAULT_REACTION_POSTPROCESS_CONFIG["parent_stability_screen"],
+                raw["parent_stability_screen"],
+            )
+        if isinstance(raw.get("local_cmc"), dict):
+            flat["local_cmc"] = deep_update(
+                default_local_cmc_config(),
+                raw["local_cmc"],
             )
         if isinstance(raw.get("state_relaxation"), dict):
             flat["state_relaxation"] = deep_update(
@@ -214,7 +248,12 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
     flat["output_dir"] = resolve_optional_path(flat.get("output_dir"), config_path.parent)
     for key in ("model", "model_file"):
         flat[key] = resolve_optional_path(flat.get(key), config_path.parent)
-    for section_key in ("candidate_generation", "state_relaxation", "vibrations"):
+    for section_key in (
+        "candidate_generation",
+        "local_cmc",
+        "state_relaxation",
+        "vibrations",
+    ):
         section = flat.get(section_key)
         if isinstance(section, dict):
             for path_key in ("model", "model_file"):
@@ -232,10 +271,7 @@ def load_reaction_postprocess_config(config_path: str | Path) -> SimpleNamespace
                         config_path.parent,
                     )
             progress_log = section.get("progress_log")
-            if (
-                section_key in {"state_relaxation", "vibrations"}
-                and progress_log not in (None, "")
-            ):
+            if section_key in {"local_cmc", "state_relaxation", "vibrations"} and progress_log not in (None, ""):
                 progress_path = Path(str(progress_log))
                 if progress_path.parent != Path("."):
                     section["progress_log"] = resolve_optional_path(

@@ -4,7 +4,7 @@ Use the reference thermo helper to relax an isolated molecule, run ASE
 vibrations, and emit a CHE config snippet for `IdealGasThermo`.
 
 For OER post-processing, prefer the integrated `reference_thermo:` section in
-`gcmc-reaction-postprocess` when `H2`, `H2O`, and optionally `O2` should be
+`gcmc-oer-workflow` when `H2`, `H2O`, and optionally `O2` should be
 generated with the same calculator before CHE. This standalone runner remains
 useful for one-off checks or precomputing a single reference molecule.
 

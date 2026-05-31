@@ -680,11 +680,10 @@ def _stage_temperature(stage: dict[str, object], reaction_config: SimpleNamespac
     if value not in (None, ""):
         return float(value)
     che = getattr(reaction_config, "che", {}) or {}
-    if (
-        isinstance(che, dict)
-        and che.get("boltzmann_temperature_K") not in (None, "")
-    ):
-        return float(che["boltzmann_temperature_K"])
+    if isinstance(che, dict):
+        for key in ("route_temperature_K", "boltzmann_temperature_K"):
+            if che.get(key) not in (None, ""):
+                return float(che[key])
     return 303.0
 
 

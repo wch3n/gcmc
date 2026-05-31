@@ -38,7 +38,7 @@ The authoritative defaults live in `gcmc/workflows.py`.
 - Shared keys used across multiple workflows: `docs/configuration/shared.md`
 - Adsorbate CMC / replica exchange / GCMC / mu-exchange keys: `docs/configuration/adsorbate.md`
 - Alloy CMC / replica-exchange keys: `docs/configuration/alloy.md`
-- Reaction post-processing keys: `docs/configuration/reaction_postprocess.md`
+- OER workflow keys: `docs/configuration/reaction_postprocess.md`
 
 ## Typical layouts
 

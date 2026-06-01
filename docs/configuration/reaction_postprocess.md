@@ -262,7 +262,7 @@ that filtered manifest.
 ### `local_cmc`
 
 This optional stage replaces or augments selected generated candidates with
-local adsorbate CMC samples constrained around the matched parent OH* anchor.
+local adsorbate CMC samples constrained around a matched parent-state anchor.
 
 | Key | Meaning |
 | --- | --- |
@@ -275,7 +275,10 @@ local adsorbate CMC samples constrained around the matched parent OH* anchor.
 | `backend`, `n_gpus`, `workers_per_gpu`, `ray_*` | Replica execution backend controls for local PT. Use `backend: ray` to reuse the existing Ray replica backend. |
 | `max_seed_candidates_per_state` | Maximum generated candidates used as local-CMC seeds for each state block. |
 | `max_output_candidates_per_state` | Maximum local-CMC samples retained in each state block's `candidates.traj`/`candidates.csv`. |
-| `output_selection` | How retained samples are chosen when more frames are available than `max_output_candidates_per_state`. `diverse` performs farthest-point selection in adsorbate position/shape space; `stride` spreads frames through the trajectory; `first` preserves the old first-N behavior; `last` and `random` are also available. |
+| `output_selection` | How retained samples are chosen when more frames are available than `max_output_candidates_per_state`. `diverse` performs farthest-point selection in adsorbate position/shape space; `motif_diverse` first reserves representatives from visited adsorption motifs such as atop/bridge/hollow and then fills by diversity; `stride` spreads frames through the trajectory; `first` preserves the old first-N behavior; `last` and `random` are also available. |
+| `sequential.enabled` | Enables reaction-step-conditioned local CMC seed generation. Set `false` to disable all sequential rules, including automatic compatibility rules. |
+| `sequential.rules` | Ordered local transition rules. Each rule gives `source_state`, `target_state`, `builder`, and optional builder controls such as `n_orientations`. The built-in `ooh_from_o` builder regenerates OOH* seeds from locally sampled O* candidates and records generic parent metadata (`parent_state_dir`, `parent_state_candidate_id`, `transition_builder`) plus the legacy `parent_o_candidate_id`. |
+| `sequential_ooh_from_o`, `sequential_ooh_orientations` | Legacy OER shortcut for the `02_O -> 03_OOH` `ooh_from_o` rule. Existing configs remain valid. For new configs, prefer `sequential.rules`. |
 | `move_mode`, `site_hop_prob`, `reorientation_prob`, `puckering_prob`, `puckering_hop_prob`, `puckering_elements`, `puckering_height_A`, `max_puckering_trials`, `displacement_sigma` | Adsorbate CMC proposal controls. |
 | `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
 | `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. |
@@ -299,7 +302,14 @@ local_cmc:
     sample_interval: 5
     max_seed_candidates_per_state: 1
     max_output_candidates_per_state: 10
-    output_selection: diverse
+    output_selection: motif_diverse
+  sequential:
+    enabled: true
+    rules:
+      - source_state: 02_O
+        target_state: 03_OOH
+        builder: ooh_from_o
+        n_orientations: 1
   pt:
     enabled: true
     temperatures_K: [298.0, 350.0, 450.0, 600.0]
@@ -434,8 +444,8 @@ state is intentionally site-conditioned.
 | `use_converged_only` | If true, choose only converged relaxed candidates for each state. |
 | `allow_unconverged_fallback` | If true, fall back to the lowest finite-energy unconverged candidate when no converged candidate exists. |
 | `route_ensemble` | If true, write explicit parent-conditioned basin routes instead of collapsing O*/OOH* states into one Boltzmann-averaged state free energy. |
-| `route_pairing_mode` | `compatible` pairs OOH* basins with the O* basin recorded in `parent_o_candidate_id` when available, otherwise falls back to all local combinations. `cartesian` always uses all O* x OOH* basin combinations. |
-| `route_parent_weight_model` | Parent contribution to route weights. The current implementation uses the sampled parent `population_total`; the field is recorded for explicitness. |
+| `route_pairing_mode` | `compatible` pairs product basins with the recorded parent candidate when available, otherwise falls back to all local combinations. For OER it pairs OOH* basins with the O* basin recorded in generic `parent_state_candidate_id` or legacy `parent_o_candidate_id`. It also auto-enforces the default `02_O -> 03_OOH` sequential local-CMC rule when both states are selected, so explicit OER sequential keys are not required. `cartesian` always uses all O* x OOH* basin combinations. |
+| `route_parent_weight_model` | Parent contribution to empirical route probabilities. The current implementation uses the sampled parent `population_total`; the field is recorded for explicitness. |
 | `route_temperature_K` | Temperature used by route-level thermodynamic helpers. Kept separate from the explicit sample-count basin probabilities. |
 | `basin_cluster_mode` | Candidate de-duplication before route construction. `geometry` clusters by assigned adsorption motif, adsorbate relative geometry, and optionally the local substrate/termination environment; `energy` clusters only by energy; `none` keeps all candidates. |
 | `basin_geometry_rmsd_tol_A` | RMSD tolerance for adsorbate relative positions when `basin_cluster_mode: geometry`. |
@@ -443,7 +453,7 @@ state is intentionally site-conditioned.
 | `basin_local_env_enabled` | Include nearby non-adsorbate atoms in the geometry basin descriptor. This separates basins with different local chemistry or puckering around the same adsorbate motif. |
 | `basin_local_env_cutoff_A` | Anchor-centered cutoff for local-environment atoms included in geometry clustering. |
 | `basin_local_env_rmsd_tol_A` | RMSD tolerance for the local-environment descriptor. |
-| `basin_weight_source` | Source of basin populations after representative selection. `trajectory` assigns every saved local CMC/PT frame to the nearest selected basin and uses those counts for route weights; `selected` uses only the selected representative counts. |
+| `basin_weight_source` | Source of basin populations after representative selection. `trajectory` assigns every saved local CMC/PT frame to the nearest selected basin and uses those counts for empirical route probabilities; `selected` uses only the selected representative counts. |
 | `basin_energy_cluster_tol_eV` | Energy clustering tolerance used when `basin_cluster_mode: energy`. |
 
 Aggregate outputs:
@@ -580,9 +590,10 @@ tables are the harmonic free energies for the relaxed candidates whenever a
 ready `vibration_summary.csv` row exists.
 
 `oer_ensemble.csv` is the single top-level ensemble descriptor. It uses the
-normalized route weights from `oer_routes.csv` and reports the route-weighted
-mean overpotential, the lowest-overpotential route, and the dominant-weight
-route. This avoids taking the overpotential of an averaged free-energy profile.
+normalized empirical route probabilities from `oer_routes.csv` and reports the
+route-probability-weighted mean overpotential, the lowest-overpotential route,
+and the dominant-probability route. This avoids taking the overpotential of an
+averaged free-energy profile.
 
 The CHE expressions are:
 

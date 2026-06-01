@@ -507,6 +507,13 @@ class ReactionStateRelaxer:
             "candidate_id": source_row.get("candidate_id", ""),
             "candidate_kind": source_row.get("candidate_kind", ""),
             "parent_o_candidate_id": source_row.get("parent_o_candidate_id", ""),
+            "parent_state_dir": source_row.get("parent_state_dir", ""),
+            "parent_state_candidate_id": source_row.get(
+                "parent_state_candidate_id",
+                "",
+            ),
+            "parent_candidate_id": source_row.get("parent_candidate_id", ""),
+            "transition_builder": source_row.get("transition_builder", ""),
             "anchor_index": source_row.get("anchor_index", ""),
             "converged": bool(converged),
             "energy_eV": energy,

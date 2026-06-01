@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import numpy as np
 from ase import Atoms
@@ -59,6 +59,10 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "output_selection": "diverse",
     "replace_candidates": True,
     "skip_existing": False,
+    "sequential_enabled": None,
+    "sequential_rules": None,
+    "sequential_ooh_from_o": False,
+    "sequential_ooh_orientations": 1,
     "move_mode": "hybrid",
     "site_hop_prob": 0.6,
     "reorientation_prob": 0.3,
@@ -132,6 +136,12 @@ class ReactionLocalCMCWorkflow:
                 "output_selection": "output_selection",
                 "replace_candidates": "replace_candidates",
                 "skip_existing": "skip_existing",
+                "sequential_ooh_from_o": "sequential_ooh_from_o",
+                "sequential_ooh_orientations": "sequential_ooh_orientations",
+            },
+            "sequential": {
+                "enabled": "sequential_enabled",
+                "rules": "sequential_rules",
             },
             "pt": {
                 "enabled": "pt_enabled",
@@ -268,10 +278,21 @@ class ReactionLocalCMCWorkflow:
         )
         manifest_rows: list[dict[str, object]] = []
         updated_rows = [dict(row) for row in rows]
+        rows_by_site_state = self._rows_by_site_state(updated_rows)
+        sequential_rules = self._sequential_rules(selected_states)
 
-        for manifest_row in updated_rows:
+        for manifest_row in self._local_work_order(
+            updated_rows,
+            selected_states,
+            sequential_rules,
+        ):
             if not self._row_selected(manifest_row, selected_states):
                 continue
+            self._refresh_sequential_target_candidates(
+                manifest_row,
+                rows_by_site_state,
+                sequential_rules,
+            )
             summary = self._run_state_block(manifest_row, calculator)
             if summary is None:
                 continue
@@ -288,6 +309,270 @@ class ReactionLocalCMCWorkflow:
             )
             return {"local_cmc_manifest_csv": str(local_manifest)}
         return {}
+
+    @staticmethod
+    def _rows_by_site_state(
+        rows: Sequence[dict[str, object]],
+    ) -> dict[tuple[str, str], dict[str, object]]:
+        grouped: dict[tuple[str, str], dict[str, object]] = {}
+        for row in rows:
+            key = (str(row.get("site_id", "")), str(row.get("state_dir", "")))
+            grouped[key] = row
+        return grouped
+
+    @staticmethod
+    def _local_work_order(
+        rows: Sequence[dict[str, object]],
+        selected_states: set[str],
+        sequential_rules: Sequence[dict[str, object]] = (),
+    ) -> list[dict[str, object]]:
+        priority: dict[str, int] = {}
+        for rule in sequential_rules:
+            source = str(rule.get("source_state", ""))
+            target = str(rule.get("target_state", ""))
+            if source and source not in priority:
+                priority[source] = 20
+            if source and target:
+                priority[target] = max(
+                    priority.get(target, 10),
+                    priority.get(source, 20) + 10,
+                )
+        changed = True
+        while changed:
+            changed = False
+            for rule in sequential_rules:
+                source = str(rule.get("source_state", ""))
+                target = str(rule.get("target_state", ""))
+                if not source or not target:
+                    continue
+                source_priority = priority.get(source, 20)
+                target_priority = priority.get(target, 10)
+                if target_priority <= source_priority:
+                    priority[target] = source_priority + 10
+                    changed = True
+        return sorted(
+            (row for row in rows if str(row.get("state_dir", "")) in selected_states),
+            key=lambda row: (
+                str(row.get("site_id", "")),
+                priority.get(str(row.get("state_dir", "")), 10),
+            ),
+        )
+
+    def _refresh_sequential_target_candidates(
+        self,
+        manifest_row: dict[str, object],
+        rows_by_site_state: dict[tuple[str, str], dict[str, object]],
+        sequential_rules: Sequence[dict[str, object]],
+    ) -> None:
+        state_dir = str(manifest_row.get("state_dir", ""))
+        rules = [
+            rule
+            for rule in sequential_rules
+            if str(rule.get("target_state", "")) == state_dir
+        ]
+        if not rules:
+            return
+
+        site_id = str(manifest_row.get("site_id", ""))
+        sequential_candidates: list[tuple[Atoms, dict[str, object]]] = []
+        total_sources = 0
+        for rule in rules:
+            source_state = str(rule.get("source_state", ""))
+            source_row = rows_by_site_state.get((site_id, source_state))
+            if source_row is None:
+                continue
+            source_candidates = self._read_state_candidates(source_row)
+            if not source_candidates:
+                continue
+            total_sources += len(source_candidates)
+            sequential_candidates.extend(
+                self._build_sequential_candidates(
+                    source_candidates,
+                    rule,
+                    site_id=site_id,
+                )
+            )
+        if not sequential_candidates:
+            return
+
+        candidates_traj = Path(str(manifest_row.get("candidates_traj", "")))
+        candidates_csv = Path(str(manifest_row.get("candidates_csv", "")))
+        self._write_candidates(sequential_candidates, candidates_traj, candidates_csv)
+        manifest_row["n_candidates"] = len(sequential_candidates)
+        manifest_row["_local_cmc_use_all_seeds"] = True
+
+        signature = self._candidate_seed_signature(
+            metadata for _, metadata in sequential_candidates
+        )
+        manifest_row["_local_cmc_seed_signature"] = signature
+        local_dir = candidates_traj.parent / "local_cmc"
+        if not self._local_seed_signature_matches(local_dir, signature):
+            manifest_row["_local_cmc_ignore_existing"] = True
+        self._progress(
+            "local-cmc refreshed sequential seeds "
+            f"site={site_id} target={state_dir} "
+            f"source_seeds={total_sources} target_seeds={len(sequential_candidates)}"
+        )
+
+    def _sequential_rules(self, selected_states: set[str]) -> list[dict[str, object]]:
+        if self.local_config.get("sequential_enabled") is False:
+            return []
+        raw_rules = self.local_config.get("sequential_rules")
+        rules: list[dict[str, object]] = []
+        if isinstance(raw_rules, dict):
+            raw_rules = [raw_rules]
+        if isinstance(raw_rules, (list, tuple)):
+            for raw_rule in raw_rules:
+                if not isinstance(raw_rule, dict):
+                    continue
+                rule = self._normalize_sequential_rule(raw_rule)
+                if rule is not None:
+                    rules.append(rule)
+
+        if not rules and self._sequential_ooh_from_o_enabled():
+            rules.append(
+                {
+                    "source_state": "02_O",
+                    "target_state": "03_OOH",
+                    "builder": "ooh_from_o",
+                    "n_orientations": int(
+                        self.local_config.get("sequential_ooh_orientations", 1)
+                    ),
+                }
+            )
+
+        return [
+            rule
+            for rule in rules
+            if str(rule.get("source_state", "")) in selected_states
+            and str(rule.get("target_state", "")) in selected_states
+        ]
+
+    @staticmethod
+    def _normalize_sequential_rule(
+        raw_rule: dict[str, object],
+    ) -> dict[str, object] | None:
+        source = raw_rule.get("source_state", raw_rule.get("source"))
+        target = raw_rule.get("target_state", raw_rule.get("target"))
+        builder = raw_rule.get("builder")
+        if source in (None, "") or target in (None, "") or builder in (None, ""):
+            return None
+        rule = dict(raw_rule)
+        rule["source_state"] = str(source)
+        rule["target_state"] = str(target)
+        rule["builder"] = str(builder)
+        if "n_orientations" not in rule and "orientations" in rule:
+            rule["n_orientations"] = rule["orientations"]
+        return rule
+
+    def _sequential_ooh_from_o_enabled(self) -> bool:
+        if bool(self.local_config.get("sequential_ooh_from_o", False)):
+            return True
+        che_config = getattr(self.config, "che", {}) or {}
+        if not isinstance(che_config, dict):
+            return False
+        route_mode = str(che_config.get("route_pairing_mode", "")).strip().lower()
+        return route_mode in {"compatible", "linked", "parent_o"}
+
+    def _read_state_candidates(
+        self,
+        manifest_row: dict[str, object],
+    ) -> list[tuple[Atoms, dict[str, object]]]:
+        traj = Path(str(manifest_row.get("candidates_traj", "")))
+        csv_path = Path(str(manifest_row.get("candidates_csv", "")))
+        if not traj.exists() or not csv_path.exists():
+            return []
+        atoms = self._read_atoms_list(traj)
+        rows = self._read_csv(csv_path)
+        count = min(len(atoms), len(rows))
+        return [(atoms[index], dict(rows[index])) for index in range(count)]
+
+    def _build_sequential_candidates(
+        self,
+        source_candidates: Sequence[tuple[Atoms, dict[str, object]]],
+        rule: dict[str, object],
+        *,
+        site_id: str,
+    ) -> list[tuple[Atoms, dict[str, object]]]:
+        builder = str(rule.get("builder", "")).strip().lower()
+        if builder in {"ooh_from_o", "o_to_ooh"}:
+            generator = ReactionCandidateGenerator(self.config)
+            orientations = rule.get("n_orientations", None)
+            if orientations is not None:
+                generator.candidate_config["ooh_orientations"] = max(
+                    1,
+                    int(orientations),
+                )
+            candidates = generator._generate_ooh_candidates(
+                source_candidates,
+                {"site_id": site_id},
+            )
+            return [
+                (atoms, self._annotate_sequential_metadata(metadata, rule))
+                for atoms, metadata in candidates
+            ]
+        raise ValueError(f"Unsupported local_cmc sequential builder: {builder!r}")
+
+    @staticmethod
+    def _annotate_sequential_metadata(
+        metadata: dict[str, object],
+        rule: dict[str, object],
+    ) -> dict[str, object]:
+        output = dict(metadata)
+        parent_id = (
+            output.get("parent_state_candidate_id")
+            or output.get("parent_candidate_id")
+            or output.get("parent_o_candidate_id")
+            or ""
+        )
+        output.setdefault("parent_state_dir", str(rule.get("source_state", "")))
+        output.setdefault("parent_state_candidate_id", parent_id)
+        output.setdefault("parent_candidate_id", parent_id)
+        output.setdefault("transition_builder", str(rule.get("builder", "")))
+        return output
+
+    @staticmethod
+    def _candidate_seed_signature(rows: Iterable[dict[str, object]]) -> str:
+        values: list[str] = []
+        for row in rows:
+            values.append(
+                "|".join(
+                    [
+                        str(row.get("candidate_id", "")),
+                        str(row.get("parent_o_candidate_id", "")),
+                        str(row.get("parent_state_candidate_id", "")),
+                        str(row.get("parent_candidate_id", "")),
+                        str(row.get("parent_state_dir", "")),
+                        str(row.get("transition_builder", "")),
+                        str(row.get("orientation_index", "")),
+                    ]
+                )
+            )
+        return "\n".join(values)
+
+    @staticmethod
+    def _local_seed_signature_path(local_dir: Path) -> Path:
+        return local_dir / "seed_signature.txt"
+
+    def _local_seed_signature_matches(
+        self,
+        local_dir: Path,
+        expected_signature: str,
+    ) -> bool:
+        if not expected_signature:
+            return True
+        path = self._local_seed_signature_path(local_dir)
+        return path.exists() and path.read_text() == expected_signature
+
+    def _write_local_seed_signature(
+        self,
+        local_dir: Path,
+        signature: str,
+    ) -> None:
+        if not signature:
+            return
+        local_dir.mkdir(parents=True, exist_ok=True)
+        self._local_seed_signature_path(local_dir).write_text(signature)
 
     def _run_state_block(
         self,
@@ -307,11 +592,25 @@ class ReactionLocalCMCWorkflow:
 
         local_dir = state_path / "local_cmc"
         final_marker = local_dir / "done"
-        if bool(self.local_config.get("skip_existing", False)) and final_marker.exists():
+        ignore_existing = bool(manifest_row.get("_local_cmc_ignore_existing", False))
+        expected_seed_signature = str(
+            manifest_row.get("_local_cmc_seed_signature", "")
+        ).strip()
+        if (
+            bool(self.local_config.get("skip_existing", False))
+            and final_marker.exists()
+            and not ignore_existing
+            and self._local_seed_signature_matches(
+                local_dir,
+                expected_seed_signature,
+            )
+        ):
             seed_atoms = self._read_atoms_list(candidates_traj)
             seed_rows = self._read_csv(candidates_csv) if candidates_csv.exists() else []
             max_seeds = self.local_config.get("max_seed_candidates_per_state")
-            if max_seeds is not None:
+            if max_seeds is not None and not bool(
+                manifest_row.get("_local_cmc_use_all_seeds", False)
+            ):
                 seed_atoms = seed_atoms[: int(max_seeds)]
                 seed_rows = seed_rows[: int(max_seeds)]
             samples = self._reuse_existing_local_samples(
@@ -356,7 +655,9 @@ class ReactionLocalCMCWorkflow:
         seed_atoms = self._read_atoms_list(candidates_traj)
         seed_rows = self._read_csv(candidates_csv) if candidates_csv.exists() else []
         max_seeds = self.local_config.get("max_seed_candidates_per_state")
-        if max_seeds is not None:
+        if max_seeds is not None and not bool(
+            manifest_row.get("_local_cmc_use_all_seeds", False)
+        ):
             seed_atoms = seed_atoms[: int(max_seeds)]
             seed_rows = seed_rows[: int(max_seeds)]
 
@@ -392,6 +693,7 @@ class ReactionLocalCMCWorkflow:
 
         self._write_candidates(samples, candidates_traj, candidates_csv)
         final_marker.write_text(f"{datetime.now().isoformat()} samples={len(samples)}\n")
+        self._write_local_seed_signature(local_dir, expected_seed_signature)
         self._progress(
             "local-cmc block done "
             f"site={manifest_row.get('site_id', '')} state={state_dir} "
@@ -1045,10 +1347,13 @@ class ReactionLocalCMCWorkflow:
             indices = sorted(int(i) for i in rng.choice(len(samples), max_samples, replace=False))
         elif mode == "diverse":
             indices = self._diverse_sample_indices(samples, max_samples)
+        elif mode == "motif_diverse":
+            indices = self._motif_diverse_sample_indices(samples, max_samples)
         else:
             raise ValueError(
                 "local_cmc.output_selection must be one of "
-                "'first', 'last', 'stride', 'random', or 'diverse'."
+                "'first', 'last', 'stride', 'random', 'diverse', "
+                "or 'motif_diverse'."
             )
 
         return [samples[index] for index in indices]
@@ -1073,12 +1378,21 @@ class ReactionLocalCMCWorkflow:
             "diversity": "diverse",
             "farthest": "diverse",
             "fps": "diverse",
+            "motif_diverse": "motif_diverse",
+            "motif-diverse": "motif_diverse",
+            "motif": "motif_diverse",
+            "motifs": "motif_diverse",
+            "site_motif": "motif_diverse",
+            "site-motif": "motif_diverse",
+            "motif_balanced": "motif_diverse",
+            "motif-balanced": "motif_diverse",
         }
         mode = aliases.get(raw)
         if mode is None:
             raise ValueError(
                 "local_cmc.output_selection must be one of "
-                "'first', 'last', 'stride', 'random', or 'diverse'."
+                "'first', 'last', 'stride', 'random', 'diverse', "
+                "or 'motif_diverse'."
             )
         return mode
 
@@ -1107,13 +1421,25 @@ class ReactionLocalCMCWorkflow:
         self,
         samples: Sequence[tuple[Atoms, dict[str, object]]],
         n_select: int,
+        initial_indices: Sequence[int] = (),
     ) -> list[int]:
         features = [self._sample_feature_vector(atoms) for atoms, _ in samples]
         if any(feature is None for feature in features):
             return self._evenly_spaced_indices(len(samples), n_select)
 
-        selected = [0]
-        remaining = set(range(1, len(samples)))
+        selected: list[int] = []
+        seen: set[int] = set()
+        for index in initial_indices:
+            index = int(index)
+            if 0 <= index < len(samples) and index not in seen:
+                selected.append(index)
+                seen.add(index)
+                if len(selected) >= n_select:
+                    return sorted(selected)
+        if not selected:
+            selected = [0]
+            seen.add(0)
+        remaining = set(range(len(samples))) - seen
         min_dist = np.full(len(samples), np.inf, dtype=float)
         while remaining and len(selected) < n_select:
             latest = selected[-1]
@@ -1127,6 +1453,131 @@ class ReactionLocalCMCWorkflow:
             remaining.remove(next_index)
 
         return sorted(selected)
+
+    def _motif_diverse_sample_indices(
+        self,
+        samples: Sequence[tuple[Atoms, dict[str, object]]],
+        n_select: int,
+    ) -> list[int]:
+        groups: dict[str, list[int]] = {}
+        for index, (atoms, _) in enumerate(samples):
+            key = self._sample_motif_key(atoms)
+            groups.setdefault(key, []).append(index)
+        if len(groups) <= 1:
+            return self._diverse_sample_indices(samples, n_select)
+
+        reserve: list[int] = []
+        for _, group in sorted(
+            groups.items(),
+            key=lambda item: (len(item[1]), item[1][0], item[0]),
+        ):
+            reserve.append(self._motif_group_representative_index(samples, group))
+            if len(reserve) >= n_select:
+                return sorted(reserve)
+        return self._diverse_sample_indices(samples, n_select, initial_indices=reserve)
+
+    def _sample_motif_key(self, atoms: Atoms) -> str:
+        ads_indices = set(self._adsorbate_indices(atoms))
+        anchor_idx = self._anchor_index(atoms)
+        if not ads_indices or not (0 <= anchor_idx < len(atoms)):
+            return "unknown"
+
+        support_indices = self._motif_support_indices(atoms, ads_indices)
+        if len(support_indices) == 0:
+            return "unknown"
+
+        vectors = np.asarray(
+            atoms.get_distances(anchor_idx, support_indices, mic=True, vector=True),
+            dtype=float,
+        )
+        lateral = np.linalg.norm(vectors[:, :2], axis=1)
+        order = np.argsort(lateral)
+        sorted_distances = [float(lateral[int(idx)]) for idx in order]
+        sorted_indices = [int(support_indices[int(idx)]) for idx in order]
+        sorted_symbols = [atoms[index].symbol for index in sorted_indices]
+
+        d1 = sorted_distances[0]
+        d2 = sorted_distances[1] if len(sorted_distances) > 1 else float("inf")
+        d3 = sorted_distances[2] if len(sorted_distances) > 2 else float("inf")
+        atop_cutoff = float(self.local_config.get("motif_atop_distance_A", 1.25))
+        atop_ratio = float(self.local_config.get("motif_atop_ratio", 0.65))
+        bridge_ratio = float(self.local_config.get("motif_bridge_ratio", 0.75))
+
+        if d1 <= atop_cutoff or (np.isfinite(d2) and d1 <= atop_ratio * d2):
+            return f"atop:{sorted_symbols[0]}"
+        if np.isfinite(d2) and (not np.isfinite(d3) or d2 <= bridge_ratio * d3):
+            symbols = "-".join(sorted(sorted_symbols[:2]))
+            return f"bridge:{symbols}"
+        symbols = "-".join(sorted(sorted_symbols[: min(3, len(sorted_symbols))]))
+        return f"hollow:{symbols}"
+
+    def _motif_support_indices(
+        self,
+        atoms: Atoms,
+        ads_indices: set[int],
+    ) -> np.ndarray:
+        elements: set[str] = set()
+        elements.update(str(value) for value in getattr(self.config, "site_elements", ()) or ())
+        elements.update(
+            str(value) for value in getattr(self.config, "substrate_elements", ()) or ()
+        )
+        if elements:
+            indices = [
+                idx
+                for idx, atom in enumerate(atoms)
+                if idx not in ads_indices and atom.symbol in elements
+            ]
+        else:
+            indices = [idx for idx in range(len(atoms)) if idx not in ads_indices]
+        if indices:
+            side = str(getattr(self.config, "surface_side", "top")).strip().lower()
+            if side in {"top", "bottom"}:
+                z_values = np.asarray([atoms.positions[idx, 2] for idx in indices], dtype=float)
+                extreme = float(np.max(z_values) if side == "top" else np.min(z_values))
+                default_tol = max(
+                    1.2,
+                    float(getattr(self.config, "surface_layer_tol", 0.5)),
+                )
+                layer_tol = float(
+                    self.local_config.get("motif_surface_layer_tol_A", default_tol)
+                )
+                if side == "top":
+                    filtered = [
+                        idx for idx in indices if atoms.positions[idx, 2] >= extreme - layer_tol
+                    ]
+                else:
+                    filtered = [
+                        idx for idx in indices if atoms.positions[idx, 2] <= extreme + layer_tol
+                    ]
+                if filtered:
+                    indices = filtered
+        return np.asarray(indices, dtype=int)
+
+    def _motif_group_representative_index(
+        self,
+        samples: Sequence[tuple[Atoms, dict[str, object]]],
+        group: Sequence[int],
+    ) -> int:
+        if len(group) == 1:
+            return int(group[0])
+        features = [self._sample_feature_vector(samples[int(index)][0]) for index in group]
+        if any(feature is None for feature in features):
+            return int(group[len(group) // 2])
+
+        best_index = int(group[0])
+        best_mean = float("inf")
+        for local_index, feature in enumerate(features):
+            distances = [
+                self._feature_distance(feature, other)
+                for other_index, other in enumerate(features)
+                if other_index != local_index
+            ]
+            mean_distance = float(np.mean(distances)) if distances else 0.0
+            candidate_index = int(group[local_index])
+            if mean_distance < best_mean:
+                best_mean = mean_distance
+                best_index = candidate_index
+        return best_index
 
     @staticmethod
     def _feature_distance(

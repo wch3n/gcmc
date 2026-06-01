@@ -172,3 +172,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local Codex/MCP metadata and scratch outputs
+/.codex
+/.mcp.json
+/analysis/
+/*.pkl

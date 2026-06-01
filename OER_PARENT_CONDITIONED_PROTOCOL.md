@@ -262,12 +262,14 @@ profile, not a final DFT-quality overpotential.
 
 ## 6. Parent-Conditioned Basin Routes
 
-For one parent `OH*_p`, first group raw local samples into distinct retained
-basins:
+For one parent `OH*_p`, first group raw local O* samples into distinct retained
+basins. When both `02_O` and `03_OOH` are selected for local CMC/PT, the
+workflow then regenerates OOH* seeds from these retained local O* candidates and
+runs the OOH* local search from those basin-conditioned seeds:
 
 ```text
 O*_{j|p}
-OOH*_{k|p}
+OOH*_{k|p,j}
 ```
 
 where `j` and `k` label unique adsorption configurations after local CMC/PT,
@@ -281,10 +283,15 @@ The explicit route is:
 r = (p, j, k)
 ```
 
-OOH* candidates generated from a specific O* candidate carry
-`parent_o_candidate_id`; in that case the workflow pairs only compatible
-`O*_{j|p}` and `OOH*_{k|p}` basins. If no such provenance is available, all
-local O* x OOH* basin combinations for the parent are allowed.
+OOH* candidates generated from a specific O* candidate carry generic transition
+metadata (`parent_state_dir`, `parent_state_candidate_id`, and
+`transition_builder`) plus the legacy OER field `parent_o_candidate_id`. With
+`route_pairing_mode: compatible`, local CMC enforces the default sequential
+`02_O -> 03_OOH` rule when both states are sampled, so the parent candidate ID
+refers to the post-local-CMC O* basin seed. Compatible pairing then keeps only
+basin-conditioned `O*_{j|p}` and `OOH*_{k|p,j}` basins. If no such provenance is
+available, all local O* x OOH* basin combinations for the parent are allowed as
+a fallback.
 
 The route weight is based on the sampled parent population and child basin
 counts:
@@ -335,73 +342,44 @@ instead of one profile from averaged child states.
 
 ## 8. Full Parent Ensemble
 
-For the current workflow, the top-level ensemble summary should be based on a
-dilute-limit model for the first `OH*` adsorption step, not on direct
-population-weighting of the site-specific overpotentials.
-
-The reason is that the canonical/PT `OH*` run gives a conditional distribution:
+For the current workflow, the top-level ensemble summary is based on explicit
+route probabilities written to `oer_routes.csv`. The parent contribution comes
+from the sampled `OH*` parent population:
 
 ```text
 P(parent site p | one OH* is present somewhere)
 ```
 
-This is useful for identifying parent basins and for preserving the local
-background structure, but it is not yet the same as the catalyst-level
-probability that `OH*` forms at site `p` under operating conditions.
-
-### Recommended Ensemble Weight
-
-Use the site-resolved `DeltaG1_p` values from the parent-conditioned CHE table
-to define a dilute-limit `OH*` occupation weight:
+and the child contributions come from retained O* and OOH* basin occurrence
+counts. With sequential OOH generation and compatible pairing, one route has
 
 ```text
-w_p(U) ∝ g_p exp[-beta DeltaG1,p(U)]
+W_r(raw) =
+    P(OH*_p)
+    P(O*_j | OH*_p)
+    P(OOH*_k | O*_j, OH*_p)
 ```
 
-where:
+followed by normalization over all ready routes.
 
-- `p` labels the parent `OH*` basin;
-- `g_p` is a site degeneracy factor;
-- `beta = 1 / (k_B T)`.
+These are empirical route probabilities from the sampling workflow. They should
+not be described as Boltzmann weights over full OER routes. A dilute-limit
+Boltzmann reconstruction from `DeltaG1` is retained only as a legacy fallback in
+the standalone summary script for older outputs that do not contain explicit
+`route_weight` values.
 
-In the current code, the default choice is:
-
-```text
-g_p = 1
-```
-
-for each retained parent basin, i.e. uniform site degeneracy.
-
-Because every `OH*` formation step contains one proton-electron transfer, the
-relative site weights on the RHE scale are already determined by `DeltaG1_p` at
-`U = 0`:
-
-```text
-DeltaG1,p(U) = DeltaG1,p(0) - eU
-```
-
-and the common `exp(beta eU)` factor cancels after normalization. Therefore the
-current dilute-limit site weights can be built directly from the `U = 0`
-`DeltaG1_p` values already present in the CHE summary.
-
-### Route-Weighted Ensemble Summary
-
-After normalizing the dilute-limit weights,
-
-```text
-W_p = w_p / sum_q w_q
-```
+### Route-Probability Ensemble Summary
 
 the recommended top-level descriptor is the route-weighted mean overpotential:
 
 ```text
-eta_ens = sum_p W_p eta_p
+eta_ens = sum_r W_r eta_r
 ```
 
-where each `eta_p` already comes from one parent-conditioned OER route:
+where each route-specific overpotential is
 
 ```text
-eta_p = max(DeltaG1_p, DeltaG2_p, DeltaG3_p, DeltaG4_p) / e - 1.23 V
+eta_r = max(DeltaG1_r, DeltaG2_r, DeltaG3_r, DeltaG4_r) / e - 1.23 V
 ```
 
 This is the current top-level ensemble descriptor written by the workflow.
@@ -423,11 +401,11 @@ promising channels are unlikely to host the first `OH*` adsorbate.
 
 ### Current Shared Clean Reference
 
-This dilute-limit ensemble treatment is valid only when all parent-conditioned
-states are referenced to one consistent clean slab. For a fixed alloy slab, use
-one shared relaxed `00_clean` reference, selected from the lowest-energy
-converged per-site `00_clean` structures, and keep the other per-site clean
-slabs only as diagnostics for adsorbate-induced hysteresis.
+The route ensemble is easiest to compare when all parent-conditioned states are
+referenced to one consistent clean slab. For a fixed alloy slab, use one shared
+relaxed `00_clean` reference, selected from the lowest-energy converged per-site
+`00_clean` structures, and keep the other per-site clean slabs only as
+diagnostics for adsorbate-induced hysteresis.
 
 ### Recommended Reporting
 
@@ -484,8 +462,9 @@ For the material as a whole:
 
 - top parent-conditioned profiles;
 - distribution of `eta_p`;
-- dilute-limit `OH*`-weighted route overpotential summary `eta_ens`;
-- dominant parent basin under the dilute-limit `OH*` weighting model;
+- route-probability-weighted overpotential summary `eta_ens`;
+- dominant route and dominant parent basin under the empirical route
+  probability model;
 - whether `OH*`, `O*`, and `OOH*` stay in the same local region or require
   site shifts;
 - sensitivity to including/excluding nearby child basins.
@@ -498,7 +477,7 @@ For the current code outputs, the recommended hierarchy is:
 - `oer_routes.csv`: primary site-resolved parent-conditioned route table,
   with one row per explicit grouped-basin route;
 - `oer_ensemble.csv`: single top-level ensemble descriptor using normalized
-  route weights from parent populations and child basin counts;
+  empirical route probabilities from parent populations and child basin counts;
 - `oer_states.csv`: compact state-level provenance and free-energy table;
 - `vibration_summary.csv`: optional harmonic corrections for every relaxed
   clean/`OH*`/`O*`/`OOH*` candidate, with the local slab mask defined from the

@@ -1033,7 +1033,7 @@ relaxation:
             )
             self.assertEqual(
                 ensemble[0]["route_weight_model"],
-                "parent_population_times_child_basin_counts",
+                "empirical_conditional_route_probability",
             )
 
     def test_oer_che_geometry_clustering_collapses_duplicate_basin(self):
@@ -1640,6 +1640,139 @@ relaxation:
             self.assertTrue((local_dir / "seed000_accepted.traj").exists())
             self.assertTrue((local_dir / "seed000_rejected.traj").exists())
 
+    def test_reaction_local_cmc_sequential_rule_regenerates_target_from_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_dir = root / "sites" / "atop_0"
+            o_dir = site_dir / "reactions" / "02_O"
+            ooh_dir = site_dir / "reactions" / "03_OOH"
+            o_dir.mkdir(parents=True)
+            ooh_dir.mkdir(parents=True)
+
+            slab_positions = [
+                [0.0, 0.0, 0.0],
+                [2.8, 0.0, 0.0],
+                [0.0, 2.8, 0.0],
+                [2.8, 2.8, 0.0],
+            ]
+            o_a = Atoms(
+                "Pt4O",
+                positions=[*slab_positions, [0.0, 0.0, 1.8]],
+                cell=[5.6, 5.6, 10.0],
+                pbc=[True, True, False],
+            )
+            o_b = o_a.copy()
+            o_b.positions[4, :2] = [2.8, 0.0]
+            for atoms in (o_a, o_b):
+                atoms.set_tags([0, 0, 0, 0, ADSORBATE_TAG_OFFSET])
+            write(str(o_dir / "candidates.traj"), [o_a, o_b])
+            (o_dir / "candidates.csv").write_text(
+                "site_id,state,species,candidate_id,candidate_kind,anchor_index\n"
+                "atop:0,02_O,O,o_basin_a,local_cmc_pt_sample,4\n"
+                "atop:0,02_O,O,o_basin_b,local_cmc_pt_sample,4\n"
+            )
+            write(str(ooh_dir / "candidates.traj"), [o_a])
+            (ooh_dir / "candidates.csv").write_text(
+                "site_id,state,species,candidate_id,candidate_kind,anchor_index,"
+                "parent_o_candidate_id\n"
+                "atop:0,03_OOH,OOH,old_ooh,seed,4,old_o_seed\n"
+            )
+
+            o_row = {
+                "site_id": "atop:0",
+                "state_dir": "02_O",
+                "species": "O",
+                "candidates_traj": str(o_dir / "candidates.traj"),
+                "candidates_csv": str(o_dir / "candidates.csv"),
+            }
+            ooh_row: dict[str, object] = {
+                "site_id": "atop:0",
+                "state_dir": "03_OOH",
+                "species": "OOH",
+                "candidates_traj": str(ooh_dir / "candidates.traj"),
+                "candidates_csv": str(ooh_dir / "candidates.csv"),
+            }
+            cfg = SimpleNamespace(
+                surface_side="top",
+                candidate_generation={"ooh_orientations": 6},
+                local_cmc={
+                    "enabled": True,
+                    "states": ["02_O", "03_OOH"],
+                    "sequential": {
+                        "enabled": True,
+                        "rules": [
+                            {
+                                "source_state": "02_O",
+                                "target_state": "03_OOH",
+                                "builder": "ooh_from_o",
+                                "n_orientations": 1,
+                            }
+                        ],
+                    },
+                    "progress_stdout": False,
+                },
+            )
+
+            workflow = ReactionLocalCMCWorkflow(cfg)
+            rules = workflow._sequential_rules({"02_O", "03_OOH"})
+            workflow._refresh_sequential_target_candidates(
+                ooh_row,
+                {("atop:0", "02_O"): o_row, ("atop:0", "03_OOH"): ooh_row},
+                rules,
+            )
+
+            with (ooh_dir / "candidates.csv").open() as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                [row["parent_o_candidate_id"] for row in rows],
+                ["o_basin_a", "o_basin_b"],
+            )
+            self.assertEqual(
+                [row["parent_state_candidate_id"] for row in rows],
+                ["o_basin_a", "o_basin_b"],
+            )
+            self.assertEqual(rows[0]["parent_state_dir"], "02_O")
+            self.assertEqual(rows[0]["transition_builder"], "ooh_from_o")
+            self.assertEqual(ooh_row["n_candidates"], 2)
+            self.assertTrue(ooh_row["_local_cmc_use_all_seeds"])
+            self.assertTrue(ooh_row["_local_cmc_ignore_existing"])
+
+    def test_reaction_local_cmc_compatible_routes_enable_default_oer_sequence(self):
+        cfg = SimpleNamespace(
+            che={"route_pairing_mode": "compatible"},
+            local_cmc={
+                "enabled": True,
+                "states": ["02_O", "03_OOH"],
+                "sequential_ooh_from_o": False,
+            },
+        )
+        rules = ReactionLocalCMCWorkflow(cfg)._sequential_rules({"02_O", "03_OOH"})
+
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["source_state"], "02_O")
+        self.assertEqual(rules[0]["target_state"], "03_OOH")
+        self.assertEqual(rules[0]["builder"], "ooh_from_o")
+
+    def test_reaction_local_cmc_generic_sequential_rules_order_chained_states(self):
+        rows = [
+            {"site_id": "site0", "state_dir": "C"},
+            {"site_id": "site0", "state_dir": "A"},
+            {"site_id": "site0", "state_dir": "B"},
+        ]
+        rules = [
+            {"source_state": "B", "target_state": "C", "builder": "noop"},
+            {"source_state": "A", "target_state": "B", "builder": "noop"},
+        ]
+
+        ordered = ReactionLocalCMCWorkflow._local_work_order(
+            rows,
+            {"A", "B", "C"},
+            rules,
+        )
+
+        self.assertEqual([row["state_dir"] for row in ordered], ["A", "B", "C"])
+
     def test_reaction_local_cmc_passes_puckering_controls_to_driver(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1798,6 +1931,38 @@ relaxation:
 
         selected_indices = [metadata["sample"] for _, metadata in selected]
         self.assertIn(15, selected_indices)
+        self.assertNotEqual(selected_indices, [0, 1, 2])
+
+    def test_reaction_local_cmc_motif_diverse_output_selection_keeps_rare_atop(self):
+        cfg = SimpleNamespace(
+            site_elements=("Pt",),
+            substrate_elements=("Pt",),
+            local_cmc={
+                "output_selection": "motif_diverse",
+                "max_output_candidates_per_state": 3,
+                "motif_atop_distance_A": 0.6,
+            },
+        )
+        workflow = ReactionLocalCMCWorkflow(cfg)
+        samples = []
+        support = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]]
+        for index in range(20):
+            ads_pos = [1.6 + 0.01 * index, 1.6, 1.8]
+            if index == 17:
+                ads_pos = [0.2, 0.0, 1.8]
+            atoms = Atoms(
+                "Pt3O",
+                positions=[*support, ads_pos],
+                cell=[8.0, 8.0, 12.0],
+                pbc=[False, False, False],
+            )
+            atoms.set_tags([0, 0, 0, ADSORBATE_TAG_OFFSET])
+            samples.append((atoms, {"sample": index}))
+
+        selected = workflow._select_output_samples(samples, 3)
+
+        selected_indices = [metadata["sample"] for _, metadata in selected]
+        self.assertIn(17, selected_indices)
         self.assertNotEqual(selected_indices, [0, 1, 2])
 
     def test_reaction_local_cmc_first_output_selection_keeps_legacy_order(self):

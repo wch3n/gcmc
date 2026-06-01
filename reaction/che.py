@@ -91,6 +91,7 @@ _DEFAULT_CHE_CONFIG = {
 }
 
 _KB_EV_PER_K = 8.617333262145e-5
+_ROUTE_WEIGHT_MODEL = "empirical_conditional_route_probability"
 
 
 def default_che_config() -> dict[str, object]:
@@ -1187,7 +1188,7 @@ class OERCHESummarizer:
         linked = [
             row
             for row in ooh_basins
-            if str(row.get("parent_o_candidate_id", "")).strip()
+            if self._parent_candidate_id(row)
         ]
         if not linked:
             return [dict(row) for row in ooh_basins]
@@ -1202,7 +1203,7 @@ class OERCHESummarizer:
         o_state: dict[str, object],
         ooh_state: dict[str, object],
     ) -> bool:
-        parent_id = str(ooh_state.get("parent_o_candidate_id", "")).strip()
+        parent_id = OERCHESummarizer._parent_candidate_id(ooh_state)
         if not parent_id:
             return True
         ids = {
@@ -1224,6 +1225,18 @@ class OERCHESummarizer:
             if parent_id.startswith(candidate_id + "_"):
                 return True
         return False
+
+    @staticmethod
+    def _parent_candidate_id(row: dict[str, object]) -> str:
+        for key in (
+            "parent_state_candidate_id",
+            "parent_candidate_id",
+            "parent_o_candidate_id",
+        ):
+            value = str(row.get(key, "")).strip()
+            if value:
+                return value
+        return ""
 
     def _annotate_selected_state(
         self,
@@ -1985,6 +1998,13 @@ class OERCHESummarizer:
             "n_OOH_candidates": n_ooh_basins,
             "ooh_basin_candidate_ids": ooh_state.get("basin_candidate_ids", ""),
             "parent_o_candidate_id": ooh_state.get("parent_o_candidate_id", ""),
+            "parent_state_dir": ooh_state.get("parent_state_dir", ""),
+            "parent_state_candidate_id": ooh_state.get(
+                "parent_state_candidate_id",
+                "",
+            ),
+            "parent_candidate_id": ooh_state.get("parent_candidate_id", ""),
+            "transition_builder": ooh_state.get("transition_builder", ""),
             "DeltaG1_eV": base.get("DeltaG1_eV", ""),
             "DeltaG2_eV": base.get("DeltaG2_eV", ""),
             "DeltaG3_eV": base.get("DeltaG3_eV", ""),
@@ -2226,6 +2246,13 @@ class OERCHESummarizer:
                         "parent_o_candidate_id",
                         "",
                     ),
+                    "parent_state_dir": reference.get("parent_state_dir", ""),
+                    "parent_state_candidate_id": reference.get(
+                        "parent_state_candidate_id",
+                        "",
+                    ),
+                    "parent_candidate_id": reference.get("parent_candidate_id", ""),
+                    "transition_builder": reference.get("transition_builder", ""),
                     "min_free_energy_eV": (
                         min_state.get("energy_eV", "") if min_state else ""
                     ),
@@ -2292,6 +2319,10 @@ class OERCHESummarizer:
             "min_candidate_id": "",
             "min_candidate_kind": "",
             "parent_o_candidate_id": "",
+            "parent_state_dir": "",
+            "parent_state_candidate_id": "",
+            "parent_candidate_id": "",
+            "transition_builder": "",
             "min_free_energy_eV": "",
             "min_energy_source": "",
             "electronic_energy_eV": "",
@@ -2357,7 +2388,7 @@ class OERCHESummarizer:
                 "n_ready_routes": len(ready),
                 "population_sum_ready": population_sum,
                 "population_missing": population_missing,
-                "route_weight_model": "parent_population_times_child_basin_counts",
+                "route_weight_model": _ROUTE_WEIGHT_MODEL,
                 "basin_cluster_mode": self._basin_cluster_mode(),
                 "basin_energy_cluster_tol_eV": self._basin_energy_cluster_tol(),
                 "route_weighted_mean_overpotential_V": eta_weighted_mean,

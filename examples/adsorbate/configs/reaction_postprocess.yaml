@@ -77,8 +77,15 @@ local_cmc:
     equilibration_cycles: 100
     max_seed_candidates_per_state: 1
     max_output_candidates_per_state: 50
-    output_selection: diverse
+    output_selection: motif_diverse
     replace_candidates: true
+  sequential:
+    enabled: true
+    rules:
+      - source_state: 02_O
+        target_state: 03_OOH
+        builder: ooh_from_o
+        n_orientations: 1
   pt:
     enabled: false
     temperatures_K: [303.0, 400.0, 500.0, 600.0]

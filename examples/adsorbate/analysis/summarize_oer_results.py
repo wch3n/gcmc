@@ -50,6 +50,10 @@ class RouteProfile:
     o_basin_count: int | None = None
     ooh_basin_id: str = ""
     ooh_basin_count: int | None = None
+    parent_state_dir: str = ""
+    parent_state_candidate_id: str = ""
+    parent_candidate_id: str = ""
+    transition_builder: str = ""
     n_oh: int | None = None
     n_o: int | None = None
     n_ooh: int | None = None
@@ -182,6 +186,10 @@ def _route_from_deltas(
     o_basin_count: int | None = None,
     ooh_basin_id: str = "",
     ooh_basin_count: int | None = None,
+    parent_state_dir: str = "",
+    parent_state_candidate_id: str = "",
+    parent_candidate_id: str = "",
+    transition_builder: str = "",
     n_oh: int | None = None,
     n_o: int | None = None,
     n_ooh: int | None = None,
@@ -196,6 +204,10 @@ def _route_from_deltas(
         o_basin_count=o_basin_count,
         ooh_basin_id=ooh_basin_id,
         ooh_basin_count=ooh_basin_count,
+        parent_state_dir=parent_state_dir,
+        parent_state_candidate_id=parent_state_candidate_id,
+        parent_candidate_id=parent_candidate_id,
+        transition_builder=transition_builder,
         deltas=deltas,
         limiting_step=limiting,
         overpotential=max(deltas) - equilibrium,
@@ -221,6 +233,10 @@ def _route_with_closed_dg4(
         o_basin_count=route.o_basin_count,
         ooh_basin_id=route.ooh_basin_id,
         ooh_basin_count=route.ooh_basin_count,
+        parent_state_dir=route.parent_state_dir,
+        parent_state_candidate_id=route.parent_state_candidate_id,
+        parent_candidate_id=route.parent_candidate_id,
+        transition_builder=route.transition_builder,
         deltas=(dg1, dg2, dg3, total_oer_free_energy - dg1 - dg2 - dg3),
         equilibrium=equilibrium,
         n_oh=route.n_oh,
@@ -266,6 +282,13 @@ def load_harmonic_routes(workflow: Path, equilibrium: float) -> list[RouteProfil
                     o_basin_count=_as_int(row.get("o_basin_count")),
                     ooh_basin_id=str(row.get("ooh_basin_id", "")),
                     ooh_basin_count=_as_int(row.get("ooh_basin_count")),
+                    parent_state_dir=str(row.get("parent_state_dir", "")),
+                    parent_state_candidate_id=str(
+                        row.get("parent_state_candidate_id", "")
+                        or row.get("parent_o_candidate_id", "")
+                    ),
+                    parent_candidate_id=str(row.get("parent_candidate_id", "")),
+                    transition_builder=str(row.get("transition_builder", "")),
                     deltas=deltas,  # type: ignore[arg-type]
                     equilibrium=equilibrium,
                     n_oh=_as_int(row.get("n_OH_candidates")),
@@ -458,8 +481,16 @@ def _resolve_oer_reference_mode(mode: str, o2_energy: float) -> str:
     raise ValueError("--oer-reference-mode must be auto, closure, or explicit_o2.")
 
 
-def dilute_oh_weights(routes: list[RouteProfile], temperature: float) -> list[float]:
-    """Weights used by the current dilute-limit OH adsorption model."""
+def route_probability_weights(
+    routes: list[RouteProfile],
+    temperature: float,
+) -> list[float]:
+    """Route probabilities used for summaries.
+
+    Current workflow outputs carry explicit empirical route probabilities in
+    ``route_weight``.  The temperature-dependent fallback is only for older
+    outputs that predate explicit route weights.
+    """
 
     if not routes:
         return []
@@ -532,7 +563,7 @@ def ensemble_profile(
 ) -> EnsembleProfile | None:
     if not routes:
         return None
-    weights = dilute_oh_weights(routes, temperature)
+    weights = route_probability_weights(routes, temperature)
     deltas = tuple(
         sum(weight * route.deltas[idx] for weight, route in zip(weights, routes))
         for idx in range(4)
@@ -561,7 +592,7 @@ def route_distribution_stats(
     temperature: float,
     interval: float,
 ) -> dict[str, WeightedStats]:
-    weights = dilute_oh_weights(routes, temperature)
+    weights = route_probability_weights(routes, temperature)
     stats: dict[str, WeightedStats] = {}
     for idx in range(4):
         stats[f"DG{idx + 1}"] = _weighted_stats(
@@ -614,6 +645,8 @@ def _site_rows(routes: list[RouteProfile], weights: list[float], top: int) -> li
             [
                 route.route_id,
                 route.site_id,
+                route.parent_state_candidate_id,
+                route.transition_builder,
                 _format_float(route.population, 4),
                 _format_float(weight, 4),
                 _format_float(route.deltas[0]),
@@ -731,12 +764,13 @@ def render_summary(
         "## Ensemble Profile",
         "",
         (
-            "Weights use `route_weight` from `oer_routes.csv` when available; "
-            "older outputs fall back to dilute-limit OH adsorption weights."
+            "`route_weight` is an empirical conditional route probability from "
+            "`oer_routes.csv`; older outputs fall back to OH Boltzmann "
+            "adsorption weights reconstructed from DeltaG1."
         ),
         (
-            "The reported ensemble eta is the weighted mean of the route-wise "
-            "overpotentials, not max(<DeltaG1>, ..., <DeltaG4>)."
+            "The reported ensemble eta is the route-probability-weighted mean "
+            "of the route-wise overpotentials, not max(<DeltaG1>, ..., <DeltaG4>)."
         ),
         (
             "DeltaG4 uses "
@@ -790,7 +824,7 @@ def render_summary(
                     [
                         "model",
                         "quantity",
-                        "weighted mean",
+                        "prob. mean",
                         "site sigma",
                         f"q{0.5 * (100.0 - interval_pct):.1f}",
                         f"q{100.0 - 0.5 * (100.0 - interval_pct):.1f}",
@@ -812,13 +846,13 @@ def render_summary(
                     "before CHE route construction."
                 ),
                 (
-                    "Basin and route weights are empirical retained-sample frequencies; "
+                    "Basin and route probabilities are empirical retained-sample frequencies; "
                     "they are not guaranteed to be unbiased thermodynamic probabilities "
                     "unless local CMC/PT sampling is well equilibrated and well mixed."
                 ),
                 "",
                 _table(
-                    ["state", "site", "basin", "raw samples", "route weight sum"],
+                    ["state", "site", "basin", "raw samples", "route prob. sum"],
                     basin_rows,
                 ),
             ]
@@ -833,16 +867,18 @@ def render_summary(
                 (
                     f"Best site eta: {harmonic_ensemble.min_site_id} "
                     f"({_format_float(harmonic_ensemble.min_site_overpotential)} V); "
-                    f"dominant OH-weight site: {harmonic_ensemble.dominant_site_id} "
-                    f"(weight {_format_float(harmonic_ensemble.dominant_weight, 4)})."
+                    f"dominant route-probability site: {harmonic_ensemble.dominant_site_id} "
+                    f"(prob. {_format_float(harmonic_ensemble.dominant_weight, 4)})."
                 ),
                 "",
                 _table(
                     [
                         "route",
                         "site",
+                        "parent candidate",
+                        "transition",
                         "pop",
-                        "weight",
+                        "route prob.",
                         "DG1",
                         "DG2",
                         "DG3",
@@ -853,7 +889,7 @@ def render_summary(
                     ],
                     _site_rows(
                         harmonic_routes,
-                        dilute_oh_weights(harmonic_routes, temperature),
+                        route_probability_weights(harmonic_routes, temperature),
                         top_sites,
                     ),
                 ),
@@ -917,7 +953,10 @@ def main() -> None:
         "--temperature",
         type=float,
         default=298.0,
-        help="Temperature in K for reconstructed Boltzmann weights.",
+        help=(
+            "Temperature in K for legacy OH Boltzmann fallback weights when "
+            "oer_routes.csv lacks explicit route_weight values."
+        ),
     )
     parser.add_argument(
         "--cluster-tol",

@@ -216,6 +216,7 @@ class AdsorbateCMC(SurfaceMCBase):
         accepted_traj_file: Optional[str] = None,
         rejected_traj_file: Optional[str] = None,
         attempted_traj_file: Optional[str] = None,
+        debug_traj_interval: int = 1,
         thermo_file: str = "adsorbate_cmc.dat",
         checkpoint_file: str = "adsorbate_cmc.pkl",
         checkpoint_interval: int = 100,
@@ -518,6 +519,9 @@ class AdsorbateCMC(SurfaceMCBase):
         self.accepted_traj_file = accepted_traj_file
         self.rejected_traj_file = rejected_traj_file
         self.attempted_traj_file = attempted_traj_file
+        self.debug_traj_interval = int(debug_traj_interval)
+        if self.debug_traj_interval < 1:
+            raise ValueError("debug_traj_interval must be >= 1.")
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
@@ -2060,6 +2064,9 @@ class AdsorbateCMC(SurfaceMCBase):
             self._persistent_thermo_handles[self.thermo_file] = handle
         return handle
 
+    def _should_write_debug_traj(self) -> bool:
+        return int(self.total_moves) % int(self.debug_traj_interval) == 0
+
     def close_persistent_io(self) -> None:
         for writer in self._persistent_traj_writers.values():
             try:
@@ -2123,6 +2130,7 @@ class AdsorbateCMC(SurfaceMCBase):
 
             for i in range(moves_this_sweep):
                 self.total_moves += 1
+                write_debug_frame = self._should_write_debug_traj()
                 do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
                 if do_md:
                     self.md_attempted_moves += 1
@@ -2133,7 +2141,7 @@ class AdsorbateCMC(SurfaceMCBase):
                     if self.has_detached_functional_groups(
                         atoms_trial, detach_tol=self.detach_tol
                     ):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
@@ -2142,21 +2150,21 @@ class AdsorbateCMC(SurfaceMCBase):
                         support_xy_tol=self.support_xy_tol,
                         z_max_support=self.z_max_support,
                     ):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
                     if not self._molecular_adsorbates_are_intact(atoms_trial):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
                     if not self._anchors_within_site_region(atoms_trial):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
-                    if attempted_writer is not None:
+                    if attempted_writer is not None and write_debug_frame:
                         attempted_writer.write(atoms_trial)
 
                     md_delta = (
@@ -2169,9 +2177,9 @@ class AdsorbateCMC(SurfaceMCBase):
                         self.atoms.positions = atoms_trial.positions
                         self.atoms.cell = atoms_trial.cell
                         self._site_registry = None
-                        if accepted_writer is not None:
+                        if accepted_writer is not None and write_debug_frame:
                             accepted_writer.write(self.atoms)
-                    elif rejected_writer is not None:
+                    elif rejected_writer is not None and write_debug_frame:
                         rejected_writer.write(atoms_trial)
                     continue
 
@@ -2188,12 +2196,12 @@ class AdsorbateCMC(SurfaceMCBase):
                     if self.has_detached_functional_groups(
                         atoms_trial, detach_tol=self.detach_tol
                     ):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
                     if not self._molecular_adsorbates_are_intact(atoms_trial):
-                        if rejected_writer is not None:
+                        if rejected_writer is not None and write_debug_frame:
                             rejected_writer.write(atoms_trial)
                         continue
 
@@ -2202,16 +2210,16 @@ class AdsorbateCMC(SurfaceMCBase):
                     support_xy_tol=self.support_xy_tol,
                     z_max_support=self.z_max_support,
                 ):
-                    if rejected_writer is not None:
+                    if rejected_writer is not None and write_debug_frame:
                         rejected_writer.write(atoms_trial)
                     continue
 
                 if not self._anchors_within_site_region(atoms_trial):
-                    if rejected_writer is not None:
+                    if rejected_writer is not None and write_debug_frame:
                         rejected_writer.write(atoms_trial)
                     continue
 
-                if attempted_writer is not None:
+                if attempted_writer is not None and write_debug_frame:
                     attempted_writer.write(atoms_trial)
 
                 e_new = self.get_potential_energy(atoms_trial)
@@ -2223,9 +2231,9 @@ class AdsorbateCMC(SurfaceMCBase):
                     self.e_old = e_new
                     self.accepted_moves += 1
                     self._site_registry = None
-                    if accepted_writer is not None:
+                    if accepted_writer is not None and write_debug_frame:
                         accepted_writer.write(self.atoms)
-                elif rejected_writer is not None:
+                elif rejected_writer is not None and write_debug_frame:
                     rejected_writer.write(atoms_trial)
 
             self.sweep += 1

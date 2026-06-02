@@ -1875,7 +1875,11 @@ relaxation:
                 },
                 "moves": {
                     "mode": "hybrid",
-                    "reorientation_prob": 0.1,
+                    "reorientation": {
+                        "prob": 0.1,
+                        "angle_deg": 35.0,
+                        "max_trials": 9,
+                    },
                     "hop": {
                         "prob": 0.25,
                         "reorient": {
@@ -1893,7 +1897,11 @@ relaxation:
                 },
                 "relaxation": {"enabled": True, "steps": 30, "fmax": 0.04},
                 "md": {"enabled": False, "move_prob": 0.0},
-                "output": {"write_debug_trajs": True, "progress_stdout": False},
+                "output": {
+                    "write_debug_trajs": True,
+                    "debug_traj_interval": 13,
+                    "progress_stdout": False,
+                },
             }
         )
 
@@ -1910,6 +1918,8 @@ relaxation:
         self.assertAlmostEqual(local["hop_puckering_reorientation_prob"], 0.04)
         self.assertEqual(local["hop_reorientation_angle_deg"], 170.0)
         self.assertEqual(local["max_hop_reorientation_trials"], 11)
+        self.assertEqual(local["rotation_max_angle_deg"], 35.0)
+        self.assertEqual(local["max_reorientation_trials"], 9)
         self.assertEqual(local["puckering_prob"], 0.0)
         self.assertEqual(local["puckering_hop_prob"], 0.0)
         self.assertEqual(local["puckering_elements"], ["Pt"])
@@ -1917,6 +1927,7 @@ relaxation:
         self.assertTrue(local["relax"])
         self.assertFalse(local["enable_hybrid_md"])
         self.assertTrue(local["write_debug_trajs"])
+        self.assertEqual(local["debug_traj_interval"], 13)
 
     def test_reaction_local_cmc_diverse_output_selection_keeps_late_basin(self):
         cfg = SimpleNamespace(
@@ -2152,6 +2163,7 @@ relaxation:
                     "workers_per_gpu": 1,
                     "ray_num_gpus_per_task": 1.0,
                     "write_debug_trajs": True,
+                    "debug_traj_interval": 9,
                     "progress_stdout": False,
                 },
             )
@@ -2177,7 +2189,9 @@ relaxation:
             self.assertIn("replica_300K_attempted.traj", first_mc_kwargs["attempted_traj_file"])
             self.assertIn("replica_300K_accepted.traj", first_mc_kwargs["accepted_traj_file"])
             self.assertIn("replica_300K_rejected.traj", first_mc_kwargs["rejected_traj_file"])
+            self.assertEqual(first_mc_kwargs["debug_traj_interval"], 9)
             self.assertIn("replica_450K_attempted.traj", second_mc_kwargs["attempted_traj_file"])
+            self.assertEqual(second_mc_kwargs["debug_traj_interval"], 9)
             self.assertEqual(outputs[0][1]["candidate_kind"], "local_cmc_pt_sample")
             self.assertEqual(outputs[0][1]["local_cmc_pt_temperature_K"], 300.0)
 

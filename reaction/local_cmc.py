@@ -15,6 +15,7 @@ from ase.io import read, write
 
 from gcmc.adsorbate_cmc import AdsorbateCMC
 from gcmc.constants import ADSORBATE_TAG_OFFSET
+from gcmc.move_config import normalize_adsorbate_move_config
 from gcmc.replica import ReplicaExchange
 from gcmc.workflows import build_adsorbate_gcmc_calculator, build_replica_calculator_spec
 
@@ -96,6 +97,7 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "write_attempted_traj": False,
     "write_accepted_traj": False,
     "write_rejected_traj": False,
+    "debug_traj_interval": 1,
     "progress_log": None,
     "progress_stdout": True,
     "calculator": None,
@@ -236,6 +238,7 @@ class ReactionLocalCMCWorkflow:
                 "write_attempted_traj": "write_attempted_traj",
                 "write_accepted_traj": "write_accepted_traj",
                 "write_rejected_traj": "write_rejected_traj",
+                "debug_traj_interval": "debug_traj_interval",
                 "progress_log": "progress_log",
                 "progress_stdout": "progress_stdout",
             },
@@ -255,87 +258,14 @@ class ReactionLocalCMCWorkflow:
                 if source_key in section:
                     merged[target_key] = section[source_key]
 
-        moves_section = raw.get("moves")
-        if isinstance(moves_section, dict) and isinstance(
-            moves_section.get("puckering"), dict
-        ):
-            for source_key, target_key in section_maps["puckering"].items():
-                if source_key in moves_section["puckering"]:
-                    merged[target_key] = moves_section["puckering"][source_key]
-        if isinstance(moves_section, dict) and isinstance(
-            moves_section.get("hop"), dict
-        ):
-            cls._apply_nested_hop_move_config(merged, moves_section["hop"])
+        if isinstance(raw.get("moves"), dict):
+            normalize_adsorbate_move_config(merged)
 
         backend_section = raw.get("backend")
         if isinstance(backend_section, dict):
             for source_key, target_key in section_maps["backend_config"].items():
                 if source_key in backend_section:
                     merged[target_key] = backend_section[source_key]
-
-    @staticmethod
-    def _probability(value: object, *, name: str) -> float:
-        probability = float(value)
-        if not (0.0 <= probability <= 1.0):
-            raise ValueError(f"{name} must be in [0, 1].")
-        return probability
-
-    @classmethod
-    def _apply_nested_hop_move_config(
-        cls,
-        merged: dict[str, object],
-        hop_section: dict[str, object],
-    ) -> None:
-        reorient_section = hop_section.get("reorient")
-        reorient_prob = 0.0
-        if isinstance(reorient_section, dict):
-            enabled = bool(reorient_section.get("enabled", True))
-            if enabled:
-                reorient_prob = cls._probability(
-                    reorient_section.get("prob", 1.0),
-                    name="moves.hop.reorient.prob",
-                )
-            if "angle_deg" in reorient_section:
-                merged["hop_reorientation_angle_deg"] = reorient_section["angle_deg"]
-            if "max_trials" in reorient_section:
-                merged["max_hop_reorientation_trials"] = reorient_section[
-                    "max_trials"
-                ]
-
-        puckering_section = hop_section.get("puckering")
-        puckering_prob = 0.0
-        if isinstance(puckering_section, dict):
-            enabled = bool(puckering_section.get("enabled", True))
-            if enabled:
-                puckering_prob = cls._probability(
-                    puckering_section.get("prob", 1.0),
-                    name="moves.hop.puckering.prob",
-                )
-            if "elements" in puckering_section:
-                merged["puckering_elements"] = puckering_section["elements"]
-            if "height_A" in puckering_section:
-                merged["puckering_height_A"] = puckering_section["height_A"]
-            if "height_jitter_A" in puckering_section:
-                merged["puckering_height_jitter_A"] = puckering_section[
-                    "height_jitter_A"
-                ]
-            if "max_trials" in puckering_section:
-                merged["max_puckering_trials"] = puckering_section["max_trials"]
-
-        if "max_trials" in hop_section:
-            merged["max_displacement_trials"] = hop_section["max_trials"]
-        if "prob" in hop_section:
-            hop_prob = cls._probability(hop_section["prob"], name="moves.hop.prob")
-            plain_hop_prob = hop_prob * (1.0 - puckering_prob)
-            puckered_hop_prob = hop_prob * puckering_prob
-            merged["site_hop_prob"] = plain_hop_prob * (1.0 - reorient_prob)
-            merged["hop_reorientation_prob"] = plain_hop_prob * reorient_prob
-            merged["hop_puckering_prob"] = (
-                puckered_hop_prob * (1.0 - reorient_prob)
-            )
-            merged["hop_puckering_reorientation_prob"] = (
-                puckered_hop_prob * reorient_prob
-            )
 
     def enabled(self) -> bool:
         return bool(self.local_config.get("enabled", False))
@@ -985,6 +915,7 @@ class ReactionLocalCMCWorkflow:
             attempted_traj_file=str(attempted_path) if attempted_path else None,
             accepted_traj_file=str(accepted_path) if accepted_path else None,
             rejected_traj_file=str(rejected_path) if rejected_path else None,
+            debug_traj_interval=int(self.local_config.get("debug_traj_interval", 1)),
             thermo_file=str(thermo_path),
             checkpoint_file=str(checkpoint_path),
             checkpoint_interval=int(self.local_config.get("checkpoint_interval", 0)),
@@ -1245,6 +1176,7 @@ class ReactionLocalCMCWorkflow:
             "relax": bool(self.local_config.get("relax", False)),
             "relax_steps": int(self.local_config.get("relax_steps", 20)),
             "fmax": float(self.local_config.get("fmax", 0.05)),
+            "debug_traj_interval": int(self.local_config.get("debug_traj_interval", 1)),
             "checkpoint_interval": 0,
             "enable_hybrid_md": bool(self.local_config.get("enable_hybrid_md", False)),
             "md_move_prob": float(self.local_config.get("md_move_prob", 0.05)),

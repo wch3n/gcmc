@@ -1147,6 +1147,34 @@ class TestAdsorbateCMCPuckering(unittest.TestCase):
             self.assertEqual(len(attempted_frames), 0)
             self.assertEqual(len(rejected_frames), 1)
 
+    def test_debug_traj_interval_thins_attempted_and_accepted_frames(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sim = self._make_sim(
+                move_mode="displacement",
+                debug_traj_interval=2,
+            )
+            sim._propose_move = lambda: sim.atoms.copy()
+
+            attempted = root / "attempted.traj"
+            accepted = root / "accepted.traj"
+            samples = root / "samples.traj"
+            sim.attempted_traj_file = str(attempted)
+            sim.accepted_traj_file = str(accepted)
+
+            sim.run(
+                nsweeps=3,
+                traj_file=str(samples),
+                interval=1,
+                sample_interval=1,
+                equilibration=0,
+            )
+
+            attempted_frames = read(str(attempted), ":") if attempted.exists() else []
+            accepted_frames = read(str(accepted), ":") if accepted.exists() else []
+            self.assertEqual(len(attempted_frames), 1)
+            self.assertEqual(len(accepted_frames), 1)
+
     def test_surface_side_filter_rejects_buried_molecular_atom(self):
         atoms = Atoms(
             "TiOOH",

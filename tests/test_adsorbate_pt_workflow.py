@@ -72,6 +72,7 @@ pt:
   T_step: 100
 cmc:
   moves:
+    mode: hybrid
     hop:
       prob: 0.6
       reorient:
@@ -89,6 +90,7 @@ output:
   results_file: results.csv
   checkpoint_file: state.pkl
   initial_traj_file: init.traj
+  debug_traj_interval: 25
 """.strip()
             )
 
@@ -100,6 +102,8 @@ output:
         self.assertEqual(cfg.results_file, str(root / "results.csv"))
         self.assertEqual(cfg.checkpoint_file, str(root / "state.pkl"))
         self.assertEqual(cfg.initial_traj_file, str(root / "init.traj"))
+        self.assertEqual(cfg.debug_traj_interval, 25)
+        self.assertEqual(cfg.move_mode, "hybrid")
         self.assertAlmostEqual(cfg.site_hop_prob, 0.075)
         self.assertAlmostEqual(cfg.hop_reorientation_prob, 0.225)
         self.assertAlmostEqual(cfg.hop_puckering_prob, 0.075)
@@ -140,6 +144,7 @@ output:
                     "checkpoint_file": str(Path(tmpdir) / "pt_out" / "state.pkl"),
                     "initial_traj_file": str(Path(tmpdir) / "pt_out" / "initial.traj"),
                     "write_debug_trajs": True,
+                    "debug_traj_interval": 7,
                 }
             )
             cfg = SimpleNamespace(**cfg_dict)
@@ -163,6 +168,7 @@ output:
             self.assertIs(kwargs["mc_class"], AdsorbateCMC)
             self.assertEqual(kwargs["mc_kwargs"]["adsorbate_anchor_index"], 0)
             self.assertEqual(kwargs["mc_kwargs"]["site_type"], ["atop"])
+            self.assertEqual(kwargs["mc_kwargs"]["debug_traj_interval"], 7)
 
             atoms_template = kwargs["atoms_template"]
             tags = np.asarray(atoms_template.get_tags(), dtype=int)

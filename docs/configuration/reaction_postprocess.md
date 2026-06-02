@@ -285,6 +285,7 @@ local adsorbate CMC samples constrained around a matched parent-state anchor.
 | `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
 | `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. Attempted trajectories contain valid trial moves after geometry filters, while rejected trajectories include invalid-filter rejects and Metropolis rejects. |
 | `write_attempted_traj`, `write_accepted_traj`, `write_rejected_traj` | Individually enable specific debug trajectory files. |
+| `debug_traj_interval` | Write only every Nth debug event to attempted/accepted/rejected trajectories. Defaults to `1`, which preserves the previous every-event behavior. |
 | `skip_existing` | If true, do not rerun CMC/PT for state blocks whose `local_cmc/done` marker exists. Existing local trajectories are still re-promoted into `candidates.traj` using the current `output_selection` and `max_output_candidates_per_state` settings when possible. |
 
 `local_cmc` also accepts grouped subsections. Grouped keys override the
@@ -345,6 +346,7 @@ local_cmc:
     enabled: false
   output:
     write_debug_trajs: true
+    debug_traj_interval: 10
     progress_log: local_cmc.log
 ```
 

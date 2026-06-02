@@ -78,6 +78,7 @@ For adsorbate CMC/PT, the hop controls may also be written as a nested block:
 ```yaml
 cmc:
   moves:
+    mode: hybrid
     hop:
       prob: 0.60
       reorient:
@@ -181,6 +182,9 @@ These keys live under the `pt:` section in nested YAML for `AdsorbateReplicaExch
 | `results_file` | `results.csv` | Per-cycle replica summary written under `output_dir`. |
 | `checkpoint_file` | `pt_state.pkl` | PT master checkpoint written under `output_dir`. |
 | `initial_traj_file` | `adsorbate_pt_initial.traj` | Shared initialized adsorbate structure written once before PT starts. |
+| `write_debug_trajs` | `False` | Write per-replica attempted/accepted/rejected debug trajectories. |
+| `write_accepted_traj`, `write_rejected_traj` | `False` | Individually enable accepted or rejected debug trajectories. |
+| `debug_traj_interval` | `1` | Write only every Nth debug event to attempted/accepted/rejected trajectories. |
 
 On resume, PT output files are truncated back to the master-checkpoint boundary
 before new rows are appended.  This avoids duplicate sweep/cycle segments in

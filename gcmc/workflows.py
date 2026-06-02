@@ -21,6 +21,7 @@ from .adsorbate_cmc import AdsorbateCMC, _place_adsorbate_template
 from .adsorbate_gcmc import AdsorbateGCMC
 from .alloy_cmc import AlloyCMC
 from .constants import ADSORBATE_TAG_OFFSET
+from .move_config import normalize_adsorbate_move_config
 from .replica import MuReplicaExchange, ReplicaExchange
 from .utils import build_surface_site_registry
 from .utils import initialize_surface_adsorbates
@@ -303,6 +304,7 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "relax_z_only": False,
     "fmax": 0.05,
     "verbose_relax": False,
+    "debug_traj_interval": 1,
     "enable_hybrid_md": False,
     "md_move_prob": 0.1,
     "md_steps": 50,
@@ -403,6 +405,7 @@ _DEFAULT_ADSORBATE_PT_CONFIG.update(
         "write_debug_trajs": False,
         "write_accepted_traj": False,
         "write_rejected_traj": False,
+        "debug_traj_interval": 1,
         "write_site_overlay": False,
         "site_overlay_include_blocked": False,
         "site_overlay_z_field": "suggested_z_A",
@@ -947,105 +950,6 @@ def _resolve_mu_scan_values(flat_config: dict) -> dict:
     return flat_config
 
 
-def _as_probability(value: object, *, name: str) -> float:
-    probability = float(value)
-    if not (0.0 <= probability <= 1.0):
-        raise ValueError(f"{name} must be in [0, 1].")
-    return probability
-
-
-def _apply_nested_adsorbate_move_config(flat_config: dict) -> dict:
-    moves = flat_config.get("moves")
-    if not isinstance(moves, dict):
-        return flat_config
-
-    displacement = moves.get("displacement")
-    if isinstance(displacement, dict):
-        if "sigma_A" in displacement:
-            flat_config["displacement_sigma"] = displacement["sigma_A"]
-        if "sigma" in displacement:
-            flat_config["displacement_sigma"] = displacement["sigma"]
-        if "max_trials" in displacement:
-            flat_config["max_displacement_trials"] = displacement["max_trials"]
-
-    reorientation = moves.get("reorientation")
-    if isinstance(reorientation, dict):
-        if "prob" in reorientation:
-            flat_config["reorientation_prob"] = reorientation["prob"]
-        if "angle_deg" in reorientation:
-            flat_config["rotation_max_angle_deg"] = reorientation["angle_deg"]
-        if "max_trials" in reorientation:
-            flat_config["max_reorientation_trials"] = reorientation["max_trials"]
-
-    hop = moves.get("hop")
-    if isinstance(hop, dict):
-        if "max_trials" in hop:
-            flat_config["max_displacement_trials"] = hop["max_trials"]
-        reorient = hop.get("reorient")
-        reorient_prob = 0.0
-        if isinstance(reorient, dict):
-            enabled = bool(reorient.get("enabled", True))
-            if enabled:
-                reorient_prob = _as_probability(
-                    reorient.get("prob", 1.0),
-                    name="moves.hop.reorient.prob",
-                )
-            if "angle_deg" in reorient:
-                flat_config["hop_reorientation_angle_deg"] = reorient["angle_deg"]
-            if "max_trials" in reorient:
-                flat_config["max_hop_reorientation_trials"] = reorient["max_trials"]
-
-        hop_puckering = hop.get("puckering")
-        hop_puckering_prob = 0.0
-        if isinstance(hop_puckering, dict):
-            enabled = bool(hop_puckering.get("enabled", True))
-            if enabled:
-                hop_puckering_prob = _as_probability(
-                    hop_puckering.get("prob", 1.0),
-                    name="moves.hop.puckering.prob",
-                )
-            if "elements" in hop_puckering:
-                flat_config["puckering_elements"] = hop_puckering["elements"]
-            if "height_A" in hop_puckering:
-                flat_config["puckering_height_A"] = hop_puckering["height_A"]
-            if "height_jitter_A" in hop_puckering:
-                flat_config["puckering_height_jitter_A"] = hop_puckering[
-                    "height_jitter_A"
-                ]
-            if "max_trials" in hop_puckering:
-                flat_config["max_puckering_trials"] = hop_puckering["max_trials"]
-
-        if "prob" in hop:
-            hop_prob = _as_probability(hop["prob"], name="moves.hop.prob")
-            plain_hop_prob = hop_prob * (1.0 - hop_puckering_prob)
-            puckered_hop_prob = hop_prob * hop_puckering_prob
-            flat_config["site_hop_prob"] = plain_hop_prob * (1.0 - reorient_prob)
-            flat_config["hop_reorientation_prob"] = plain_hop_prob * reorient_prob
-            flat_config["hop_puckering_prob"] = (
-                puckered_hop_prob * (1.0 - reorient_prob)
-            )
-            flat_config["hop_puckering_reorientation_prob"] = (
-                puckered_hop_prob * reorient_prob
-            )
-
-    puckering = moves.get("puckering")
-    if isinstance(puckering, dict):
-        if "prob" in puckering:
-            flat_config["puckering_prob"] = puckering["prob"]
-        if "hop_prob" in puckering:
-            flat_config["puckering_hop_prob"] = puckering["hop_prob"]
-        if "elements" in puckering:
-            flat_config["puckering_elements"] = puckering["elements"]
-        if "height_A" in puckering:
-            flat_config["puckering_height_A"] = puckering["height_A"]
-        if "height_jitter_A" in puckering:
-            flat_config["puckering_height_jitter_A"] = puckering["height_jitter_A"]
-        if "max_trials" in puckering:
-            flat_config["max_puckering_trials"] = puckering["max_trials"]
-
-    return flat_config
-
-
 def _resolve_support_xy_tol(cfg) -> float:
     value = getattr(cfg, "support_xy_tol", None)
     if value is None:
@@ -1195,7 +1099,7 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
 
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
-    flat_config = _apply_nested_adsorbate_move_config(flat_config)
+    flat_config = normalize_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
     adsorbate_value = flat_config.get("adsorbate")
     if isinstance(adsorbate_value, str):
@@ -1267,7 +1171,7 @@ def load_adsorbate_pt_config(config_path: str | Path) -> SimpleNamespace:
         flat_config = dict(_DEFAULT_ADSORBATE_PT_CONFIG)
         flat_config.update(raw)
 
-    flat_config = _apply_nested_adsorbate_move_config(flat_config)
+    flat_config = normalize_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
     adsorbate_value = flat_config.get("adsorbate")
     if isinstance(adsorbate_value, str):
@@ -2430,6 +2334,7 @@ class AdsorbateCMCWorkflow:
             thermo_file=output_paths["thermo_file"],
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
+            debug_traj_interval=int(getattr(cfg, "debug_traj_interval", 1)),
             seed=run_seed,
             resume=bool(getattr(cfg, "resume", False)),
             enable_hybrid_md=bool(getattr(cfg, "enable_hybrid_md", False)),
@@ -2851,6 +2756,7 @@ class AdsorbateReplicaExchangeWorkflow:
             "relax_z_only": bool(getattr(cfg, "relax_z_only", False)),
             "fmax": float(cfg.fmax),
             "verbose_relax": bool(getattr(cfg, "verbose_relax", False)),
+            "debug_traj_interval": int(getattr(cfg, "debug_traj_interval", 1)),
             "checkpoint_interval": int(
                 getattr(cfg, "worker_checkpoint_interval", 0)
             ),

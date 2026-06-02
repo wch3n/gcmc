@@ -86,6 +86,7 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
+    "puckering_height_jitter_A": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
@@ -189,6 +190,7 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
+    "puckering_height_jitter_A": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
@@ -267,16 +269,24 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "move_mode": "displacement",
     "site_hop_prob": 0.5,
     "reorientation_prob": 0.2,
+    "hop_reorientation_prob": 0.0,
+    "hop_puckering_prob": 0.0,
+    "hop_puckering_reorientation_prob": 0.0,
     "puckering_prob": 0.0,
     "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
+    "puckering_height_jitter_A": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.6,
     "max_displacement_trials": 20,
     "max_reorientation_trials": None,
+    "max_hop_reorientation_trials": None,
     "max_puckering_trials": None,
+    "hop_reorientation_angle_deg": 180.0,
     "min_clearance": 0.9,
+    "adsorbate_surface_clearance_A": 0.0,
+    "adsorbate_surface_xy_tol_A": None,
     "site_match_tol": 0.6,
     "support_xy_tol": None,
     "termination_site_xy_tol": None,
@@ -390,6 +400,9 @@ _DEFAULT_ADSORBATE_PT_CONFIG.update(
         "checkpoint_file": "pt_state.pkl",
         "initial_traj_file": "adsorbate_pt_initial.traj",
         "output_dir": "adsorbate_pt",
+        "write_debug_trajs": False,
+        "write_accepted_traj": False,
+        "write_rejected_traj": False,
         "write_site_overlay": False,
         "site_overlay_include_blocked": False,
         "site_overlay_z_field": "suggested_z_A",
@@ -934,6 +947,105 @@ def _resolve_mu_scan_values(flat_config: dict) -> dict:
     return flat_config
 
 
+def _as_probability(value: object, *, name: str) -> float:
+    probability = float(value)
+    if not (0.0 <= probability <= 1.0):
+        raise ValueError(f"{name} must be in [0, 1].")
+    return probability
+
+
+def _apply_nested_adsorbate_move_config(flat_config: dict) -> dict:
+    moves = flat_config.get("moves")
+    if not isinstance(moves, dict):
+        return flat_config
+
+    displacement = moves.get("displacement")
+    if isinstance(displacement, dict):
+        if "sigma_A" in displacement:
+            flat_config["displacement_sigma"] = displacement["sigma_A"]
+        if "sigma" in displacement:
+            flat_config["displacement_sigma"] = displacement["sigma"]
+        if "max_trials" in displacement:
+            flat_config["max_displacement_trials"] = displacement["max_trials"]
+
+    reorientation = moves.get("reorientation")
+    if isinstance(reorientation, dict):
+        if "prob" in reorientation:
+            flat_config["reorientation_prob"] = reorientation["prob"]
+        if "angle_deg" in reorientation:
+            flat_config["rotation_max_angle_deg"] = reorientation["angle_deg"]
+        if "max_trials" in reorientation:
+            flat_config["max_reorientation_trials"] = reorientation["max_trials"]
+
+    hop = moves.get("hop")
+    if isinstance(hop, dict):
+        if "max_trials" in hop:
+            flat_config["max_displacement_trials"] = hop["max_trials"]
+        reorient = hop.get("reorient")
+        reorient_prob = 0.0
+        if isinstance(reorient, dict):
+            enabled = bool(reorient.get("enabled", True))
+            if enabled:
+                reorient_prob = _as_probability(
+                    reorient.get("prob", 1.0),
+                    name="moves.hop.reorient.prob",
+                )
+            if "angle_deg" in reorient:
+                flat_config["hop_reorientation_angle_deg"] = reorient["angle_deg"]
+            if "max_trials" in reorient:
+                flat_config["max_hop_reorientation_trials"] = reorient["max_trials"]
+
+        hop_puckering = hop.get("puckering")
+        hop_puckering_prob = 0.0
+        if isinstance(hop_puckering, dict):
+            enabled = bool(hop_puckering.get("enabled", True))
+            if enabled:
+                hop_puckering_prob = _as_probability(
+                    hop_puckering.get("prob", 1.0),
+                    name="moves.hop.puckering.prob",
+                )
+            if "elements" in hop_puckering:
+                flat_config["puckering_elements"] = hop_puckering["elements"]
+            if "height_A" in hop_puckering:
+                flat_config["puckering_height_A"] = hop_puckering["height_A"]
+            if "height_jitter_A" in hop_puckering:
+                flat_config["puckering_height_jitter_A"] = hop_puckering[
+                    "height_jitter_A"
+                ]
+            if "max_trials" in hop_puckering:
+                flat_config["max_puckering_trials"] = hop_puckering["max_trials"]
+
+        if "prob" in hop:
+            hop_prob = _as_probability(hop["prob"], name="moves.hop.prob")
+            plain_hop_prob = hop_prob * (1.0 - hop_puckering_prob)
+            puckered_hop_prob = hop_prob * hop_puckering_prob
+            flat_config["site_hop_prob"] = plain_hop_prob * (1.0 - reorient_prob)
+            flat_config["hop_reorientation_prob"] = plain_hop_prob * reorient_prob
+            flat_config["hop_puckering_prob"] = (
+                puckered_hop_prob * (1.0 - reorient_prob)
+            )
+            flat_config["hop_puckering_reorientation_prob"] = (
+                puckered_hop_prob * reorient_prob
+            )
+
+    puckering = moves.get("puckering")
+    if isinstance(puckering, dict):
+        if "prob" in puckering:
+            flat_config["puckering_prob"] = puckering["prob"]
+        if "hop_prob" in puckering:
+            flat_config["puckering_hop_prob"] = puckering["hop_prob"]
+        if "elements" in puckering:
+            flat_config["puckering_elements"] = puckering["elements"]
+        if "height_A" in puckering:
+            flat_config["puckering_height_A"] = puckering["height_A"]
+        if "height_jitter_A" in puckering:
+            flat_config["puckering_height_jitter_A"] = puckering["height_jitter_A"]
+        if "max_trials" in puckering:
+            flat_config["max_puckering_trials"] = puckering["max_trials"]
+
+    return flat_config
+
+
 def _resolve_support_xy_tol(cfg) -> float:
     value = getattr(cfg, "support_xy_tol", None)
     if value is None:
@@ -1083,6 +1195,7 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
 
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
+    flat_config = _apply_nested_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
     adsorbate_value = flat_config.get("adsorbate")
     if isinstance(adsorbate_value, str):
@@ -1154,6 +1267,7 @@ def load_adsorbate_pt_config(config_path: str | Path) -> SimpleNamespace:
         flat_config = dict(_DEFAULT_ADSORBATE_PT_CONFIG)
         flat_config.update(raw)
 
+    flat_config = _apply_nested_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
     adsorbate_value = flat_config.get("adsorbate")
     if isinstance(adsorbate_value, str):
@@ -1631,11 +1745,18 @@ class AdsorbateGCMCScanWorkflow:
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
+            puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
             max_reorientation_trials=getattr(cfg, "max_reorientation_trials", None),
+            max_hop_reorientation_trials=getattr(
+                cfg, "max_hop_reorientation_trials", None
+            ),
             max_puckering_trials=getattr(cfg, "max_puckering_trials", None),
+            hop_reorientation_angle_deg=getattr(
+                cfg, "hop_reorientation_angle_deg", 180.0
+            ),
             min_clearance=cfg.min_clearance,
             site_match_tol=cfg.site_match_tol,
             support_xy_tol=_resolve_support_xy_tol(cfg),
@@ -1730,6 +1851,9 @@ class AdsorbateGCMCScanWorkflow:
             )
             or None,
             "puckering_height_A": getattr(cfg, "puckering_height_A", 0.15),
+            "puckering_height_jitter_A": getattr(
+                cfg, "puckering_height_jitter_A", None
+            ),
             "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
             "displacement_sigma": cfg.displacement_sigma,
             "max_displacement_trials": cfg.max_displacement_trials,
@@ -2257,17 +2381,35 @@ class AdsorbateCMCWorkflow:
             move_mode=cfg.move_mode,
             site_hop_prob=cfg.site_hop_prob,
             reorientation_prob=getattr(cfg, "reorientation_prob", 0.2),
+            hop_reorientation_prob=getattr(cfg, "hop_reorientation_prob", 0.0),
+            hop_puckering_prob=getattr(cfg, "hop_puckering_prob", 0.0),
+            hop_puckering_reorientation_prob=getattr(
+                cfg, "hop_puckering_reorientation_prob", 0.0
+            ),
             puckering_prob=getattr(cfg, "puckering_prob", 0.0),
             puckering_hop_prob=getattr(cfg, "puckering_hop_prob", 0.0),
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
+            puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
             max_reorientation_trials=getattr(cfg, "max_reorientation_trials", None),
+            max_hop_reorientation_trials=getattr(
+                cfg, "max_hop_reorientation_trials", None
+            ),
             max_puckering_trials=getattr(cfg, "max_puckering_trials", None),
+            hop_reorientation_angle_deg=getattr(
+                cfg, "hop_reorientation_angle_deg", 180.0
+            ),
             min_clearance=cfg.min_clearance,
+            adsorbate_surface_clearance_A=getattr(
+                cfg, "adsorbate_surface_clearance_A", 0.0
+            ),
+            adsorbate_surface_xy_tol_A=getattr(
+                cfg, "adsorbate_surface_xy_tol_A", None
+            ),
             site_match_tol=cfg.site_match_tol,
             support_xy_tol=_resolve_support_xy_tol(cfg),
             termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
@@ -2660,6 +2802,11 @@ class AdsorbateReplicaExchangeWorkflow:
             "move_mode": cfg.move_mode,
             "site_hop_prob": cfg.site_hop_prob,
             "reorientation_prob": getattr(cfg, "reorientation_prob", 0.2),
+            "hop_reorientation_prob": getattr(cfg, "hop_reorientation_prob", 0.0),
+            "hop_puckering_prob": getattr(cfg, "hop_puckering_prob", 0.0),
+            "hop_puckering_reorientation_prob": getattr(
+                cfg, "hop_puckering_reorientation_prob", 0.0
+            ),
             "puckering_prob": getattr(cfg, "puckering_prob", 0.0),
             "puckering_hop_prob": getattr(cfg, "puckering_hop_prob", 0.0),
             "puckering_elements": _parse_symbols(
@@ -2667,12 +2814,27 @@ class AdsorbateReplicaExchangeWorkflow:
             )
             or None,
             "puckering_height_A": getattr(cfg, "puckering_height_A", 0.15),
+            "puckering_height_jitter_A": getattr(
+                cfg, "puckering_height_jitter_A", None
+            ),
             "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
             "displacement_sigma": cfg.displacement_sigma,
             "max_displacement_trials": cfg.max_displacement_trials,
             "max_reorientation_trials": getattr(cfg, "max_reorientation_trials", None),
+            "max_hop_reorientation_trials": getattr(
+                cfg, "max_hop_reorientation_trials", None
+            ),
             "max_puckering_trials": getattr(cfg, "max_puckering_trials", None),
+            "hop_reorientation_angle_deg": getattr(
+                cfg, "hop_reorientation_angle_deg", 180.0
+            ),
             "min_clearance": cfg.min_clearance,
+            "adsorbate_surface_clearance_A": getattr(
+                cfg, "adsorbate_surface_clearance_A", 0.0
+            ),
+            "adsorbate_surface_xy_tol_A": getattr(
+                cfg, "adsorbate_surface_xy_tol_A", None
+            ),
             "site_match_tol": cfg.site_match_tol,
             "support_xy_tol": _resolve_support_xy_tol(cfg),
             "termination_site_xy_tol": _resolve_termination_site_xy_tol(cfg),
@@ -2809,6 +2971,14 @@ class AdsorbateReplicaExchangeWorkflow:
             state["traj_file"] = str(out_dir / Path(state["traj_file"]).name)
             state["thermo_file"] = str(out_dir / Path(state["thermo_file"]).name)
             state["checkpoint_file"] = str(out_dir / Path(state["checkpoint_file"]).name)
+            prefix = Path(state["traj_file"]).with_suffix("")
+            for kind in ("attempted", "accepted", "rejected"):
+                if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+                    getattr(self.config, f"write_{kind}_traj", False)
+                ):
+                    state[f"{kind}_traj_file"] = str(
+                        prefix.parent / f"{prefix.name}_{kind}.traj"
+                    )
 
     def run(self) -> ReplicaExchange:
         cfg = self.config
@@ -2997,6 +3167,7 @@ class AdsorbateGCMCWorkflow:
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
+            puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,

@@ -166,6 +166,12 @@ class _RayReplicaActor:
             sim.traj_file = data["traj_file"]
             sim.thermo_file = data["thermo_file"]
             sim.checkpoint_file = data["checkpoint_file"]
+            if hasattr(sim, "attempted_traj_file"):
+                sim.attempted_traj_file = data.get("attempted_traj_file")
+            if hasattr(sim, "accepted_traj_file"):
+                sim.accepted_traj_file = data.get("accepted_traj_file")
+            if hasattr(sim, "rejected_traj_file"):
+                sim.rejected_traj_file = data.get("rejected_traj_file")
 
             if hasattr(sim, "tree"):
                 sim.tree = cKDTree(data["positions"])

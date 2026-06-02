@@ -66,12 +66,20 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "move_mode": "hybrid",
     "site_hop_prob": 0.6,
     "reorientation_prob": 0.3,
+    "hop_reorientation_prob": 0.0,
+    "hop_puckering_prob": 0.0,
+    "hop_puckering_reorientation_prob": 0.0,
     "puckering_prob": 0.0,
     "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
+    "puckering_height_jitter_A": None,
     "displacement_sigma": 0.2,
     "max_displacement_trials": 20,
+    "max_hop_reorientation_trials": None,
+    "hop_reorientation_angle_deg": 180.0,
+    "adsorbate_surface_clearance_A": 0.0,
+    "adsorbate_surface_xy_tol_A": None,
     "max_puckering_trials": None,
     "rotation_max_angle_deg": 35.0,
     "relax": False,
@@ -174,8 +182,17 @@ class ReactionLocalCMCWorkflow:
                 "move_mode": "move_mode",
                 "site_hop_prob": "site_hop_prob",
                 "reorientation_prob": "reorientation_prob",
+                "hop_reorientation_prob": "hop_reorientation_prob",
+                "hop_puckering_prob": "hop_puckering_prob",
+                "hop_puckering_reorientation_prob": "hop_puckering_reorientation_prob",
                 "displacement_sigma": "displacement_sigma",
                 "max_displacement_trials": "max_displacement_trials",
+                "max_hop_reorientation_trials": "max_hop_reorientation_trials",
+                "hop_reorientation_angle_deg": "hop_reorientation_angle_deg",
+                "surface_clearance_A": "adsorbate_surface_clearance_A",
+                "adsorbate_surface_clearance_A": "adsorbate_surface_clearance_A",
+                "surface_xy_tol_A": "adsorbate_surface_xy_tol_A",
+                "adsorbate_surface_xy_tol_A": "adsorbate_surface_xy_tol_A",
                 "rotation_max_angle_deg": "rotation_max_angle_deg",
             },
             "puckering": {
@@ -187,6 +204,8 @@ class ReactionLocalCMCWorkflow:
                 "puckering_elements": "puckering_elements",
                 "height_A": "puckering_height_A",
                 "puckering_height_A": "puckering_height_A",
+                "height_jitter_A": "puckering_height_jitter_A",
+                "puckering_height_jitter_A": "puckering_height_jitter_A",
                 "max_trials": "max_puckering_trials",
                 "max_puckering_trials": "max_puckering_trials",
             },
@@ -243,12 +262,80 @@ class ReactionLocalCMCWorkflow:
             for source_key, target_key in section_maps["puckering"].items():
                 if source_key in moves_section["puckering"]:
                     merged[target_key] = moves_section["puckering"][source_key]
+        if isinstance(moves_section, dict) and isinstance(
+            moves_section.get("hop"), dict
+        ):
+            cls._apply_nested_hop_move_config(merged, moves_section["hop"])
 
         backend_section = raw.get("backend")
         if isinstance(backend_section, dict):
             for source_key, target_key in section_maps["backend_config"].items():
                 if source_key in backend_section:
                     merged[target_key] = backend_section[source_key]
+
+    @staticmethod
+    def _probability(value: object, *, name: str) -> float:
+        probability = float(value)
+        if not (0.0 <= probability <= 1.0):
+            raise ValueError(f"{name} must be in [0, 1].")
+        return probability
+
+    @classmethod
+    def _apply_nested_hop_move_config(
+        cls,
+        merged: dict[str, object],
+        hop_section: dict[str, object],
+    ) -> None:
+        reorient_section = hop_section.get("reorient")
+        reorient_prob = 0.0
+        if isinstance(reorient_section, dict):
+            enabled = bool(reorient_section.get("enabled", True))
+            if enabled:
+                reorient_prob = cls._probability(
+                    reorient_section.get("prob", 1.0),
+                    name="moves.hop.reorient.prob",
+                )
+            if "angle_deg" in reorient_section:
+                merged["hop_reorientation_angle_deg"] = reorient_section["angle_deg"]
+            if "max_trials" in reorient_section:
+                merged["max_hop_reorientation_trials"] = reorient_section[
+                    "max_trials"
+                ]
+
+        puckering_section = hop_section.get("puckering")
+        puckering_prob = 0.0
+        if isinstance(puckering_section, dict):
+            enabled = bool(puckering_section.get("enabled", True))
+            if enabled:
+                puckering_prob = cls._probability(
+                    puckering_section.get("prob", 1.0),
+                    name="moves.hop.puckering.prob",
+                )
+            if "elements" in puckering_section:
+                merged["puckering_elements"] = puckering_section["elements"]
+            if "height_A" in puckering_section:
+                merged["puckering_height_A"] = puckering_section["height_A"]
+            if "height_jitter_A" in puckering_section:
+                merged["puckering_height_jitter_A"] = puckering_section[
+                    "height_jitter_A"
+                ]
+            if "max_trials" in puckering_section:
+                merged["max_puckering_trials"] = puckering_section["max_trials"]
+
+        if "max_trials" in hop_section:
+            merged["max_displacement_trials"] = hop_section["max_trials"]
+        if "prob" in hop_section:
+            hop_prob = cls._probability(hop_section["prob"], name="moves.hop.prob")
+            plain_hop_prob = hop_prob * (1.0 - puckering_prob)
+            puckered_hop_prob = hop_prob * puckering_prob
+            merged["site_hop_prob"] = plain_hop_prob * (1.0 - reorient_prob)
+            merged["hop_reorientation_prob"] = plain_hop_prob * reorient_prob
+            merged["hop_puckering_prob"] = (
+                puckered_hop_prob * (1.0 - reorient_prob)
+            )
+            merged["hop_puckering_reorientation_prob"] = (
+                puckered_hop_prob * reorient_prob
+            )
 
     def enabled(self) -> bool:
         return bool(self.local_config.get("enabled", False))
@@ -832,6 +919,15 @@ class ReactionLocalCMCWorkflow:
             move_mode=str(self.local_config.get("move_mode", "hybrid")),
             site_hop_prob=float(self.local_config.get("site_hop_prob", 0.6)),
             reorientation_prob=float(self.local_config.get("reorientation_prob", 0.3)),
+            hop_reorientation_prob=float(
+                self.local_config.get("hop_reorientation_prob", 0.0)
+            ),
+            hop_puckering_prob=float(
+                self.local_config.get("hop_puckering_prob", 0.0)
+            ),
+            hop_puckering_reorientation_prob=float(
+                self.local_config.get("hop_puckering_reorientation_prob", 0.0)
+            ),
             puckering_prob=float(self.local_config.get("puckering_prob", 0.0)),
             puckering_hop_prob=float(
                 self.local_config.get("puckering_hop_prob", 0.0)
@@ -843,9 +939,19 @@ class ReactionLocalCMCWorkflow:
             puckering_height_A=float(
                 self.local_config.get("puckering_height_A", 0.15)
             ),
+            puckering_height_jitter_A=(
+                None
+                if self.local_config.get("puckering_height_jitter_A") is None
+                else float(self.local_config.get("puckering_height_jitter_A", 0.0))
+            ),
             displacement_sigma=float(self.local_config.get("displacement_sigma", 0.2)),
             max_displacement_trials=int(
                 self.local_config.get("max_displacement_trials", 20)
+            ),
+            max_hop_reorientation_trials=(
+                None
+                if self.local_config.get("max_hop_reorientation_trials") is None
+                else int(self.local_config.get("max_hop_reorientation_trials", 20))
             ),
             max_puckering_trials=(
                 None
@@ -855,8 +961,19 @@ class ReactionLocalCMCWorkflow:
             rotation_max_angle_deg=float(
                 self.local_config.get("rotation_max_angle_deg", 35.0)
             ),
+            hop_reorientation_angle_deg=float(
+                self.local_config.get("hop_reorientation_angle_deg", 180.0)
+            ),
             site_match_tol=float(self.config.site_match_tol),
             support_xy_tol=float(self.config.support_xy_tol),
+            adsorbate_surface_clearance_A=float(
+                self.local_config.get("adsorbate_surface_clearance_A", 0.0)
+            ),
+            adsorbate_surface_xy_tol_A=(
+                None
+                if self.local_config.get("adsorbate_surface_xy_tol_A") is None
+                else float(self.local_config.get("adsorbate_surface_xy_tol_A", 0.0))
+            ),
             termination_site_xy_tol=self.config.termination_site_xy_tol,
             surface_layer_tol=float(self.config.surface_layer_tol),
             termination_clearance=float(self.config.termination_clearance),
@@ -1066,6 +1183,15 @@ class ReactionLocalCMCWorkflow:
             "move_mode": str(self.local_config.get("move_mode", "hybrid")),
             "site_hop_prob": float(self.local_config.get("site_hop_prob", 0.6)),
             "reorientation_prob": float(self.local_config.get("reorientation_prob", 0.3)),
+            "hop_reorientation_prob": float(
+                self.local_config.get("hop_reorientation_prob", 0.0)
+            ),
+            "hop_puckering_prob": float(
+                self.local_config.get("hop_puckering_prob", 0.0)
+            ),
+            "hop_puckering_reorientation_prob": float(
+                self.local_config.get("hop_puckering_reorientation_prob", 0.0)
+            ),
             "puckering_prob": float(self.local_config.get("puckering_prob", 0.0)),
             "puckering_hop_prob": float(
                 self.local_config.get("puckering_hop_prob", 0.0)
@@ -1077,9 +1203,19 @@ class ReactionLocalCMCWorkflow:
             "puckering_height_A": float(
                 self.local_config.get("puckering_height_A", 0.15)
             ),
+            "puckering_height_jitter_A": (
+                None
+                if self.local_config.get("puckering_height_jitter_A") is None
+                else float(self.local_config.get("puckering_height_jitter_A", 0.0))
+            ),
             "displacement_sigma": float(self.local_config.get("displacement_sigma", 0.2)),
             "max_displacement_trials": int(
                 self.local_config.get("max_displacement_trials", 20)
+            ),
+            "max_hop_reorientation_trials": (
+                None
+                if self.local_config.get("max_hop_reorientation_trials") is None
+                else int(self.local_config.get("max_hop_reorientation_trials", 20))
             ),
             "max_puckering_trials": (
                 None
@@ -1089,8 +1225,19 @@ class ReactionLocalCMCWorkflow:
             "rotation_max_angle_deg": float(
                 self.local_config.get("rotation_max_angle_deg", 35.0)
             ),
+            "hop_reorientation_angle_deg": float(
+                self.local_config.get("hop_reorientation_angle_deg", 180.0)
+            ),
             "site_match_tol": float(self.config.site_match_tol),
             "support_xy_tol": float(self.config.support_xy_tol),
+            "adsorbate_surface_clearance_A": float(
+                self.local_config.get("adsorbate_surface_clearance_A", 0.0)
+            ),
+            "adsorbate_surface_xy_tol_A": (
+                None
+                if self.local_config.get("adsorbate_surface_xy_tol_A") is None
+                else float(self.local_config.get("adsorbate_surface_xy_tol_A", 0.0))
+            ),
             "termination_site_xy_tol": self.config.termination_site_xy_tol,
             "surface_layer_tol": float(self.config.surface_layer_tol),
             "termination_clearance": float(self.config.termination_clearance),
@@ -1125,6 +1272,17 @@ class ReactionLocalCMCWorkflow:
             label = self._temperature_label(float(temperature))
             replica_atoms = atoms.copy()
             replica_atoms.calc = None
+            replica_mc_kwargs = dict(mc_kwargs)
+            attempted_path = self._debug_traj_path(pt_dir, f"replica_{label}", "attempted")
+            accepted_path = self._debug_traj_path(pt_dir, f"replica_{label}", "accepted")
+            rejected_path = self._debug_traj_path(pt_dir, f"replica_{label}", "rejected")
+            replica_mc_kwargs.update(
+                {
+                    "attempted_traj_file": str(attempted_path) if attempted_path else None,
+                    "accepted_traj_file": str(accepted_path) if accepted_path else None,
+                    "rejected_traj_file": str(rejected_path) if rejected_path else None,
+                }
+            )
             states.append(
                 {
                     "id": replica_id,
@@ -1138,7 +1296,7 @@ class ReactionLocalCMCWorkflow:
                     "traj_file": str(pt_dir / f"replica_{label}.traj"),
                     "thermo_file": str(pt_dir / f"replica_{label}.dat"),
                     "checkpoint_file": str(pt_dir / f"checkpoint_{label}.pkl"),
-                    "mc_kwargs": mc_kwargs,
+                    "mc_kwargs": replica_mc_kwargs,
                 }
             )
         return states

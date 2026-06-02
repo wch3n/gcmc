@@ -6,6 +6,7 @@ from unittest import mock
 import numpy as np
 from ase import Atom, Atoms
 from ase.calculators.calculator import Calculator, all_changes
+from ase.io import read
 
 from gcmc.adsorbate_cmc import AdsorbateCMC
 from gcmc.adsorbate_gcmc import AdsorbateGCMC
@@ -125,6 +126,9 @@ class StubRNG:
 
     def uniform(self, low, high):
         return self.angle
+
+    def permutation(self, value):
+        return np.arange(value)
 
 
 class TestAdsorbateGCMCSiteAssignment(unittest.TestCase):
@@ -839,6 +843,7 @@ class TestAdsorbateCMCPuckering(unittest.TestCase):
             site_type="atop",
             move_mode="puckering",
             puckering_height_A=0.2,
+            puckering_height_jitter_A=0.0,
             max_puckering_trials=4,
             min_clearance=1.0,
             termination_clearance=0.0,
@@ -859,7 +864,7 @@ class TestAdsorbateCMCPuckering(unittest.TestCase):
         support_dz = trial.positions[support_idx, 2] - original[support_idx, 2]
 
         self.assertGreater(support_dz, 0.0)
-        self.assertLessEqual(support_dz, sim.puckering_height_A)
+        self.assertAlmostEqual(support_dz, sim.puckering_height_A)
         self.assertTrue(np.allclose(trial.positions[group, :2], original[group, :2]))
         self.assertTrue(
             np.allclose(trial.positions[group, 2] - original[group, 2], support_dz)
@@ -1005,13 +1010,186 @@ class TestAdsorbateCMCPuckering(unittest.TestCase):
             sim._puckering_reference_positions[0, 2],
             places=10,
         )
-        self.assertLessEqual(dz1, sim.puckering_height_A)
+        self.assertAlmostEqual(dz1, sim.puckering_height_A)
         self.assertAlmostEqual(trial.positions[anchor_idx, 0], 3.0, places=10)
         self.assertAlmostEqual(
             trial.positions[anchor_idx, 2] - trial.positions[1, 2],
             sim.vertical_offset,
             places=10,
         )
+
+    def test_hop_reorientation_hops_anchor_and_rotates_group(self):
+        atoms = Atoms(
+            "Pt2OH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (3.0, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.0, 0.0, 2.78),
+            ],
+            cell=[[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[True, True, False],
+        )
+        atoms.set_tags([0, 0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Pt",),
+            site_elements=("Pt",),
+            site_type="atop",
+            move_mode="hop_reorientation",
+            support_xy_tol=1.2,
+            min_clearance=0.7,
+            hop_reorientation_angle_deg=180.0,
+            max_hop_reorientation_trials=1,
+        )
+        sim.rng = StubRNG(axis=[0.0, 1.0, 0.0], angle=0.5 * np.pi)
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+
+        trial = sim._propose_hop_reorientation()
+
+        self.assertIsNotNone(trial)
+        anchor_idx = int(group[0])
+        distal_idx = int(group[1])
+        self.assertAlmostEqual(trial.positions[anchor_idx, 0], 3.0, places=10)
+        self.assertAlmostEqual(
+            trial.positions[anchor_idx, 2] - trial.positions[1, 2],
+            sim.vertical_offset,
+            places=10,
+        )
+        relative = trial.positions[distal_idx] - trial.positions[anchor_idx]
+        self.assertAlmostEqual(abs(relative[0]), 0.98, places=10)
+        self.assertAlmostEqual(relative[2], 0.0, places=10)
+
+    def test_hop_puckering_reorientation_transfers_pucker_and_rotates_group(self):
+        atoms = Atoms(
+            "Pt2OH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (3.0, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.0, 0.0, 2.78),
+            ],
+            cell=[[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 12.0]],
+            pbc=[True, True, False],
+        )
+        atoms.set_tags([0, 0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET])
+        sim = self._make_sim(
+            atoms=atoms,
+            substrate_elements=("Pt",),
+            site_elements=("Pt",),
+            site_type="atop",
+            move_mode="hop_puckering_reorientation",
+            support_xy_tol=1.2,
+            min_clearance=0.7,
+            hop_reorientation_angle_deg=180.0,
+            max_hop_reorientation_trials=1,
+        )
+        sim.rng = StubRNG(axis=[0.0, 1.0, 0.0], angle=0.5 * np.pi)
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        sim.atoms.positions[0, 2] += 0.4
+        sim.atoms.positions[group, 2] += 0.4
+
+        trial = sim._propose_hop_puckering_reorientation()
+
+        self.assertIsNotNone(trial)
+        anchor_idx = int(group[0])
+        distal_idx = int(group[1])
+        self.assertAlmostEqual(
+            trial.positions[0, 2],
+            sim._puckering_reference_positions[0, 2],
+            places=10,
+        )
+        self.assertAlmostEqual(
+            trial.positions[1, 2] - sim._puckering_reference_positions[1, 2],
+            sim.puckering_height_A,
+            places=10,
+        )
+        self.assertAlmostEqual(trial.positions[anchor_idx, 0], 3.0, places=10)
+        self.assertAlmostEqual(
+            trial.positions[anchor_idx, 2] - trial.positions[1, 2],
+            sim.vertical_offset,
+            places=10,
+        )
+        relative = trial.positions[distal_idx] - trial.positions[anchor_idx]
+        self.assertAlmostEqual(abs(relative[0]), 0.98, places=10)
+        self.assertAlmostEqual(relative[2], 0.0, places=10)
+
+    def test_attempted_traj_records_only_filter_passing_trials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sim = self._make_sim(
+                move_mode="displacement",
+                support_xy_tol=0.2,
+                z_max_support=1.0,
+            )
+
+            invalid = sim.atoms.copy()
+            group = np.asarray(sim.ads_groups[0], dtype=int)
+            invalid.positions[group, :2] += 4.0
+            sim._propose_move = lambda: invalid.copy()
+
+            attempted = root / "attempted.traj"
+            rejected = root / "rejected.traj"
+            samples = root / "samples.traj"
+            sim.attempted_traj_file = str(attempted)
+            sim.rejected_traj_file = str(rejected)
+
+            sim.run(
+                nsweeps=1,
+                traj_file=str(samples),
+                interval=1,
+                sample_interval=1,
+                equilibration=0,
+            )
+
+            attempted_frames = read(str(attempted), ":") if attempted.exists() else []
+            rejected_frames = read(str(rejected), ":") if rejected.exists() else []
+            self.assertEqual(len(attempted_frames), 0)
+            self.assertEqual(len(rejected_frames), 1)
+
+    def test_surface_side_filter_rejects_buried_molecular_atom(self):
+        atoms = Atoms(
+            "TiOOH",
+            positions=[
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 1.8),
+                (0.9, 0.0, -0.1),
+                (1.7, 0.0, -0.1),
+            ],
+            cell=[[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 3.0]],
+            pbc=[False, False, True],
+        )
+        atoms.set_tags(
+            [0, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET, ADSORBATE_TAG_OFFSET]
+        )
+        sim = AdsorbateCMC(
+            atoms=atoms,
+            calculator=ZeroCalculator(),
+            T=300.0,
+            adsorbate_element="O",
+            adsorbate=Atoms(
+                "OOH",
+                positions=[(0.0, 0.0, 0.0), (0.9, 0.0, -1.9), (1.7, 0.0, -1.9)],
+            ),
+            adsorbate_anchor_index=0,
+            substrate_elements=("Ti",),
+            functional_elements=(),
+            site_elements=("Ti",),
+            site_type="atop",
+            move_mode="reorientation",
+            min_clearance=0.7,
+            support_xy_tol=1.2,
+            adsorbate_surface_clearance_A=0.0,
+            adsorbate_surface_xy_tol_A=1.2,
+            seed=31,
+        )
+        group = np.asarray(sim.ads_groups[0], dtype=int)
+        buried = atoms.positions[group].copy()
+        lifted = buried.copy()
+        lifted[1:, 2] = 0.2
+
+        self.assertFalse(sim._group_positions_are_valid(group, buried, atoms=atoms))
+        self.assertTrue(sim._group_positions_are_valid(group, lifted, atoms=atoms))
 
 
 class TestAmbiguousEmptyMolecularAdsorbates(unittest.TestCase):

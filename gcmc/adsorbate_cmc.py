@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import os
 import pickle
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 from ase import Atoms
 from ase import units
@@ -178,16 +178,24 @@ class AdsorbateCMC(SurfaceMCBase):
         move_mode: str = "displacement",
         site_hop_prob: float = 0.5,
         reorientation_prob: float = 0.2,
+        hop_reorientation_prob: float = 0.0,
+        hop_puckering_prob: float = 0.0,
+        hop_puckering_reorientation_prob: float = 0.0,
         puckering_prob: float = 0.0,
         puckering_hop_prob: float = 0.0,
         puckering_elements: Optional[Union[str, Sequence[str]]] = None,
         puckering_height_A: float = 0.15,
+        puckering_height_jitter_A: Optional[float] = None,
         displacement_sigma: float = 1.5,
         max_displacement_trials: int = 10,
         max_reorientation_trials: Optional[int] = None,
+        max_hop_reorientation_trials: Optional[int] = None,
         max_puckering_trials: Optional[int] = None,
         rotation_max_angle_deg: float = 25.0,
+        hop_reorientation_angle_deg: float = 180.0,
         min_clearance: float = 0.8,
+        adsorbate_surface_clearance_A: float = 0.0,
+        adsorbate_surface_xy_tol_A: Optional[float] = None,
         site_match_tol: float = 0.6,
         support_xy_tol: Optional[float] = None,
         termination_site_xy_tol: Optional[float] = None,
@@ -317,35 +325,65 @@ class AdsorbateCMC(SurfaceMCBase):
             "displacement",
             "site_hop",
             "reorientation",
+            "hop_reorientation",
+            "hop_puckering",
+            "hop_puckering_reorientation",
             "puckering",
             "puckering_hop",
             "hybrid",
         ):
             raise ValueError(
                 "move_mode must be 'displacement', 'site_hop', 'reorientation', "
-                "'puckering', 'puckering_hop', or 'hybrid'."
+                "'hop_reorientation', 'hop_puckering', "
+                "'hop_puckering_reorientation', 'puckering', 'puckering_hop', "
+                "or 'hybrid'."
             )
         if not (0.0 <= site_hop_prob <= 1.0):
             raise ValueError("site_hop_prob must be in [0, 1].")
         if not (0.0 <= reorientation_prob <= 1.0):
             raise ValueError("reorientation_prob must be in [0, 1].")
+        if not (0.0 <= hop_reorientation_prob <= 1.0):
+            raise ValueError("hop_reorientation_prob must be in [0, 1].")
+        if not (0.0 <= hop_puckering_prob <= 1.0):
+            raise ValueError("hop_puckering_prob must be in [0, 1].")
+        if not (0.0 <= hop_puckering_reorientation_prob <= 1.0):
+            raise ValueError("hop_puckering_reorientation_prob must be in [0, 1].")
         if not (0.0 <= puckering_prob <= 1.0):
             raise ValueError("puckering_prob must be in [0, 1].")
         if not (0.0 <= puckering_hop_prob <= 1.0):
             raise ValueError("puckering_hop_prob must be in [0, 1].")
         if move_mode == "hybrid" and (
-            site_hop_prob + reorientation_prob + puckering_prob + puckering_hop_prob
+            site_hop_prob
+            + reorientation_prob
+            + hop_reorientation_prob
+            + hop_puckering_prob
+            + hop_puckering_reorientation_prob
+            + puckering_prob
+            + puckering_hop_prob
         ) > 1.0:
             raise ValueError(
                 "For move_mode='hybrid', site_hop_prob + reorientation_prob "
-                "+ puckering_prob + puckering_hop_prob must be <= 1."
+                "+ hop_reorientation_prob + hop_puckering_prob "
+                "+ hop_puckering_reorientation_prob + puckering_prob "
+                "+ puckering_hop_prob must be <= 1."
             )
         if puckering_height_A < 0.0:
             raise ValueError("puckering_height_A must be >= 0.")
+        if puckering_height_jitter_A is not None and puckering_height_jitter_A < 0.0:
+            raise ValueError("puckering_height_jitter_A must be >= 0.")
         if rotation_max_angle_deg < 0.0:
             raise ValueError("rotation_max_angle_deg must be >= 0.")
+        if hop_reorientation_angle_deg < 0.0:
+            raise ValueError("hop_reorientation_angle_deg must be >= 0.")
         if min_clearance <= 0.0:
             raise ValueError("min_clearance must be > 0.")
+        if adsorbate_surface_clearance_A < 0.0:
+            raise ValueError("adsorbate_surface_clearance_A must be >= 0.")
+        if (
+            adsorbate_surface_xy_tol_A is not None
+            and adsorbate_surface_xy_tol_A <= 0.0
+        ):
+            raise ValueError("adsorbate_surface_xy_tol_A must be > 0 when provided.")
         if site_match_tol <= 0.0:
             raise ValueError("site_match_tol must be > 0.")
         if support_xy_tol <= 0.0:
@@ -421,14 +459,29 @@ class AdsorbateCMC(SurfaceMCBase):
         self.move_mode = move_mode
         self.site_hop_prob = float(site_hop_prob)
         self.reorientation_prob = float(reorientation_prob)
+        self.hop_reorientation_prob = float(hop_reorientation_prob)
+        self.hop_puckering_prob = float(hop_puckering_prob)
+        self.hop_puckering_reorientation_prob = float(
+            hop_puckering_reorientation_prob
+        )
         self.puckering_prob = float(puckering_prob)
         self.puckering_hop_prob = float(puckering_hop_prob)
         self.puckering_height_A = float(puckering_height_A)
+        self.puckering_height_jitter_A = (
+            0.1 * self.puckering_height_A
+            if puckering_height_jitter_A is None
+            else float(puckering_height_jitter_A)
+        )
         self.displacement_sigma = displacement_sigma
         self.max_displacement_trials = int(max_displacement_trials)
         self.max_reorientation_trials = (
             int(max_reorientation_trials)
             if max_reorientation_trials is not None
+            else int(max_displacement_trials)
+        )
+        self.max_hop_reorientation_trials = (
+            int(max_hop_reorientation_trials)
+            if max_hop_reorientation_trials is not None
             else int(max_displacement_trials)
         )
         self.max_puckering_trials = (
@@ -438,10 +491,19 @@ class AdsorbateCMC(SurfaceMCBase):
         )
         self._puckering_reference_positions = self.atoms.get_positions().copy()
         self.rotation_max_angle_rad = np.deg2rad(float(rotation_max_angle_deg))
+        self.hop_reorientation_angle_rad = np.deg2rad(
+            float(hop_reorientation_angle_deg)
+        )
         self.min_clearance = float(min_clearance)
+        self.adsorbate_surface_clearance_A = float(adsorbate_surface_clearance_A)
         self.site_match_tol = float(site_match_tol)
         self.same_site_tol = float(same_site_tol)
         self.support_xy_tol = float(support_xy_tol)
+        self.adsorbate_surface_xy_tol_A = (
+            self.support_xy_tol
+            if adsorbate_surface_xy_tol_A is None
+            else float(adsorbate_surface_xy_tol_A)
+        )
         self.termination_site_xy_tol = float(termination_site_xy_tol)
         self.z_max_support = z_max_support
         self.vertical_offset = vertical_offset
@@ -508,6 +570,7 @@ class AdsorbateCMC(SurfaceMCBase):
                     "md_accept_mode='hamiltonian' requires md_init_momenta=True."
                 )
         self._template_bond_limits = self._build_template_bond_limits()
+        self._hybrid_move_table = self._build_hybrid_move_table()
 
         self._update_indices()
         self.sum_E = 0.0
@@ -722,6 +785,8 @@ class AdsorbateCMC(SurfaceMCBase):
         coverage: float = 1.0,
         site_type: Union[str, Sequence[str]] = "fcc",
         min_clearance: float = 0.8,
+        adsorbate_surface_clearance_A: float = 0.0,
+        adsorbate_surface_xy_tol_A: Optional[float] = None,
         site_match_tol: float = 0.6,
         support_xy_tol: Optional[float] = None,
         termination_site_xy_tol: Optional[float] = None,
@@ -801,6 +866,8 @@ class AdsorbateCMC(SurfaceMCBase):
             coverage=coverage,
             site_type=site_type,
             min_clearance=min_clearance,
+            adsorbate_surface_clearance_A=adsorbate_surface_clearance_A,
+            adsorbate_surface_xy_tol_A=adsorbate_surface_xy_tol_A,
             site_match_tol=site_match_tol,
             support_xy_tol=support_xy_tol,
             termination_site_xy_tol=termination_site_xy_tol,
@@ -1057,7 +1124,71 @@ class AdsorbateCMC(SurfaceMCBase):
             cell=cell,
             pbc=pbc,
         )[1]
-        return float(np.min(dists)) >= self.min_clearance
+        if float(np.min(dists)) < self.min_clearance:
+            return False
+        return self._group_stays_on_surface_side(
+            group, trial_positions, atoms=atoms
+        )
+
+    def _surface_reference_indices_for_atoms(
+        self,
+        atoms: Atoms,
+        group: np.ndarray,
+    ) -> np.ndarray:
+        tags = np.asarray(atoms.get_tags(), dtype=int)
+        ads_mask = np.zeros(len(atoms), dtype=bool)
+        if len(tags) == len(atoms):
+            ads_mask |= tags >= ADSORBATE_TAG_OFFSET
+        else:
+            try:
+                for ads_group in self._adsorbate_groups_for_atoms(atoms):
+                    ads_mask[np.asarray(ads_group, dtype=int)] = True
+            except ValueError:
+                pass
+        ads_mask[np.asarray(group, dtype=int)] = True
+        return np.where(~ads_mask)[0]
+
+    def _group_stays_on_surface_side(
+        self,
+        group: np.ndarray,
+        trial_positions: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> bool:
+        if atoms is None:
+            atoms = self.atoms
+
+        group = np.asarray(group, dtype=int)
+        trial_positions = np.asarray(trial_positions, dtype=float)
+        reference_indices = self._surface_reference_indices_for_atoms(atoms, group)
+        if reference_indices.size == 0 or trial_positions.size == 0:
+            return True
+
+        reference_positions = atoms.get_positions()[reference_indices]
+        trial_xy = trial_positions.copy()
+        ref_xy = reference_positions.copy()
+        trial_xy[:, 2] = 0.0
+        ref_xy[:, 2] = 0.0
+
+        pbc_xy = np.asarray(atoms.get_pbc(), dtype=bool).copy()
+        if pbc_xy.size == 3:
+            pbc_xy[2] = False
+
+        dxy = get_distances(
+            trial_xy,
+            ref_xy,
+            cell=atoms.get_cell(),
+            pbc=pbc_xy,
+        )[1]
+        local_mask = dxy < self.adsorbate_surface_xy_tol_A
+        if not np.any(local_mask):
+            return True
+
+        side_sign = 1.0 if self.surface_side == "top" else -1.0
+        side_gap = side_sign * (
+            trial_positions[:, None, 2] - reference_positions[None, :, 2]
+        )
+        min_gap = self.adsorbate_surface_clearance_A - 1e-12
+        return not bool(np.any(local_mask & (side_gap < min_gap)))
 
     def get_non_buried_adsorbate_indices(
         self,
@@ -1309,6 +1440,47 @@ class AdsorbateCMC(SurfaceMCBase):
         rotation = _rotation_matrix(axis, angle)
         return anchor_pos + relative @ rotation.T
 
+    def _proposal_for_mode(self, mode: str) -> Callable[[], Optional[Atoms]]:
+        proposals: dict[str, Callable[[], Optional[Atoms]]] = {
+            "displacement": self._propose_displacement,
+            "site_hop": self._propose_site_hop,
+            "reorientation": self._propose_reorientation,
+            "hop_reorientation": self._propose_hop_reorientation,
+            "hop_puckering": self._propose_hop_puckering,
+            "hop_puckering_reorientation": self._propose_hop_puckering_reorientation,
+            "puckering": self._propose_puckering,
+            "puckering_hop": self._propose_puckering_hop,
+        }
+        try:
+            return proposals[mode]
+        except KeyError as exc:
+            raise ValueError(f"Unknown adsorbate move mode: {mode!r}") from exc
+
+    def _build_hybrid_move_table(
+        self,
+    ) -> list[tuple[float, Callable[[], Optional[Atoms]]]]:
+        weighted_modes = (
+            (self.site_hop_prob, "site_hop"),
+            (self.reorientation_prob, "reorientation"),
+            (self.hop_reorientation_prob, "hop_reorientation"),
+            (self.hop_puckering_prob, "hop_puckering"),
+            (
+                self.hop_puckering_reorientation_prob,
+                "hop_puckering_reorientation",
+            ),
+            (self.puckering_prob, "puckering"),
+            (self.puckering_hop_prob, "puckering_hop"),
+        )
+        table = [
+            (float(weight), self._proposal_for_mode(mode))
+            for weight, mode in weighted_modes
+            if float(weight) > 0.0
+        ]
+        residual = 1.0 - sum(weight for weight, _ in table)
+        if residual > 1e-12:
+            table.append((residual, self._propose_displacement))
+        return table
+
     def _propose_displacement(self) -> Optional[Atoms]:
         movable_group_ids = self.get_non_buried_adsorbate_indices(
             support_xy_tol=self.support_xy_tol
@@ -1362,7 +1534,42 @@ class AdsorbateCMC(SurfaceMCBase):
 
         return None
 
-    def _propose_site_hop(self) -> Optional[Atoms]:
+    def _same_site_as_current(
+        self,
+        current_anchor: np.ndarray,
+        target_xy: np.ndarray,
+    ) -> bool:
+        delta_xyz = np.zeros((1, 3), dtype=float)
+        delta_xyz[0, :2] = current_anchor[:2] - target_xy[:2]
+        mic_xy = get_distances(
+            np.zeros((1, 3)),
+            delta_xyz,
+            cell=self.atoms.get_cell(),
+            pbc=self.atoms.get_pbc(),
+        )[1].flatten()[0]
+        return mic_xy < self.same_site_tol
+
+    def _rotated_relative_positions_for_hop(
+        self,
+        relative: np.ndarray,
+        max_angle_rad: float,
+    ) -> Optional[np.ndarray]:
+        axis = self.rng.normal(size=3)
+        angle = self.rng.uniform(-max_angle_rad, max_angle_rad)
+        if np.linalg.norm(axis) <= 1e-12 or abs(angle) <= 1e-12:
+            return None
+        rotation = _rotation_matrix(axis, angle)
+        return relative @ rotation.T
+
+    def _propose_hop(self, *, reorient: bool, pucker: bool = False) -> Optional[Atoms]:
+        if reorient and (
+            (not self.is_molecular_adsorbate)
+            or self.hop_reorientation_angle_rad <= 0.0
+        ):
+            return None
+        if pucker and self.puckering_height_A <= 0.0:
+            return None
+
         movable_group_ids = self.get_non_buried_adsorbate_indices(
             support_xy_tol=self.support_xy_tol
         )
@@ -1378,39 +1585,90 @@ class AdsorbateCMC(SurfaceMCBase):
         anchor_idx = self.ads_anchor_indices[group_id]
         current_anchor = self.atoms.positions[anchor_idx].copy()
         relative = self._current_group_relative_positions(group)
-        cell = self.atoms.get_cell()
-        pbc = self.atoms.get_pbc()
+        if reorient and np.allclose(relative, 0.0):
+            return None
+        current_support = (
+            self._nearest_support_atom_for_anchor(group) if pucker else None
+        )
+        if pucker and current_support is None:
+            return None
 
         site_order = self.rng.permutation(len(site_registry))
+        trials_per_site = (
+            max(1, int(self.max_hop_reorientation_trials)) if reorient else 1
+        )
+        direction = 1.0 if self.surface_side == "top" else -1.0
         for site_idx in site_order:
             site = site_registry[int(site_idx)]
+            if pucker and str(site.get("site_type", "")).lower() != "atop":
+                continue
             if bool(site.get("blocked_by_termination", False)):
                 continue
-            suggested_z = float(site.get("suggested_z_A", np.nan))
-            if not np.isfinite(suggested_z):
+            if pucker:
+                suggested_z = self._reference_site_suggested_z(site)
+            else:
+                suggested_z = float(site.get("suggested_z_A", np.nan))
+            if suggested_z is None or not np.isfinite(suggested_z):
                 continue
             xy = np.asarray(site["xy"], dtype=float)
-            delta_xyz = np.zeros((1, 3), dtype=float)
-            delta_xyz[0, :2] = current_anchor[:2] - xy[:2]
-            mic_xy = get_distances(
-                np.zeros((1, 3)), delta_xyz, cell=cell, pbc=pbc
-            )[1].flatten()[0]
-            if mic_xy < self.same_site_tol:
+            if self._same_site_as_current(current_anchor, xy):
                 continue
 
-            new_anchor = np.array([xy[0], xy[1], suggested_z], dtype=float)
-            trial_positions = new_anchor + relative
-            trial_positions = self._adjust_trial_positions_vertically(
-                group, trial_positions
-            )
-            if trial_positions is None:
+            height = self._sample_puckering_height() if pucker else 0.0
+            if pucker and height <= 1e-12:
                 continue
+            dz = direction * height
+            new_anchor = np.array([xy[0], xy[1], suggested_z + dz], dtype=float)
+            if not self._point_within_site_region(new_anchor):
+                continue
+            target_support = None
+            if pucker:
+                target_support = self._support_atom_for_site(
+                    site,
+                    new_anchor,
+                    avoid_index=current_support,
+                )
+                if target_support is None:
+                    continue
 
-            atoms_new = self.atoms.copy()
-            atoms_new.positions[group] = trial_positions
-            return atoms_new
+            for _ in range(trials_per_site):
+                trial_relative = relative
+                if reorient:
+                    trial_relative = self._rotated_relative_positions_for_hop(
+                        relative,
+                        self.hop_reorientation_angle_rad,
+                    )
+                    if trial_relative is None:
+                        continue
+
+                trial_positions = new_anchor + trial_relative
+                trial_positions = self._adjust_trial_positions_vertically(
+                    group, trial_positions
+                )
+                if trial_positions is None:
+                    continue
+
+                atoms_new = self.atoms.copy()
+                if pucker:
+                    atoms_new.positions[int(current_support), 2] = (
+                        self._puckering_reference_z(int(current_support))
+                    )
+                    atoms_new.positions[int(target_support), 2] = (
+                        self._puckering_reference_z(int(target_support)) + dz
+                    )
+                atoms_new.positions[group] = trial_positions
+                if not self._anchors_within_site_region(atoms=atoms_new):
+                    continue
+                if self.enforce_molecular_integrity and not (
+                    self._molecular_adsorbates_are_intact(atoms_new)
+                ):
+                    continue
+                return atoms_new
 
         return None
+
+    def _propose_site_hop(self) -> Optional[Atoms]:
+        return self._propose_hop(reorient=False)
 
     def _propose_reorientation(self) -> Optional[Atoms]:
         if (not self.is_molecular_adsorbate) or self.rotation_max_angle_rad <= 0.0:
@@ -1447,6 +1705,15 @@ class AdsorbateCMC(SurfaceMCBase):
             return atoms_new
 
         return None
+
+    def _propose_hop_reorientation(self) -> Optional[Atoms]:
+        return self._propose_hop(reorient=True)
+
+    def _propose_hop_puckering(self) -> Optional[Atoms]:
+        return self._propose_hop(reorient=False, pucker=True)
+
+    def _propose_hop_puckering_reorientation(self) -> Optional[Atoms]:
+        return self._propose_hop(reorient=True, pucker=True)
 
     def _nearest_support_atom_for_anchor(
         self,
@@ -1601,6 +1868,16 @@ class AdsorbateCMC(SurfaceMCBase):
             return float(np.max(ref_z) + self.vertical_offset)
         return float(np.min(ref_z) - self.vertical_offset)
 
+    def _sample_puckering_height(self) -> float:
+        if self.puckering_height_A <= 0.0:
+            return 0.0
+        jitter = max(0.0, float(self.puckering_height_jitter_A))
+        if jitter <= 1e-12:
+            return float(self.puckering_height_A)
+        low = max(0.0, float(self.puckering_height_A) - jitter)
+        high = float(self.puckering_height_A) + jitter
+        return float(self.rng.uniform(low, high))
+
     def _propose_puckering(self) -> Optional[Atoms]:
         if self.puckering_height_A <= 0.0:
             return None
@@ -1619,7 +1896,7 @@ class AdsorbateCMC(SurfaceMCBase):
             if support_idx is None:
                 continue
 
-            height = float(self.rng.uniform(0.0, self.puckering_height_A))
+            height = self._sample_puckering_height()
             if height <= 1e-12:
                 continue
             dz = direction * height
@@ -1677,7 +1954,7 @@ class AdsorbateCMC(SurfaceMCBase):
                 continue
 
             relative = self._current_group_relative_positions(group)
-            height = float(self.rng.uniform(0.0, self.puckering_height_A))
+            height = self._sample_puckering_height()
             if height <= 1e-12:
                 continue
             dz = direction * height
@@ -1744,36 +2021,16 @@ class AdsorbateCMC(SurfaceMCBase):
         return None
 
     def _propose_move(self) -> Optional[Atoms]:
-        if self.move_mode == "displacement":
-            return self._propose_displacement()
-        if self.move_mode == "site_hop":
-            return self._propose_site_hop()
-        if self.move_mode == "reorientation":
-            return self._propose_reorientation()
-        if self.move_mode == "puckering":
-            return self._propose_puckering()
-        if self.move_mode == "puckering_hop":
-            return self._propose_puckering_hop()
+        if self.move_mode != "hybrid":
+            return self._proposal_for_mode(self.move_mode)()
 
-        move_selector = self.rng.random()
-        if move_selector < self.site_hop_prob:
-            return self._propose_site_hop()
-        reorientation_cutoff = self.site_hop_prob + self.reorientation_prob
-        if move_selector < reorientation_cutoff:
-            trial = self._propose_reorientation()
-            if trial is not None:
-                return trial
-        if move_selector < (reorientation_cutoff + self.puckering_prob):
-            trial = self._propose_puckering()
-            if trial is not None:
-                return trial
-        puckering_hop_cutoff = (
-            reorientation_cutoff + self.puckering_prob + self.puckering_hop_prob
-        )
-        if move_selector < puckering_hop_cutoff:
-            trial = self._propose_puckering_hop()
-            if trial is not None:
-                return trial
+        selector = self.rng.random()
+        cumulative = 0.0
+        for weight, propose in self._hybrid_move_table:
+            cumulative += weight
+            if selector < cumulative:
+                return propose()
+
         return self._propose_displacement()
 
     def _open_optional_traj(self, filename: Optional[str]) -> Optional[Trajectory]:
@@ -1873,9 +2130,6 @@ class AdsorbateCMC(SurfaceMCBase):
                     if atoms_trial is None:
                         continue
 
-                    if attempted_writer is not None:
-                        attempted_writer.write(atoms_trial)
-
                     if self.has_detached_functional_groups(
                         atoms_trial, detach_tol=self.detach_tol
                     ):
@@ -1902,6 +2156,9 @@ class AdsorbateCMC(SurfaceMCBase):
                             rejected_writer.write(atoms_trial)
                         continue
 
+                    if attempted_writer is not None:
+                        attempted_writer.write(atoms_trial)
+
                     md_delta = (
                         delta_h if self.md_accept_mode == "hamiltonian" else delta_e
                     )
@@ -1921,9 +2178,6 @@ class AdsorbateCMC(SurfaceMCBase):
                 atoms_trial = self._propose_move()
                 if atoms_trial is None:
                     continue
-
-                if attempted_writer is not None:
-                    attempted_writer.write(atoms_trial)
 
                 if self.relax:
                     atoms_trial, converged = self.relax_structure(
@@ -1956,6 +2210,9 @@ class AdsorbateCMC(SurfaceMCBase):
                     if rejected_writer is not None:
                         rejected_writer.write(atoms_trial)
                     continue
+
+                if attempted_writer is not None:
+                    attempted_writer.write(atoms_trial)
 
                 e_new = self.get_potential_energy(atoms_trial)
                 delta_e = e_new - self.e_old

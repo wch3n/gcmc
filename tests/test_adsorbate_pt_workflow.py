@@ -70,6 +70,19 @@ pt:
   T_start: 500
   T_end: 300
   T_step: 100
+cmc:
+  moves:
+    hop:
+      prob: 0.6
+      reorient:
+        prob: 0.75
+        angle_deg: 160
+        max_trials: 7
+      puckering:
+        prob: 0.5
+        elements: [Pt]
+        height_A: 0.3
+        height_jitter_A: 0.02
 output:
   output_dir: results
   stats_file: stats.csv
@@ -87,6 +100,15 @@ output:
         self.assertEqual(cfg.results_file, str(root / "results.csv"))
         self.assertEqual(cfg.checkpoint_file, str(root / "state.pkl"))
         self.assertEqual(cfg.initial_traj_file, str(root / "init.traj"))
+        self.assertAlmostEqual(cfg.site_hop_prob, 0.075)
+        self.assertAlmostEqual(cfg.hop_reorientation_prob, 0.225)
+        self.assertAlmostEqual(cfg.hop_puckering_prob, 0.075)
+        self.assertAlmostEqual(cfg.hop_puckering_reorientation_prob, 0.225)
+        self.assertEqual(cfg.hop_reorientation_angle_deg, 160)
+        self.assertEqual(cfg.max_hop_reorientation_trials, 7)
+        self.assertEqual(cfg.puckering_elements, ["Pt"])
+        self.assertEqual(cfg.puckering_height_A, 0.3)
+        self.assertEqual(cfg.puckering_height_jitter_A, 0.02)
 
     def test_adsorbate_pt_workflow_initializes_fixed_count_and_relocates_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -117,6 +139,7 @@ output:
                     "results_file": str(Path(tmpdir) / "pt_out" / "results.csv"),
                     "checkpoint_file": str(Path(tmpdir) / "pt_out" / "state.pkl"),
                     "initial_traj_file": str(Path(tmpdir) / "pt_out" / "initial.traj"),
+                    "write_debug_trajs": True,
                 }
             )
             cfg = SimpleNamespace(**cfg_dict)
@@ -161,6 +184,18 @@ output:
             self.assertEqual(
                 fake_pt.replica_states[1]["checkpoint_file"],
                 str(out_dir / "checkpoint_300K.pkl"),
+            )
+            self.assertEqual(
+                fake_pt.replica_states[0]["attempted_traj_file"],
+                str(out_dir / "replica_400K_attempted.traj"),
+            )
+            self.assertEqual(
+                fake_pt.replica_states[0]["accepted_traj_file"],
+                str(out_dir / "replica_400K_accepted.traj"),
+            )
+            self.assertEqual(
+                fake_pt.replica_states[0]["rejected_traj_file"],
+                str(out_dir / "replica_400K_rejected.traj"),
             )
 
     def test_adsorbate_pt_workflow_passes_ray_backend_options(self):

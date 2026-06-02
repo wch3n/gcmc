@@ -1875,13 +1875,20 @@ relaxation:
                 },
                 "moves": {
                     "mode": "hybrid",
-                    "site_hop_prob": 0.25,
                     "reorientation_prob": 0.1,
-                    "puckering": {
-                        "prob": 0.2,
-                        "hop_prob": 0.1,
-                        "elements": ["Pt"],
-                        "height_A": 0.15,
+                    "hop": {
+                        "prob": 0.25,
+                        "reorient": {
+                            "prob": 0.8,
+                            "angle_deg": 170.0,
+                            "max_trials": 11,
+                        },
+                        "puckering": {
+                            "prob": 0.2,
+                            "elements": ["Pt"],
+                            "height_A": 0.15,
+                            "height_jitter_A": 0.01,
+                        },
                     },
                 },
                 "relaxation": {"enabled": True, "steps": 30, "fmax": 0.04},
@@ -1897,9 +1904,16 @@ relaxation:
         self.assertEqual(local["backend"], "ray")
         self.assertEqual(local["n_gpus"], 2)
         self.assertEqual(local["move_mode"], "hybrid")
-        self.assertEqual(local["puckering_prob"], 0.2)
-        self.assertEqual(local["puckering_hop_prob"], 0.1)
+        self.assertAlmostEqual(local["site_hop_prob"], 0.04)
+        self.assertAlmostEqual(local["hop_reorientation_prob"], 0.16)
+        self.assertAlmostEqual(local["hop_puckering_prob"], 0.01)
+        self.assertAlmostEqual(local["hop_puckering_reorientation_prob"], 0.04)
+        self.assertEqual(local["hop_reorientation_angle_deg"], 170.0)
+        self.assertEqual(local["max_hop_reorientation_trials"], 11)
+        self.assertEqual(local["puckering_prob"], 0.0)
+        self.assertEqual(local["puckering_hop_prob"], 0.0)
         self.assertEqual(local["puckering_elements"], ["Pt"])
+        self.assertEqual(local["puckering_height_jitter_A"], 0.01)
         self.assertTrue(local["relax"])
         self.assertFalse(local["enable_hybrid_md"])
         self.assertTrue(local["write_debug_trajs"])
@@ -2137,6 +2151,7 @@ relaxation:
                     "n_gpus": 1,
                     "workers_per_gpu": 1,
                     "ray_num_gpus_per_task": 1.0,
+                    "write_debug_trajs": True,
                     "progress_stdout": False,
                 },
             )
@@ -2157,6 +2172,12 @@ relaxation:
             self.assertEqual(captured["n_cycles"], 4)
             self.assertEqual(len(captured["replica_states"]), 2)
             self.assertIn("seed000_pt", captured["replica_states"][0]["traj_file"])
+            first_mc_kwargs = captured["replica_states"][0]["mc_kwargs"]
+            second_mc_kwargs = captured["replica_states"][1]["mc_kwargs"]
+            self.assertIn("replica_300K_attempted.traj", first_mc_kwargs["attempted_traj_file"])
+            self.assertIn("replica_300K_accepted.traj", first_mc_kwargs["accepted_traj_file"])
+            self.assertIn("replica_300K_rejected.traj", first_mc_kwargs["rejected_traj_file"])
+            self.assertIn("replica_450K_attempted.traj", second_mc_kwargs["attempted_traj_file"])
             self.assertEqual(outputs[0][1]["candidate_kind"], "local_cmc_pt_sample")
             self.assertEqual(outputs[0][1]["local_cmc_pt_temperature_K"], 300.0)
 

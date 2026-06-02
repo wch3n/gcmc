@@ -24,6 +24,8 @@ This page documents the YAML keys used by:
 | `termination_site_xy_tol` | all | derived | Lateral tolerance used when mapping terminations to metal reference sites. Defaults to `support_xy_tol`. |
 | `termination_clearance` | all | `0.8` | Minimum clearance from `functional_elements`. |
 | `min_clearance` | all | `0.9` | Generic minimum distance from the adsorbate to the slab. |
+| `adsorbate_surface_clearance_A` | Ad-CMC/PT | `0.0` | Minimum z-side gap requiring each adsorbate atom to remain on the requested `surface_side` of nearby slab atoms. This rejects molecular trials whose distal atoms are buried inside the slab even when pair distances are not too short. |
+| `adsorbate_surface_xy_tol_A` | Ad-CMC/PT | `null` | Lateral radius used for the surface-side envelope check. `null` uses `support_xy_tol`. |
 | `vertical_offset` | all | `1.8` | Initial anchor height above the site support plane. |
 | `vertical_adjust_step` | all | `0.25` | Increment used by bounded vertical retry when a trial starts too close to the surface. |
 | `max_vertical_adjust` | all | `1.5` | Maximum total vertical lifting applied during bounded retry. |
@@ -44,13 +46,19 @@ This page documents the YAML keys used by:
 | `max_displacement_trials` | all | `20` | Retry budget for generating a valid displacement proposal. |
 | `site_hop_prob` | all | `0.5` for CMC, `0.25` for GCMC | In `move_mode: hybrid`, probability of selecting a site hop. |
 | `reorientation_prob` | all | `0.2` for CMC, `0.0` for GCMC | In `move_mode: hybrid`, probability of selecting a rigid-body reorientation. |
+| `hop_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a combined site-hop plus rigid-body reorientation. Useful for molecular adsorbates such as OOH where the anchor site and molecular orientation should be sampled together. |
+| `hop_puckering_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that also transfers the local puckering to the target atop metal atom. |
+| `hop_puckering_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that transfers puckering and reorients the molecule around the new anchor. |
 | `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, probability of selecting a coupled local surface-atom puckering move. |
 | `puckering_hop_prob` | all | `0.0` | In `move_mode: hybrid`, probability of resetting the current puckered support atom to its initial local-CMC height, hopping to another site, and puckering a support atom at the target site. |
 | `puckering_elements` | all | `None` | Elements eligible for puckering. `None` uses `site_elements`; for MXenes set this to the metal elements, e.g. `[Ti]` or `[Ti, Zr, Mo]`. |
-| `puckering_height_A` | all | `0.15` | Maximum outward displacement relative to the initial local-CMC support-atom height for puckering proposals. |
+| `puckering_height_A` | all | `0.15` | Target outward displacement relative to the initial local-CMC support-atom height for puckering proposals. |
+| `puckering_height_jitter_A` | all | `null` | Uniform half-width around `puckering_height_A`; `null` uses 10% of `puckering_height_A`. Set `0.0` for a fixed lift. |
 | `max_puckering_trials` | all | `None` | Retry budget for puckering proposals. `None` uses the displacement retry budget. |
 | `rotation_max_angle_deg` | all | `25.0` | Maximum absolute rotation angle used for reorientation. |
 | `max_reorientation_trials` | all | `None` | Retry budget for rigid-body reorientation proposals. `None` lets the engine use its internal default. |
+| `hop_reorientation_angle_deg` | Ad-CMC/PT | `180.0` | Maximum absolute rotation angle used after the anchor hops to a new site. |
+| `max_hop_reorientation_trials` | Ad-CMC/PT | `None` | Number of random orientations tried per target site for hop+reorientation proposals. `None` uses the displacement retry budget. |
 
 ### Reorientation semantics
 
@@ -59,6 +67,36 @@ This page documents the YAML keys used by:
 - Internal bond lengths and angles are preserved.
 - For `OH`, the H rotates around the anchored O.
 - For `H2O`, both H atoms rotate as a rigid body around the anchored O.
+- `hop_reorientation` first moves the anchor to a different eligible registry site,
+  then applies a random rigid-body rotation about that new anchor before the usual
+  clearance and surface-side filters.
+
+### Nested move syntax
+
+For adsorbate CMC/PT, the hop controls may also be written as a nested block:
+
+```yaml
+cmc:
+  moves:
+    hop:
+      prob: 0.60
+      reorient:
+        prob: 0.75
+        angle_deg: 180.0
+        max_trials: 20
+      puckering:
+        prob: 0.50
+        elements: [Mo]
+        height_A: 1.10
+        height_jitter_A: 0.05
+```
+
+Here `moves.hop.prob` is the total hop-family probability. The loader maps
+`moves.hop.reorient.prob` and `moves.hop.puckering.prob` as conditional
+probabilities within that hop family. For the example, the effective weights are
+plain hop `0.60 * 0.25 * 0.50`, hop+reorientation `0.60 * 0.75 * 0.50`,
+hop+puckering `0.60 * 0.25 * 0.50`, and hop+puckering+reorientation
+`0.60 * 0.75 * 0.50`.
 
 ## 3. Adsorbate CMC keys
 

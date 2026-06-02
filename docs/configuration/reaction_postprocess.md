@@ -193,6 +193,8 @@ These keys are passed to `LocalAdsorptionMotifAnalyzer`.
 | `shell1_size`, `shell2_size` | Number of local metal atoms used in shell fingerprints. |
 | `functional_cutoff` | Cutoff for nearby termination counts. |
 | `surface_layer_tol`, `site_match_tol`, `support_xy_tol`, `termination_site_xy_tol`, `vertical_offset`, `termination_clearance` | Site-registry geometry controls. |
+| `local_cmc.moves.surface_clearance_A` / `adsorbate_surface_clearance_A` | Minimum z-side gap for local CMC/PT proposals. The default `0.0` rejects trial O/OH/OOH atoms that fall below the nearby top-surface envelope, or above the nearby bottom-surface envelope. |
+| `local_cmc.moves.surface_xy_tol_A` / `adsorbate_surface_xy_tol_A` | Lateral radius for the local CMC/PT surface-envelope filter. `null` uses `support_xy_tol`. |
 
 ### `selection`
 
@@ -279,9 +281,9 @@ local adsorbate CMC samples constrained around a matched parent-state anchor.
 | `sequential.enabled` | Enables reaction-step-conditioned local CMC seed generation. Set `false` to disable all sequential rules, including automatic compatibility rules. |
 | `sequential.rules` | Ordered local transition rules. Each rule gives `source_state`, `target_state`, `builder`, and optional builder controls such as `n_orientations`. The built-in `ooh_from_o` builder regenerates OOH* seeds from locally sampled O* candidates and records generic parent metadata (`parent_state_dir`, `parent_state_candidate_id`, `transition_builder`) plus the legacy `parent_o_candidate_id`. |
 | `sequential_ooh_from_o`, `sequential_ooh_orientations` | Legacy OER shortcut for the `02_O -> 03_OOH` `ooh_from_o` rule. Existing configs remain valid. For new configs, prefer `sequential.rules`. |
-| `move_mode`, `site_hop_prob`, `reorientation_prob`, `puckering_prob`, `puckering_hop_prob`, `puckering_elements`, `puckering_height_A`, `max_puckering_trials`, `displacement_sigma` | Adsorbate CMC proposal controls. |
+| `move_mode`, `site_hop_prob`, `reorientation_prob`, `hop_reorientation_prob`, `hop_puckering_prob`, `hop_puckering_reorientation_prob`, `puckering_prob`, `puckering_hop_prob`, `puckering_elements`, `puckering_height_A`, `puckering_height_jitter_A`, `max_puckering_trials`, `displacement_sigma`, `adsorbate_surface_clearance_A`, `adsorbate_surface_xy_tol_A` | Adsorbate CMC proposal controls. `hop_reorientation_prob` hops the anchor to a new registry site and then randomly reorients the molecule about that new anchor. `hop_puckering_reorientation_prob` additionally transfers the local puckering to the target atop metal. `puckering_height_A` is the target lift; `puckering_height_jitter_A` controls the uniform variation around it. |
 | `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
-| `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. |
+| `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. Attempted trajectories contain valid trial moves after geometry filters, while rejected trajectories include invalid-filter rejects and Metropolis rejects. |
 | `write_attempted_traj`, `write_accepted_traj`, `write_rejected_traj` | Individually enable specific debug trajectory files. |
 | `skip_existing` | If true, do not rerun CMC/PT for state blocks whose `local_cmc/done` marker exists. Existing local trajectories are still re-promoted into `candidates.traj` using the current `output_selection` and `max_output_candidates_per_state` settings when possible. |
 
@@ -322,14 +324,19 @@ local_cmc:
     ray_num_gpus_per_task: 1.0
   moves:
     mode: hybrid
-    site_hop_prob: 0.25
     reorientation_prob: 0.1
     displacement_sigma: 0.2
-    puckering:
-      prob: 0.2
-      hop_prob: 0.1
-      elements: [Ti]
-      height_A: 0.15
+    hop:
+      prob: 0.6
+      reorient:
+        prob: 0.75
+        angle_deg: 180.0
+        max_trials: 20
+      puckering:
+        prob: 0.5
+        elements: [Ti]
+        height_A: 0.15
+        height_jitter_A: 0.02
   relaxation:
     enabled: true
     steps: 50
@@ -340,6 +347,12 @@ local_cmc:
     write_debug_trajs: true
     progress_log: local_cmc.log
 ```
+
+In this nested syntax, `moves.hop.prob` is the total hop-family probability.
+`moves.hop.reorient.prob` and `moves.hop.puckering.prob` are conditional on
+choosing a hop, so the example maps to `site_hop_prob = 0.075`,
+`hop_reorientation_prob = 0.225`, `hop_puckering_prob = 0.075`, and
+`hop_puckering_reorientation_prob = 0.225`.
 
 ### `state_relaxation`
 

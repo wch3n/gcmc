@@ -1820,7 +1820,6 @@ relaxation:
                     "site_hop_prob": 0.3,
                     "reorientation_prob": 0.2,
                     "puckering_prob": 0.4,
-                    "puckering_hop_prob": 0.1,
                     "puckering_elements": ["Pt"],
                     "puckering_height_A": 0.7,
                     "max_puckering_trials": 9,
@@ -1839,7 +1838,6 @@ relaxation:
                 )
 
             self.assertEqual(captured["puckering_prob"], 0.4)
-            self.assertEqual(captured["puckering_hop_prob"], 0.1)
             self.assertEqual(captured["puckering_elements"], ("Pt",))
             self.assertEqual(captured["puckering_height_A"], 0.7)
             self.assertEqual(captured["max_puckering_trials"], 9)
@@ -1921,7 +1919,6 @@ relaxation:
         self.assertEqual(local["rotation_max_angle_deg"], 35.0)
         self.assertEqual(local["max_reorientation_trials"], 9)
         self.assertEqual(local["puckering_prob"], 0.0)
-        self.assertEqual(local["puckering_hop_prob"], 0.0)
         self.assertEqual(local["puckering_elements"], ["Pt"])
         self.assertEqual(local["puckering_height_jitter_A"], 0.01)
         self.assertTrue(local["relax"])

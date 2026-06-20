@@ -22,6 +22,8 @@ def normalize_adsorbate_move_config(flat_config: dict) -> dict:
     _apply_reorientation_config(flat_config, moves.get("reorientation"))
     _apply_hop_config(flat_config, moves.get("hop"))
     _apply_standalone_puckering_config(flat_config, moves.get("puckering"))
+    _apply_orientation_filter_config(flat_config, moves.get("orientation_filter"))
+    _apply_diagnostics_config(flat_config, moves.get("diagnostics"))
     _apply_surface_filter_config(flat_config, moves)
     return flat_config
 
@@ -112,8 +114,6 @@ def _apply_standalone_puckering_config(flat_config: dict, puckering: object) -> 
         return
     if "prob" in puckering:
         flat_config["puckering_prob"] = puckering["prob"]
-    if "hop_prob" in puckering:
-        flat_config["puckering_hop_prob"] = puckering["hop_prob"]
     _apply_puckering_geometry_config(flat_config, puckering)
 
 
@@ -138,3 +138,32 @@ def _apply_surface_filter_config(flat_config: dict, moves: dict) -> None:
     for source_key, target_key in aliases.items():
         if source_key in moves:
             flat_config[target_key] = moves[source_key]
+
+
+def _apply_orientation_filter_config(flat_config: dict, filter_config: object) -> None:
+    if not isinstance(filter_config, dict):
+        return
+
+    aliases = {
+        "atom_indices": "molecular_upright_atom_indices",
+        "molecular_upright_atom_indices": "molecular_upright_atom_indices",
+        "min_z_above_anchor_A": "molecular_upright_min_z_A",
+        "min_height_above_anchor_A": "molecular_upright_min_z_A",
+        "molecular_upright_min_z_A": "molecular_upright_min_z_A",
+    }
+    for source_key, target_key in aliases.items():
+        if source_key in filter_config:
+            flat_config[target_key] = filter_config[source_key]
+
+
+def _apply_diagnostics_config(flat_config: dict, diagnostics: object) -> None:
+    if not isinstance(diagnostics, dict):
+        return
+    aliases = {
+        "enabled": "diagnostics_enabled",
+        "log": "diagnostics_log",
+        "top_n": "diagnostics_top_n",
+    }
+    for source_key, target_key in aliases.items():
+        if source_key in diagnostics:
+            flat_config[target_key] = diagnostics[source_key]

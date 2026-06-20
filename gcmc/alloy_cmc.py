@@ -41,7 +41,10 @@ class AlloyCMC(BaseMC):
         relax_radius: float = 4.0,
         fmax: float = 0.05,
         traj_file: str = "alloy_cmc.traj",
-        accepted_traj_file: Optional[str] = "alloy_accepted.traj",
+        accepted_traj_file: Optional[str] = None,
+        attempted_traj_file: Optional[str] = None,
+        rejected_traj_file: Optional[str] = None,
+        debug_traj_interval: int = 1,
         thermo_file: str = "energies.dat",
         checkpoint_file: str = "restart.pkl",
         checkpoint_interval: int = 100,
@@ -91,6 +94,11 @@ class AlloyCMC(BaseMC):
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.accepted_traj_file = accepted_traj_file
+        self.attempted_traj_file = attempted_traj_file
+        self.rejected_traj_file = rejected_traj_file
+        self.debug_traj_interval = int(debug_traj_interval)
+        if self.debug_traj_interval < 1:
+            raise ValueError("debug_traj_interval must be >= 1.")
         self.checkpoint_interval = checkpoint_interval
         self.enable_hybrid_md = enable_hybrid_md
         self.md_move_prob = md_move_prob
@@ -395,6 +403,60 @@ class AlloyCMC(BaseMC):
         delta_h = (e_new + k_new) - (e_old + k_old)
         return atoms_trial, delta_e, delta_h
 
+    @staticmethod
+    def _open_optional_traj(path: Optional[str]) -> Optional[Trajectory]:
+        if not path:
+            return None
+        mode = "a" if os.path.exists(path) and os.path.getsize(path) > 0 else "w"
+        return Trajectory(path, mode)
+
+    def _should_write_debug_traj(self) -> bool:
+        return int(self.total_moves) % int(self.debug_traj_interval) == 0
+
+    def _write_debug_atoms(
+        self,
+        writer: Optional[Trajectory],
+        atoms_obj: Atoms,
+        *,
+        event: str,
+        move_name: str,
+        delta_e: Optional[float] = None,
+        delta_h: Optional[float] = None,
+        accept_prob: Optional[float] = None,
+        reject_reason: str = "",
+        swap_indices: Optional[Tuple[int, int]] = None,
+        converged: Optional[bool] = None,
+    ) -> None:
+        if writer is None or not self._should_write_debug_traj():
+            return
+        frame = atoms_obj.copy()
+        frame.calc = None
+        frame.info["mc_event"] = event
+        frame.info["mc_move_name"] = move_name
+        frame.info["mc_sweep"] = int(self.sweep)
+        frame.info["mc_total_moves"] = int(self.total_moves)
+        frame.info["mc_temperature_K"] = float(self.T)
+        frame.info["mc_current_energy_eV"] = float(self.e_old)
+        if delta_e is not None:
+            frame.info["mc_delta_e_eV"] = float(delta_e)
+        if delta_h is not None:
+            frame.info["mc_delta_h_eV"] = float(delta_h)
+        if accept_prob is not None:
+            frame.info["mc_accept_prob"] = float(accept_prob)
+        if reject_reason:
+            frame.info["mc_reject_reason"] = reject_reason
+        if swap_indices is not None:
+            frame.info["mc_swap_indices"] = " ".join(str(int(i)) for i in swap_indices)
+        if converged is not None:
+            frame.info["mc_relax_converged"] = bool(converged)
+        writer.write(frame)
+
+    @staticmethod
+    def _acceptance_probability(delta: float, beta: float) -> float:
+        if delta < 0.0:
+            return 1.0
+        return min(1.0, float(np.exp(-delta * beta)))
+
     def relax_structure(
         self, atoms: Atoms, move_ind: Optional[list]
     ) -> tuple[Atoms, bool]:
@@ -473,6 +535,9 @@ class AlloyCMC(BaseMC):
             mode = "w"
 
         self.traj_writer = Trajectory(self.traj_file, mode)
+        attempted_writer = self._open_optional_traj(self.attempted_traj_file)
+        accepted_writer = self._open_optional_traj(self.accepted_traj_file)
+        rejected_writer = self._open_optional_traj(self.rejected_traj_file)
 
         if not self._resumed_from_checkpoint:
             self.sum_E = 0.0
@@ -519,6 +584,16 @@ class AlloyCMC(BaseMC):
                     md_delta = (
                         delta_h if self.md_accept_mode == "hamiltonian" else delta_e
                     )
+                    accept_prob = self._acceptance_probability(md_delta, beta)
+                    self._write_debug_atoms(
+                        attempted_writer,
+                        atoms_trial,
+                        event="attempted",
+                        move_name="md",
+                        delta_e=delta_e,
+                        delta_h=delta_h,
+                        accept_prob=accept_prob,
+                    )
                     if self._metropolis_accept(md_delta, beta=beta):
                         self.e_old += delta_e
                         self.accepted_moves += 1
@@ -527,6 +602,26 @@ class AlloyCMC(BaseMC):
                         self.atoms.cell = atoms_trial.cell
                         if self.neighbor_cache:
                             self._invalidate_neighbor_cache()
+                        self._write_debug_atoms(
+                            accepted_writer,
+                            self.atoms,
+                            event="accepted",
+                            move_name="md",
+                            delta_e=delta_e,
+                            delta_h=delta_h,
+                            accept_prob=accept_prob,
+                        )
+                    else:
+                        self._write_debug_atoms(
+                            rejected_writer,
+                            atoms_trial,
+                            event="rejected",
+                            move_name="md",
+                            delta_e=delta_e,
+                            delta_h=delta_h,
+                            accept_prob=accept_prob,
+                            reject_reason="metropolis",
+                        )
                     continue
 
                 indices = self.propose_swap_indices()
@@ -552,9 +647,22 @@ class AlloyCMC(BaseMC):
                     else:
                         e_new = 1e9
                 else:
+                    atoms_trial = self.atoms.copy()
                     e_new = self.get_potential_energy(self.atoms)
+                    conv = None
 
                 delta_e = e_new - self.e_old
+                accept_prob = self._acceptance_probability(delta_e, beta)
+                self._write_debug_atoms(
+                    attempted_writer,
+                    atoms_trial,
+                    event="attempted",
+                    move_name="swap",
+                    delta_e=delta_e,
+                    accept_prob=accept_prob,
+                    swap_indices=(idx1, idx2),
+                    converged=conv,
+                )
 
                 if self._metropolis_accept(delta_e, beta=beta):
                     self.e_old = e_new
@@ -564,7 +672,29 @@ class AlloyCMC(BaseMC):
                         self.atoms.cell = atoms_trial.cell
                         if self.neighbor_cache:
                             self._invalidate_neighbor_cache()
+                    self._write_debug_atoms(
+                        accepted_writer,
+                        self.atoms,
+                        event="accepted",
+                        move_name="swap",
+                        delta_e=delta_e,
+                        accept_prob=accept_prob,
+                        swap_indices=(idx1, idx2),
+                        converged=conv,
+                    )
                 else:
+                    reason = "relax_not_converged" if conv is False else "metropolis"
+                    self._write_debug_atoms(
+                        rejected_writer,
+                        atoms_trial,
+                        event="rejected",
+                        move_name="swap",
+                        delta_e=delta_e,
+                        accept_prob=accept_prob,
+                        reject_reason=reason,
+                        swap_indices=(idx1, idx2),
+                        converged=conv,
+                    )
                     self.atoms.symbols[idx1], self.atoms.symbols[idx2] = sym1, sym2
 
                 self.current_swap_indices = None
@@ -628,7 +758,9 @@ class AlloyCMC(BaseMC):
             ):
                 self._save_checkpoint()
 
-        self.traj_writer.close()
+        for writer in (self.traj_writer, attempted_writer, accepted_writer, rejected_writer):
+            if writer is not None:
+                writer.close()
 
         final_avg = self.sum_E / self.n_samples if self.n_samples else self.e_old
         final_Cv = 0.0

@@ -59,6 +59,7 @@ These keys are used by `AlloyCMCWorkflow`.
 | `write_interval` | `10` | Trajectory/thermo write interval. `interval` is accepted as an alias. |
 | `seed` | `67` | Random seed for the single-temperature alloy MC engine. |
 | `resume` | `False` | Resume from the per-run checkpoint instead of starting fresh. On resume, `nsweeps` remains the total target sweep count. |
+| `output_dir` | `None` | Optional directory prepended to `output_prefix` when `output_prefix` is relative. Useful for keeping alloy CMC outputs in a dedicated `results/` folder. |
 | `output_prefix` | `alloy_cmc` | Prefix used for `.traj`, `_accepted.traj`, `.dat`, and `.pkl`. |
 
 ## 4. Replica-exchange keys (`pt`)

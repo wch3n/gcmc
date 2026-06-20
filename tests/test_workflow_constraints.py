@@ -17,10 +17,12 @@ from gcmc.utils import initialize_surface_adsorbates
 from gcmc.workflows import (
     AdsorbateCMCWorkflow,
     AdsorbateGCMCScanWorkflow,
+    AlloyCMCWorkflow,
     _prepare_adsorbate_scan_atoms,
     _prepare_alloy_atoms,
     _write_site_overlay_if_requested,
     load_adsorbate_cmc_config,
+    load_alloy_cmc_config,
 )
 
 
@@ -196,6 +198,54 @@ output:
             )
 
             cfg = load_adsorbate_cmc_config(config_path)
+
+        self.assertEqual(cfg.output_dir, str((Path(tmpdir) / "results").resolve()))
+        self.assertEqual(cfg.output_prefix, "seed_067/out")
+
+    def test_alloy_cmc_output_dir_prefixes_relative_outputs(self):
+        cfg = SimpleNamespace(
+            snapshot="dummy.traj",
+            frame=0,
+            output_dir="/tmp/alloy_cmc_outputs",
+            output_prefix="seed_067/out",
+        )
+        workflow = AlloyCMCWorkflow(cfg, calculator_factory=lambda *_: None)
+
+        output_paths = workflow._build_output_paths()
+
+        self.assertEqual(
+            output_paths["traj_file"],
+            "/tmp/alloy_cmc_outputs/seed_067/out.traj",
+        )
+        self.assertEqual(
+            output_paths["accepted_traj_file"],
+            "/tmp/alloy_cmc_outputs/seed_067/out_accepted.traj",
+        )
+        self.assertEqual(
+            output_paths["thermo_file"],
+            "/tmp/alloy_cmc_outputs/seed_067/out.dat",
+        )
+        self.assertEqual(
+            output_paths["checkpoint_file"],
+            "/tmp/alloy_cmc_outputs/seed_067/out.pkl",
+        )
+
+    def test_load_alloy_cmc_config_preserves_relative_output_prefix_with_output_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                """
+system:
+  snapshot: slab.traj
+cmc:
+  seed: 67
+output:
+  output_dir: results
+  output_prefix: seed_067/out
+""".strip()
+            )
+
+            cfg = load_alloy_cmc_config(config_path)
 
         self.assertEqual(cfg.output_dir, str((Path(tmpdir) / "results").resolve()))
         self.assertEqual(cfg.output_prefix, "seed_067/out")

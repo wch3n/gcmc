@@ -249,7 +249,7 @@ class ReplicaExchange:
                 "id": i,
                 "T": T,
                 "atoms": atoms_i,
-                "e_old": 0.0,
+                "e_old": None,
                 "sweep": 0,
                 # Cumulative counters kept in memory for logging.
                 "cum_sum_E": 0.0,

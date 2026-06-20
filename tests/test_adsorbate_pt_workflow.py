@@ -13,6 +13,7 @@ from gcmc.constants import ADSORBATE_TAG_OFFSET
 from gcmc.workflows import (
     AdsorbateReplicaExchangeWorkflow,
     _DEFAULT_ADSORBATE_PT_CONFIG,
+    _select_initial_adsorbate_template,
     load_adsorbate_pt_config,
 )
 
@@ -61,11 +62,40 @@ class AdsorbatePTWorkflowTests(unittest.TestCase):
     def test_load_adsorbate_pt_config_resolves_output_paths(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
+            template_dir = Path(tmpdir) / "templates"
+            template_dir.mkdir()
+            (template_dir / "OOH_flat.vasp").write_text(
+                """
+O H
+1.0
+10.0 0.0 0.0
+0.0 10.0 0.0
+0.0 0.0 10.0
+O H
+2 1
+Cartesian
+0.0 0.0 0.0
+1.2 0.0 0.0
+1.3 0.8 0.1
+""".strip()
+            )
             config_path.write_text(
                 """
 system:
   snapshot: slab.traj
-  adsorbate: OH
+  adsorbate_templates:
+    - name: upright
+      adsorbate: OOH
+      weight: 1.0
+      anchor:
+        mode: atom
+        atom_index: 0
+    - name: flat
+      path: templates/OOH_flat.vasp
+      weight: 2.0
+      anchor:
+        mode: center_of_mass
+        atom_indices: [0, 1]
 pt:
   T_start: 500
   T_end: 300
@@ -73,6 +103,13 @@ pt:
 cmc:
   moves:
     mode: hybrid
+    orientation_filter:
+      atom_indices: [2]
+      min_z_above_anchor_A: 0.1
+    diagnostics:
+      enabled: true
+      log: true
+      top_n: 2
     hop:
       prob: 0.6
       reorient:
@@ -95,6 +132,7 @@ output:
             )
 
             cfg = load_adsorbate_pt_config(config_path)
+            selected = _select_initial_adsorbate_template(cfg, seed=1)
 
         root = (Path(tmpdir) / "results").resolve()
         self.assertEqual(cfg.output_dir, str(root))
@@ -102,6 +140,12 @@ output:
         self.assertEqual(cfg.results_file, str(root / "results.csv"))
         self.assertEqual(cfg.checkpoint_file, str(root / "state.pkl"))
         self.assertEqual(cfg.initial_traj_file, str(root / "init.traj"))
+        self.assertEqual(cfg.adsorbate_templates[0]["adsorbate"], "OOH")
+        self.assertEqual(
+            cfg.adsorbate_templates[1]["path"],
+            str((Path(tmpdir) / "templates" / "OOH_flat.vasp").resolve()),
+        )
+        self.assertEqual(cfg.adsorbate_templates[1]["anchor"]["mode"], "center_of_mass")
         self.assertEqual(cfg.debug_traj_interval, 25)
         self.assertEqual(cfg.move_mode, "hybrid")
         self.assertAlmostEqual(cfg.site_hop_prob, 0.075)
@@ -113,6 +157,17 @@ output:
         self.assertEqual(cfg.puckering_elements, ["Pt"])
         self.assertEqual(cfg.puckering_height_A, 0.3)
         self.assertEqual(cfg.puckering_height_jitter_A, 0.02)
+        self.assertEqual(cfg.molecular_upright_atom_indices, [2])
+        self.assertEqual(cfg.molecular_upright_min_z_A, 0.1)
+        self.assertTrue(cfg.diagnostics_enabled)
+        self.assertTrue(cfg.diagnostics_log)
+        self.assertEqual(cfg.diagnostics_top_n, 2)
+        template, anchor_index, anchor_mode, anchor_atom_indices, library = selected
+        self.assertEqual(template.get_chemical_formula(), "HO2")
+        self.assertEqual(anchor_index, 0)
+        self.assertEqual(anchor_mode, "center_of_mass")
+        self.assertEqual(anchor_atom_indices, [0, 1])
+        self.assertEqual(len(library), 2)
 
     def test_adsorbate_pt_workflow_initializes_fixed_count_and_relocates_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -145,6 +200,9 @@ output:
                     "initial_traj_file": str(Path(tmpdir) / "pt_out" / "initial.traj"),
                     "write_debug_trajs": True,
                     "debug_traj_interval": 7,
+                    "diagnostics_enabled": True,
+                    "diagnostics_log": True,
+                    "diagnostics_top_n": 2,
                 }
             )
             cfg = SimpleNamespace(**cfg_dict)
@@ -169,6 +227,9 @@ output:
             self.assertEqual(kwargs["mc_kwargs"]["adsorbate_anchor_index"], 0)
             self.assertEqual(kwargs["mc_kwargs"]["site_type"], ["atop"])
             self.assertEqual(kwargs["mc_kwargs"]["debug_traj_interval"], 7)
+            self.assertTrue(kwargs["mc_kwargs"]["diagnostics_enabled"])
+            self.assertTrue(kwargs["mc_kwargs"]["diagnostics_log"])
+            self.assertEqual(kwargs["mc_kwargs"]["diagnostics_top_n"], 2)
 
             atoms_template = kwargs["atoms_template"]
             tags = np.asarray(atoms_template.get_tags(), dtype=int)

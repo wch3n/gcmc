@@ -90,7 +90,7 @@ Semantics:
 | Key | Workflows | Default | Meaning |
 | --- | --- | --- | --- |
 | `output_prefix` | `A-CMC`, `Ad-CMC`, `Ad-GCMC` | workflow-specific | Prefix used to derive `.traj`, `.dat`, `.pkl`, and accepted/attempted trajectory paths. |
-| `output_dir` | `A-PT`, `Ad-SCAN` | workflow-specific | Output directory used for replica exchange or scan outputs. |
+| `output_dir` | `A-CMC`, `A-PT`, `Ad-SCAN` | workflow-specific | Output directory used for CMC, replica exchange, or scan outputs. |
 | `checkpoint_file` | `A-PT` | `pt_state.pkl` | Top-level checkpoint file for alloy replica exchange. |
 | `stats_file` | `A-PT` | `replica_stats.csv` | Swap-level replica exchange statistics file. |
 | `results_file` | `A-PT` | `results.csv` | Per-cycle replica summary written by alloy replica exchange. |

@@ -195,6 +195,7 @@ These keys are passed to `LocalAdsorptionMotifAnalyzer`.
 | `surface_layer_tol`, `site_match_tol`, `support_xy_tol`, `termination_site_xy_tol`, `vertical_offset`, `termination_clearance` | Site-registry geometry controls. |
 | `local_cmc.moves.surface_clearance_A` / `adsorbate_surface_clearance_A` | Minimum z-side gap for local CMC/PT proposals. The default `0.0` rejects trial O/OH/OOH atoms that fall below the nearby top-surface envelope, or above the nearby bottom-surface envelope. |
 | `local_cmc.moves.surface_xy_tol_A` / `adsorbate_surface_xy_tol_A` | Lateral radius for the local CMC/PT surface-envelope filter. `null` uses `support_xy_tol`. |
+| `local_cmc.moves.orientation_filter` | Optional molecular orientation filter. `atom_indices` names adsorbate-template atoms that must remain above the anchor for `surface_side: top`; `min_z_above_anchor_A: 0.0` is useful for rejecting H-down OOH proposals. |
 
 ### `selection`
 
@@ -281,11 +282,12 @@ local adsorbate CMC samples constrained around a matched parent-state anchor.
 | `sequential.enabled` | Enables reaction-step-conditioned local CMC seed generation. Set `false` to disable all sequential rules, including automatic compatibility rules. |
 | `sequential.rules` | Ordered local transition rules. Each rule gives `source_state`, `target_state`, `builder`, and optional builder controls such as `n_orientations`. The built-in `ooh_from_o` builder regenerates OOH* seeds from locally sampled O* candidates and records generic parent metadata (`parent_state_dir`, `parent_state_candidate_id`, `transition_builder`) plus the legacy `parent_o_candidate_id`. |
 | `sequential_ooh_from_o`, `sequential_ooh_orientations` | Legacy OER shortcut for the `02_O -> 03_OOH` `ooh_from_o` rule. Existing configs remain valid. For new configs, prefer `sequential.rules`. |
-| `move_mode`, `site_hop_prob`, `reorientation_prob`, `hop_reorientation_prob`, `hop_puckering_prob`, `hop_puckering_reorientation_prob`, `puckering_prob`, `puckering_hop_prob`, `puckering_elements`, `puckering_height_A`, `puckering_height_jitter_A`, `max_puckering_trials`, `displacement_sigma`, `adsorbate_surface_clearance_A`, `adsorbate_surface_xy_tol_A` | Adsorbate CMC proposal controls. `hop_reorientation_prob` hops the anchor to a new registry site and then randomly reorients the molecule about that new anchor. `hop_puckering_reorientation_prob` additionally transfers the local puckering to the target atop metal. `puckering_height_A` is the target lift; `puckering_height_jitter_A` controls the uniform variation around it. |
+| `move_mode`, `site_hop_prob`, `reorientation_prob`, `hop_reorientation_prob`, `hop_puckering_prob`, `hop_puckering_reorientation_prob`, `puckering_prob`, `puckering_elements`, `puckering_height_A`, `puckering_height_jitter_A`, `max_puckering_trials`, `displacement_sigma`, `adsorbate_surface_clearance_A`, `adsorbate_surface_xy_tol_A`, `molecular_upright_atom_indices`, `molecular_upright_min_z_A` | Adsorbate CMC proposal controls. Molecular hop-family moves rebuild compatible molecules from the adsorbate template before placing them at the target site, so flipped or distorted current geometries are not propagated by later hops. `hop_puckering_reorientation_prob` transfers the coupled local-coordinate puckering to the target atop metal: the metal is placed at its reference lateral position plus the sampled lift, and the adsorbate anchor is reseated above it by `vertical_offset`. `puckering_height_A` is the target lift; `puckering_height_jitter_A` controls the uniform variation around it. |
 | `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
-| `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. Attempted trajectories contain valid trial moves after geometry filters, while rejected trajectories include invalid-filter rejects and Metropolis rejects. |
+| `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. Attempted trajectories contain every materialized trial structure before the shared filter/acceptance pipeline. Rejected trajectories include invalid-filter rejects and Metropolis rejects, with `Atoms.info` fields such as `mc_move_name`, `mc_event`, and `mc_reject_reason`. |
 | `write_attempted_traj`, `write_accepted_traj`, `write_rejected_traj` | Individually enable specific debug trajectory files. |
 | `debug_traj_interval` | Write only every Nth debug event to attempted/accepted/rejected trajectories. Defaults to `1`, which preserves the previous every-event behavior. |
+| `diagnostics.enabled`, `diagnostics.log`, `diagnostics.top_n` | Optional move diagnostics for local CMC/PT. Disabled by default. When enabled, returned worker stats/checkpoints include counters by move type and rejection reason; `log: true` also prints compact top counters at report intervals. |
 | `skip_existing` | If true, do not rerun CMC/PT for state blocks whose `local_cmc/done` marker exists. Existing local trajectories are still re-promoted into `candidates.traj` using the current `output_selection` and `max_output_candidates_per_state` settings when possible. |
 
 `local_cmc` also accepts grouped subsections. Grouped keys override the
@@ -327,6 +329,13 @@ local_cmc:
     mode: hybrid
     reorientation_prob: 0.1
     displacement_sigma: 0.2
+    orientation_filter:
+      atom_indices: [2]
+      min_z_above_anchor_A: 0.0
+    diagnostics:
+      enabled: false
+      log: false
+      top_n: 3
     hop:
       prob: 0.6
       reorient:

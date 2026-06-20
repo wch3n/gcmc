@@ -71,7 +71,6 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "hop_puckering_prob": 0.0,
     "hop_puckering_reorientation_prob": 0.0,
     "puckering_prob": 0.0,
-    "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
@@ -81,6 +80,8 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "hop_reorientation_angle_deg": 180.0,
     "adsorbate_surface_clearance_A": 0.0,
     "adsorbate_surface_xy_tol_A": None,
+    "molecular_upright_atom_indices": None,
+    "molecular_upright_min_z_A": None,
     "max_puckering_trials": None,
     "rotation_max_angle_deg": 35.0,
     "relax": False,
@@ -98,6 +99,9 @@ _DEFAULT_LOCAL_CMC_CONFIG = {
     "write_accepted_traj": False,
     "write_rejected_traj": False,
     "debug_traj_interval": 1,
+    "diagnostics_enabled": False,
+    "diagnostics_log": False,
+    "diagnostics_top_n": 3,
     "progress_log": None,
     "progress_stdout": True,
     "calculator": None,
@@ -195,13 +199,13 @@ class ReactionLocalCMCWorkflow:
                 "adsorbate_surface_clearance_A": "adsorbate_surface_clearance_A",
                 "surface_xy_tol_A": "adsorbate_surface_xy_tol_A",
                 "adsorbate_surface_xy_tol_A": "adsorbate_surface_xy_tol_A",
+                "molecular_upright_atom_indices": "molecular_upright_atom_indices",
+                "molecular_upright_min_z_A": "molecular_upright_min_z_A",
                 "rotation_max_angle_deg": "rotation_max_angle_deg",
             },
             "puckering": {
                 "prob": "puckering_prob",
                 "puckering_prob": "puckering_prob",
-                "hop_prob": "puckering_hop_prob",
-                "puckering_hop_prob": "puckering_hop_prob",
                 "elements": "puckering_elements",
                 "puckering_elements": "puckering_elements",
                 "height_A": "puckering_height_A",
@@ -239,8 +243,16 @@ class ReactionLocalCMCWorkflow:
                 "write_accepted_traj": "write_accepted_traj",
                 "write_rejected_traj": "write_rejected_traj",
                 "debug_traj_interval": "debug_traj_interval",
+                "diagnostics_enabled": "diagnostics_enabled",
+                "diagnostics_log": "diagnostics_log",
+                "diagnostics_top_n": "diagnostics_top_n",
                 "progress_log": "progress_log",
                 "progress_stdout": "progress_stdout",
+            },
+            "diagnostics": {
+                "enabled": "diagnostics_enabled",
+                "log": "diagnostics_log",
+                "top_n": "diagnostics_top_n",
             },
             "calculator": {
                 "calculator": "calculator",
@@ -859,9 +871,6 @@ class ReactionLocalCMCWorkflow:
                 self.local_config.get("hop_puckering_reorientation_prob", 0.0)
             ),
             puckering_prob=float(self.local_config.get("puckering_prob", 0.0)),
-            puckering_hop_prob=float(
-                self.local_config.get("puckering_hop_prob", 0.0)
-            ),
             puckering_elements=(
                 self._parse_element_list(self.local_config.get("puckering_elements"))
                 or tuple(self.config.site_elements)
@@ -904,6 +913,10 @@ class ReactionLocalCMCWorkflow:
                 if self.local_config.get("adsorbate_surface_xy_tol_A") is None
                 else float(self.local_config.get("adsorbate_surface_xy_tol_A", 0.0))
             ),
+            molecular_upright_atom_indices=self.local_config.get(
+                "molecular_upright_atom_indices"
+            ),
+            molecular_upright_min_z_A=self.local_config.get("molecular_upright_min_z_A"),
             termination_site_xy_tol=self.config.termination_site_xy_tol,
             surface_layer_tol=float(self.config.surface_layer_tol),
             termination_clearance=float(self.config.termination_clearance),
@@ -916,6 +929,11 @@ class ReactionLocalCMCWorkflow:
             accepted_traj_file=str(accepted_path) if accepted_path else None,
             rejected_traj_file=str(rejected_path) if rejected_path else None,
             debug_traj_interval=int(self.local_config.get("debug_traj_interval", 1)),
+            diagnostics_enabled=bool(
+                self.local_config.get("diagnostics_enabled", False)
+            ),
+            diagnostics_log=bool(self.local_config.get("diagnostics_log", False)),
+            diagnostics_top_n=int(self.local_config.get("diagnostics_top_n", 3)),
             thermo_file=str(thermo_path),
             checkpoint_file=str(checkpoint_path),
             checkpoint_interval=int(self.local_config.get("checkpoint_interval", 0)),
@@ -1124,9 +1142,6 @@ class ReactionLocalCMCWorkflow:
                 self.local_config.get("hop_puckering_reorientation_prob", 0.0)
             ),
             "puckering_prob": float(self.local_config.get("puckering_prob", 0.0)),
-            "puckering_hop_prob": float(
-                self.local_config.get("puckering_hop_prob", 0.0)
-            ),
             "puckering_elements": (
                 self._parse_element_list(self.local_config.get("puckering_elements"))
                 or tuple(self.config.site_elements)
@@ -1169,6 +1184,12 @@ class ReactionLocalCMCWorkflow:
                 if self.local_config.get("adsorbate_surface_xy_tol_A") is None
                 else float(self.local_config.get("adsorbate_surface_xy_tol_A", 0.0))
             ),
+            "molecular_upright_atom_indices": self.local_config.get(
+                "molecular_upright_atom_indices"
+            ),
+            "molecular_upright_min_z_A": self.local_config.get(
+                "molecular_upright_min_z_A"
+            ),
             "termination_site_xy_tol": self.config.termination_site_xy_tol,
             "surface_layer_tol": float(self.config.surface_layer_tol),
             "termination_clearance": float(self.config.termination_clearance),
@@ -1177,6 +1198,11 @@ class ReactionLocalCMCWorkflow:
             "relax_steps": int(self.local_config.get("relax_steps", 20)),
             "fmax": float(self.local_config.get("fmax", 0.05)),
             "debug_traj_interval": int(self.local_config.get("debug_traj_interval", 1)),
+            "diagnostics_enabled": bool(
+                self.local_config.get("diagnostics_enabled", False)
+            ),
+            "diagnostics_log": bool(self.local_config.get("diagnostics_log", False)),
+            "diagnostics_top_n": int(self.local_config.get("diagnostics_top_n", 3)),
             "checkpoint_interval": 0,
             "enable_hybrid_md": bool(self.local_config.get("enable_hybrid_md", False)),
             "md_move_prob": float(self.local_config.get("md_move_prob", 0.05)),

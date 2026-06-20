@@ -159,6 +159,8 @@ class _RayReplicaActor:
 
             if data.get("e_old") is not None:
                 sim.e_old = data["e_old"]
+            else:
+                sim.e_old = sim.get_potential_energy()
             if "rng_state" in data and data["rng_state"] is not None:
                 sim.rng.bit_generator.state = data["rng_state"]
             sim.sweep = data["sweep"]

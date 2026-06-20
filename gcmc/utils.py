@@ -12,6 +12,7 @@ import os
 import numpy as np
 from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 from ase import Atom, Atoms
+from ase.data import atomic_masses, atomic_numbers
 from ase.geometry import find_mic, get_distances
 from ase.io import read
 from ase.symbols import string2symbols
@@ -918,7 +919,10 @@ def _load_adsorbate_template(
         return adsorbate.copy()
     if isinstance(adsorbate, str):
         if os.path.exists(adsorbate):
-            return read(adsorbate)
+            try:
+                return read(adsorbate)
+            except Exception:
+                return read(adsorbate, format="vasp")
         symbols = string2symbols(adsorbate)
         if len(symbols) != 1:
             raise ValueError(
@@ -928,12 +932,63 @@ def _load_adsorbate_template(
     raise TypeError("adsorbate must be an ASE Atoms object or a string.")
 
 
+def _adsorbate_anchor_reference_position(
+    adsorbate_template: Atoms,
+    *,
+    anchor_index: int,
+    anchor_mode: str = "atom",
+    anchor_atom_indices: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    mode = str(anchor_mode or "atom").strip().lower().replace("-", "_")
+    aliases = {
+        "index": "atom",
+        "atom_index": "atom",
+        "com": "center_of_mass",
+        "center": "center_of_mass",
+        "center_of_geometry": "centroid",
+        "midpoint": "centroid",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"atom", "center_of_mass", "centroid"}:
+        raise ValueError("anchor_mode must be 'atom', 'center_of_mass', or 'centroid'.")
+    if mode == "atom":
+        indices = (int(anchor_index),)
+    elif anchor_atom_indices is None:
+        indices = tuple(range(len(adsorbate_template)))
+    else:
+        indices = tuple(int(idx) for idx in anchor_atom_indices)
+    if not indices:
+        raise ValueError("anchor_atom_indices must not be empty.")
+    for idx in indices:
+        if not (0 <= idx < len(adsorbate_template)):
+            raise ValueError("anchor_atom_indices entries are out of range.")
+
+    positions = np.asarray(adsorbate_template.get_positions(), dtype=float)
+    if mode == "atom":
+        return positions[int(anchor_index)].copy()
+    selected = positions[np.asarray(indices, dtype=int)]
+    if mode == "centroid":
+        return np.mean(selected, axis=0)
+    masses = np.asarray(
+        [
+            atomic_masses[atomic_numbers[adsorbate_template[int(idx)].symbol]]
+            for idx in indices
+        ],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(masses)) or float(np.sum(masses)) <= 0.0:
+        return np.mean(selected, axis=0)
+    return np.average(selected, axis=0, weights=masses)
+
+
 def place_adsorbate_on_site(
     atoms: Atoms,
     adsorbate: Union[str, Atoms],
     site: Dict[str, object],
     *,
     anchor_index: int = 0,
+    anchor_mode: str = "atom",
+    anchor_atom_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[Atoms, np.ndarray]:
     """
     Place one adsorbate on a specific site-registry entry.
@@ -942,7 +997,9 @@ def place_adsorbate_on_site(
         atoms: Base slab structure.
         adsorbate: Monoatomic symbol or ASE adsorbate template.
         site: One row from ``build_surface_site_registry(...)``.
-        anchor_index: Anchor atom index within the adsorbate template.
+        anchor_index: Real anchor atom index within the adsorbate template.
+        anchor_mode: Site anchor definition: atom, center_of_mass, or centroid.
+        anchor_atom_indices: Template atom indices used by center anchors.
 
     Returns:
         Tuple of:
@@ -958,6 +1015,22 @@ def place_adsorbate_on_site(
         raise ValueError("Selected site does not define a finite adsorption height.")
 
     atoms_new = atoms.copy()
+    support_indices = np.asarray(site.get("support_indices", ()), dtype=int)
+    support_indices = support_indices[
+        (support_indices >= 0) & (support_indices < len(atoms_new))
+    ]
+    if support_indices.size > 0:
+        anchor_z = float(site.get("anchor_z_A", np.nan))
+        if np.isfinite(anchor_z):
+            vertical_offset = suggested_z - anchor_z
+        else:
+            vertical_offset = 0.0
+        side = str(site.get("surface_side", "top")).lower()
+        if side == "bottom":
+            support_z = float(np.min(atoms_new.positions[support_indices, 2]))
+        else:
+            support_z = float(np.max(atoms_new.positions[support_indices, 2]))
+        suggested_z = support_z + float(vertical_offset)
     anchor_pos = np.array(
         [
             float(site["xy"][0]),
@@ -968,7 +1041,12 @@ def place_adsorbate_on_site(
     )
     relative = (
         adsorbate_template.get_positions()
-        - adsorbate_template.positions[int(anchor_index)].copy()
+        - _adsorbate_anchor_reference_position(
+            adsorbate_template,
+            anchor_index=int(anchor_index),
+            anchor_mode=anchor_mode,
+            anchor_atom_indices=anchor_atom_indices,
+        )
     )
     for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
         atoms_new.append(Atom(symbol, anchor_pos + rel))
@@ -1023,6 +1101,8 @@ def initialize_surface_adsorbates(
     termination_elements: Sequence[str] = (),
     min_termination_dist: float = 0.75,
     anchor_index: int = 0,
+    anchor_mode: str = "atom",
+    anchor_atom_indices: Optional[Sequence[int]] = None,
     seed: int = 42,
 ) -> Tuple[Atoms, np.ndarray, np.ndarray]:
     """
@@ -1094,6 +1174,8 @@ def initialize_surface_adsorbates(
             adsorbate_template,
             site,
             anchor_index=anchor_index,
+            anchor_mode=anchor_mode,
+            anchor_atom_indices=anchor_atom_indices,
         )
         stop = len(atoms_new)
         group_tag = ADSORBATE_TAG_OFFSET + next_group_id

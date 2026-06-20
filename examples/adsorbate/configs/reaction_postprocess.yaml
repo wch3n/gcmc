@@ -102,7 +102,6 @@ local_cmc:
     displacement_sigma: 0.2
     puckering:
       prob: 0.0
-      hop_prob: 0.0
       elements: null
       height_A: 0.15
   md:

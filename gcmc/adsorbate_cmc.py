@@ -2,13 +2,13 @@ import logging
 import numpy as np
 import os
 import pickle
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 from ase import Atoms
 from ase import units
 from ase.build import make_supercell
 from ase.constraints import FixCartesian
-from ase.data import atomic_numbers, covalent_radii
+from ase.data import atomic_masses, atomic_numbers, covalent_radii
 from ase.geometry import get_distances
 from ase.io import Trajectory, read, write
 from ase.md.langevin import Langevin
@@ -18,6 +18,7 @@ from ase.symbols import string2symbols
 
 from .base import SurfaceMCBase
 from .constants import ADSORBATE_TAG_OFFSET, KB_EV_PER_K
+from .adsorbate_move_proposals import AdsorbateMoveProposalMixin, MoveProposal
 from .utils import (
     _select_site_layers_for_coverage,
     build_surface_site_registry,
@@ -36,7 +37,22 @@ def _load_adsorbate_template(
         return adsorbate.copy()
     if isinstance(adsorbate, str):
         if os.path.exists(adsorbate):
-            return read(adsorbate)
+            try:
+                return read(adsorbate)
+            except Exception:
+                return read(adsorbate, format="vasp")
+        key = str(adsorbate).upper()
+        if key == "OH":
+            return Atoms("OH", positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 0.98)])
+        if key == "OOH":
+            return Atoms(
+                "OOH",
+                positions=[
+                    (0.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.46),
+                    (0.79, 0.0, 2.01),
+                ],
+            )
         symbols = string2symbols(adsorbate)
         if len(symbols) != 1:
             raise ValueError(
@@ -47,24 +63,72 @@ def _load_adsorbate_template(
     raise TypeError("adsorbate must be None, a chemical symbol/path string, or ASE Atoms.")
 
 
-def _rotation_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
-    axis = np.asarray(axis, dtype=float)
-    norm = np.linalg.norm(axis)
-    if norm <= 0.0:
-        return np.eye(3)
-    axis = axis / norm
-    x, y, z = axis
-    c = np.cos(angle)
-    s = np.sin(angle)
-    one_c = 1.0 - c
-    return np.array(
-        [
-            [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
-            [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
-            [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
-        ],
+def _normalize_anchor_mode(mode: object) -> str:
+    token = str(mode or "atom").strip().lower().replace("-", "_")
+    aliases = {
+        "index": "atom",
+        "atom_index": "atom",
+        "com": "center_of_mass",
+        "center": "center_of_mass",
+        "center_of_geometry": "centroid",
+        "midpoint": "centroid",
+    }
+    token = aliases.get(token, token)
+    if token not in {"atom", "center_of_mass", "centroid"}:
+        raise ValueError(
+            "adsorbate anchor mode must be 'atom', 'center_of_mass', or 'centroid'."
+        )
+    return token
+
+
+def _normalize_anchor_reference_indices(
+    *,
+    mode: str,
+    anchor_index: int,
+    atom_indices: Optional[Sequence[int]],
+    size: int,
+) -> tuple[int, ...]:
+    if mode == "atom":
+        indices = (int(anchor_index),)
+    elif atom_indices is None:
+        indices = tuple(range(size))
+    else:
+        indices = tuple(int(idx) for idx in atom_indices)
+    if not indices:
+        raise ValueError("adsorbate anchor atom_indices must not be empty.")
+    for idx in indices:
+        if not (0 <= idx < int(size)):
+            raise ValueError("adsorbate anchor atom_indices entries are out of range.")
+    return indices
+
+
+def _anchor_reference_position(
+    template: Atoms,
+    *,
+    mode: str,
+    anchor_index: int,
+    atom_indices: Optional[Sequence[int]] = None,
+) -> np.ndarray:
+    positions = np.asarray(template.get_positions(), dtype=float)
+    mode = _normalize_anchor_mode(mode)
+    indices = _normalize_anchor_reference_indices(
+        mode=mode,
+        anchor_index=int(anchor_index),
+        atom_indices=atom_indices,
+        size=len(template),
+    )
+    if mode == "atom":
+        return positions[int(anchor_index)].copy()
+    selected = positions[np.asarray(indices, dtype=int)]
+    if mode == "centroid":
+        return np.mean(selected, axis=0)
+    masses = np.asarray(
+        [atomic_masses[atomic_numbers[template[int(idx)].symbol]] for idx in indices],
         dtype=float,
     )
+    if not np.all(np.isfinite(masses)) or float(np.sum(masses)) <= 0.0:
+        return np.mean(selected, axis=0)
+    return np.average(selected, axis=0, weights=masses)
 
 
 def _normalize_site_types(
@@ -93,6 +157,8 @@ def _place_adsorbate_template(
     adsorbate_template: Atoms,
     *,
     anchor_index: int,
+    anchor_mode: str = "atom",
+    anchor_atom_indices: Optional[Sequence[int]] = None,
     site_registry: Sequence[Dict[str, object]],
     coverage: float,
     seed: int,
@@ -101,7 +167,12 @@ def _place_adsorbate_template(
     atoms_new = atoms.copy()
     relative = (
         adsorbate_template.get_positions()
-        - adsorbate_template.positions[anchor_index].copy()
+        - _anchor_reference_position(
+            adsorbate_template,
+            mode=anchor_mode,
+            anchor_index=int(anchor_index),
+            atom_indices=anchor_atom_indices,
+        )
     )
     candidate_sites = [
         row
@@ -117,18 +188,34 @@ def _place_adsorbate_template(
     if len(tags) != len(atoms_new):
         tags = np.zeros(len(atoms_new), dtype=int)
 
+    def _anchor_position_from_site(site: Dict[str, object]) -> np.ndarray:
+        support_indices = np.asarray(site.get("support_indices", ()), dtype=int)
+        support_indices = support_indices[
+            (support_indices >= 0) & (support_indices < len(atoms_new))
+        ]
+        if support_indices.size > 0:
+            side = str(site.get("surface_side", "top")).lower()
+            if side == "bottom":
+                support_z = float(np.min(atoms_new.positions[support_indices, 2]))
+            else:
+                support_z = float(np.max(atoms_new.positions[support_indices, 2]))
+            suggested_z = support_z + float(site["suggested_z_A"] - site["anchor_z_A"])
+        else:
+            suggested_z = float(site["suggested_z_A"])
+        return np.array(
+            [
+                float(site["xy"][0]),
+                float(site["xy"][1]),
+                suggested_z,
+            ],
+            dtype=float,
+        )
+
     group_id = 0
     for layer_indices in _select_site_layers_for_coverage(n_sites, coverage, rng):
         for site_idx in np.asarray(layer_indices, dtype=int):
             site = candidate_sites[int(site_idx)]
-            anchor_pos = np.array(
-                [
-                    float(site["xy"][0]),
-                    float(site["xy"][1]),
-                    float(site["suggested_z_A"]),
-                ],
-                dtype=float,
-            )
+            anchor_pos = _anchor_position_from_site(site)
 
             group_tag = ADSORBATE_TAG_OFFSET + group_id
             for symbol, rel in zip(adsorbate_template.get_chemical_symbols(), relative):
@@ -141,7 +228,7 @@ def _place_adsorbate_template(
     return atoms_new
 
 
-class AdsorbateCMC(SurfaceMCBase):
+class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
     """
     Canonical Monte Carlo for fixed-loading adsorbates on a surface.
 
@@ -166,6 +253,9 @@ class AdsorbateCMC(SurfaceMCBase):
         adsorbate_element: str = "H",
         adsorbate: Optional[Union[str, Atoms]] = None,
         adsorbate_anchor_index: int = 0,
+        adsorbate_anchor_mode: str = "atom",
+        adsorbate_anchor_atom_indices: Optional[Sequence[int]] = None,
+        adsorbate_template_library: Optional[Sequence[Dict[str, object]]] = None,
         substrate_elements: Tuple[str, ...] = ("Ti", "C"),
         functional_elements: Optional[Tuple[str, ...]] = None,
         top_layer_element: Optional[str] = None,
@@ -182,7 +272,6 @@ class AdsorbateCMC(SurfaceMCBase):
         hop_puckering_prob: float = 0.0,
         hop_puckering_reorientation_prob: float = 0.0,
         puckering_prob: float = 0.0,
-        puckering_hop_prob: float = 0.0,
         puckering_elements: Optional[Union[str, Sequence[str]]] = None,
         puckering_height_A: float = 0.15,
         puckering_height_jitter_A: Optional[float] = None,
@@ -217,6 +306,9 @@ class AdsorbateCMC(SurfaceMCBase):
         rejected_traj_file: Optional[str] = None,
         attempted_traj_file: Optional[str] = None,
         debug_traj_interval: int = 1,
+        diagnostics_enabled: bool = False,
+        diagnostics_log: bool = False,
+        diagnostics_top_n: int = 3,
         thermo_file: str = "adsorbate_cmc.dat",
         checkpoint_file: str = "adsorbate_cmc.pkl",
         checkpoint_interval: int = 100,
@@ -237,6 +329,8 @@ class AdsorbateCMC(SurfaceMCBase):
         enforce_molecular_integrity: bool = True,
         molecular_bond_stretch_factor: float = 1.35,
         molecular_bond_abs_tol: float = 0.35,
+        molecular_upright_atom_indices: Optional[Sequence[int]] = None,
+        molecular_upright_min_z_A: Optional[float] = None,
         site_region_center_A: Optional[Sequence[float]] = None,
         site_region_radius_A: Optional[float] = None,
         site_region_distance_metric: str = "xy",
@@ -264,6 +358,13 @@ class AdsorbateCMC(SurfaceMCBase):
         if not (0 <= int(adsorbate_anchor_index) < len(self.adsorbate_template)):
             raise ValueError("adsorbate_anchor_index is out of range for the adsorbate template.")
         self.adsorbate_anchor_index = int(adsorbate_anchor_index)
+        self.adsorbate_anchor_mode = _normalize_anchor_mode(adsorbate_anchor_mode)
+        self.adsorbate_anchor_reference_indices = _normalize_anchor_reference_indices(
+            mode=self.adsorbate_anchor_mode,
+            anchor_index=self.adsorbate_anchor_index,
+            atom_indices=adsorbate_anchor_atom_indices,
+            size=len(self.adsorbate_template),
+        )
         self.adsorbate_size = len(self.adsorbate_template)
         self.is_molecular_adsorbate = self.adsorbate_size > 1
         self.adsorbate_anchor_symbol = self.adsorbate_template[
@@ -271,6 +372,9 @@ class AdsorbateCMC(SurfaceMCBase):
         ].symbol
         self.adsorbate_symbols = tuple(self.adsorbate_template.get_chemical_symbols())
         self._adsorbate_symbol_signature = tuple(sorted(self.adsorbate_symbols))
+        self.adsorbate_template_library = self._normalize_template_library(
+            adsorbate_template_library
+        )
         self.allow_ambiguous_empty_adsorbates = bool(
             allow_ambiguous_empty_adsorbates
         )
@@ -330,14 +434,12 @@ class AdsorbateCMC(SurfaceMCBase):
             "hop_puckering",
             "hop_puckering_reorientation",
             "puckering",
-            "puckering_hop",
             "hybrid",
         ):
             raise ValueError(
                 "move_mode must be 'displacement', 'site_hop', 'reorientation', "
                 "'hop_reorientation', 'hop_puckering', "
-                "'hop_puckering_reorientation', 'puckering', 'puckering_hop', "
-                "or 'hybrid'."
+                "'hop_puckering_reorientation', 'puckering', or 'hybrid'."
             )
         if not (0.0 <= site_hop_prob <= 1.0):
             raise ValueError("site_hop_prob must be in [0, 1].")
@@ -351,8 +453,6 @@ class AdsorbateCMC(SurfaceMCBase):
             raise ValueError("hop_puckering_reorientation_prob must be in [0, 1].")
         if not (0.0 <= puckering_prob <= 1.0):
             raise ValueError("puckering_prob must be in [0, 1].")
-        if not (0.0 <= puckering_hop_prob <= 1.0):
-            raise ValueError("puckering_hop_prob must be in [0, 1].")
         if move_mode == "hybrid" and (
             site_hop_prob
             + reorientation_prob
@@ -360,13 +460,11 @@ class AdsorbateCMC(SurfaceMCBase):
             + hop_puckering_prob
             + hop_puckering_reorientation_prob
             + puckering_prob
-            + puckering_hop_prob
         ) > 1.0:
             raise ValueError(
                 "For move_mode='hybrid', site_hop_prob + reorientation_prob "
                 "+ hop_reorientation_prob + hop_puckering_prob "
-                "+ hop_puckering_reorientation_prob + puckering_prob "
-                "+ puckering_hop_prob must be <= 1."
+                "+ hop_puckering_reorientation_prob + puckering_prob must be <= 1."
             )
         if puckering_height_A < 0.0:
             raise ValueError("puckering_height_A must be >= 0.")
@@ -466,7 +564,6 @@ class AdsorbateCMC(SurfaceMCBase):
             hop_puckering_reorientation_prob
         )
         self.puckering_prob = float(puckering_prob)
-        self.puckering_hop_prob = float(puckering_hop_prob)
         self.puckering_height_A = float(puckering_height_A)
         self.puckering_height_jitter_A = (
             0.1 * self.puckering_height_A
@@ -522,6 +619,11 @@ class AdsorbateCMC(SurfaceMCBase):
         self.debug_traj_interval = int(debug_traj_interval)
         if self.debug_traj_interval < 1:
             raise ValueError("debug_traj_interval must be >= 1.")
+        self.diagnostics_enabled = bool(diagnostics_enabled)
+        self.diagnostics_log = bool(diagnostics_log)
+        self.diagnostics_top_n = int(diagnostics_top_n)
+        if self.diagnostics_top_n < 1:
+            raise ValueError("diagnostics_top_n must be >= 1.")
         self.thermo_file = thermo_file
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
@@ -564,6 +666,22 @@ class AdsorbateCMC(SurfaceMCBase):
             raise ValueError("molecular_bond_stretch_factor must be > 1.")
         if self.molecular_bond_abs_tol < 0.0:
             raise ValueError("molecular_bond_abs_tol must be >= 0.")
+        if molecular_upright_min_z_A is not None:
+            molecular_upright_min_z_A = float(molecular_upright_min_z_A)
+        if molecular_upright_atom_indices is None:
+            upright_indices: Tuple[int, ...] = ()
+        else:
+            upright_indices = tuple(int(idx) for idx in molecular_upright_atom_indices)
+            for idx in upright_indices:
+                if not (0 <= idx < self.adsorbate_size):
+                    raise ValueError(
+                        "molecular_upright_atom_indices entries must be valid "
+                        "adsorbate template indices."
+                    )
+                if idx == self.adsorbate_anchor_index:
+                    raise ValueError(
+                        "molecular_upright_atom_indices must not include the anchor index."
+                    )
         if self.md_accept_mode == "hamiltonian":
             if self.md_ensemble != "nve":
                 raise ValueError(
@@ -574,6 +692,10 @@ class AdsorbateCMC(SurfaceMCBase):
                     "md_accept_mode='hamiltonian' requires md_init_momenta=True."
                 )
         self._template_bond_limits = self._build_template_bond_limits()
+        self.molecular_upright_atom_indices = upright_indices
+        self.molecular_upright_min_z_A = (
+            0.0 if molecular_upright_min_z_A is None else molecular_upright_min_z_A
+        )
         self._hybrid_move_table = self._build_hybrid_move_table()
 
         self._update_indices()
@@ -584,6 +706,7 @@ class AdsorbateCMC(SurfaceMCBase):
         self.total_moves = 0
         self.md_attempted_moves = 0
         self.md_accepted_moves = 0
+        self.move_diagnostics = self._empty_move_diagnostics()
         self.sweep = 0
         self._resumed_from_checkpoint = False
 
@@ -592,6 +715,164 @@ class AdsorbateCMC(SurfaceMCBase):
 
         if resume:
             self._load_checkpoint()
+
+    def _normalize_template_library(
+        self,
+        library: Optional[Sequence[Dict[str, object]]],
+    ) -> list[dict[str, object]]:
+        if library is None:
+            raw_specs: list[dict[str, object]] = [
+                {
+                    "adsorbate": self.adsorbate_template.copy(),
+                    "anchor_index": self.adsorbate_anchor_index,
+                    "anchor_mode": self.adsorbate_anchor_mode,
+                    "anchor_atom_indices": self.adsorbate_anchor_reference_indices,
+                    "weight": 1.0,
+                    "name": "primary",
+                }
+            ]
+        else:
+            raw_specs = [dict(spec) for spec in library]
+            if not raw_specs:
+                raise ValueError("adsorbate_template_library must not be empty.")
+
+        specs: list[dict[str, object]] = []
+        total_weight = 0.0
+        for spec_id, raw in enumerate(raw_specs):
+            template_value = raw.get("adsorbate", raw.get("template", raw.get("path")))
+            if template_value is None:
+                raise ValueError("Each adsorbate template library entry needs adsorbate/template/path.")
+            template = _load_adsorbate_template(template_value, self.adsorbate_anchor_symbol)
+            if len(template) != self.adsorbate_size:
+                raise ValueError("All adsorbate templates must have the same number of atoms.")
+            symbols = tuple(template.get_chemical_symbols())
+            if symbols != self.adsorbate_symbols:
+                raise ValueError(
+                    "All adsorbate templates must use the same atom ordering as the primary template."
+                )
+
+            anchor_index = int(raw.get("anchor_index", self.adsorbate_anchor_index))
+            if not (0 <= anchor_index < len(template)):
+                raise ValueError("adsorbate template anchor_index is out of range.")
+            anchor_cfg = raw.get("anchor", None)
+            anchor_mode = raw.get("anchor_mode", self.adsorbate_anchor_mode)
+            anchor_atom_indices = raw.get(
+                "anchor_atom_indices",
+                raw.get("atom_indices", None),
+            )
+            if isinstance(anchor_cfg, dict):
+                anchor_index = int(
+                    anchor_cfg.get(
+                        "reference_atom_index",
+                        anchor_cfg.get("atom_index", anchor_index),
+                    )
+                )
+                if not (0 <= anchor_index < len(template)):
+                    raise ValueError("adsorbate template anchor atom index is out of range.")
+                anchor_mode = anchor_cfg.get("mode", anchor_mode)
+                anchor_atom_indices = anchor_cfg.get(
+                    "atom_indices",
+                    anchor_cfg.get("indices", anchor_atom_indices),
+                )
+
+            anchor_mode = _normalize_anchor_mode(anchor_mode)
+            anchor_atom_indices = _normalize_anchor_reference_indices(
+                mode=anchor_mode,
+                anchor_index=anchor_index,
+                atom_indices=anchor_atom_indices,
+                size=len(template),
+            )
+            weight = float(raw.get("weight", 1.0))
+            if weight < 0.0:
+                raise ValueError("adsorbate template weights must be non-negative.")
+            total_weight += weight
+            ref_pos = _anchor_reference_position(
+                template,
+                mode=anchor_mode,
+                anchor_index=anchor_index,
+                atom_indices=anchor_atom_indices,
+            )
+            atom_ref = np.asarray(template.positions[anchor_index], dtype=float)
+            specs.append(
+                {
+                    "id": int(spec_id),
+                    "name": str(raw.get("name", f"template{spec_id:03d}")),
+                    "template": template.copy(),
+                    "anchor_index": anchor_index,
+                    "anchor_mode": anchor_mode,
+                    "anchor_atom_indices": tuple(anchor_atom_indices),
+                    "weight": weight,
+                    "relative": np.asarray(template.get_positions(), dtype=float) - ref_pos,
+                    "atom_anchor_relative": np.asarray(template.get_positions(), dtype=float)
+                    - atom_ref,
+                }
+            )
+
+        if total_weight <= 0.0:
+            raise ValueError("At least one adsorbate template weight must be positive.")
+        for spec in specs:
+            spec["probability"] = float(spec["weight"]) / total_weight
+        return specs
+
+    def _template_match_rmsd(
+        self,
+        group: np.ndarray,
+        spec: dict[str, object],
+        atoms: Optional[Atoms] = None,
+    ) -> float:
+        if atoms is None:
+            atoms = self.atoms
+        group = np.asarray(group, dtype=int)
+        anchor_index = int(spec["anchor_index"])
+        if not (0 <= anchor_index < len(group)):
+            return float("inf")
+        anchor_idx = int(group[anchor_index])
+        current_rel = np.asarray(
+            atoms.get_distances(
+                anchor_idx,
+                group,
+                mic=True,
+                vector=True,
+            ),
+            dtype=float,
+        )
+        reference = np.asarray(spec["atom_anchor_relative"], dtype=float)
+        current_centered = current_rel - np.mean(current_rel, axis=0)
+        reference_centered = reference - np.mean(reference, axis=0)
+        try:
+            u, _, vt = np.linalg.svd(reference_centered.T @ current_centered)
+            rotation = u @ vt
+            if np.linalg.det(rotation) < 0.0:
+                u[:, -1] *= -1.0
+                rotation = u @ vt
+            aligned = reference_centered @ rotation
+            return float(np.sqrt(np.mean(np.sum((aligned - current_centered) ** 2, axis=1))))
+        except np.linalg.LinAlgError:
+            return float(np.sqrt(np.mean(np.sum((reference_centered - current_centered) ** 2, axis=1))))
+
+    def _template_spec_for_group(
+        self,
+        group: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> dict[str, object]:
+        if len(self.adsorbate_template_library) == 1:
+            return self.adsorbate_template_library[0]
+        scored = [
+            (self._template_match_rmsd(group, spec, atoms=atoms), spec)
+            for spec in self.adsorbate_template_library
+        ]
+        scored.sort(key=lambda item: item[0])
+        return scored[0][1]
+
+    def _sample_template_spec(self) -> dict[str, object]:
+        if len(self.adsorbate_template_library) == 1:
+            return self.adsorbate_template_library[0]
+        probabilities = np.asarray(
+            [float(spec["probability"]) for spec in self.adsorbate_template_library],
+            dtype=float,
+        )
+        idx = int(self.rng.choice(len(self.adsorbate_template_library), p=probabilities))
+        return self.adsorbate_template_library[idx]
 
     def _group_anchor_local_index(
         self, group: np.ndarray, atoms: Optional[Atoms] = None
@@ -624,21 +905,158 @@ class AdsorbateCMC(SurfaceMCBase):
     ) -> int:
         return int(group[self._group_anchor_local_index(group, atoms=atoms)])
 
-    def _current_group_relative_positions(
-        self, group: np.ndarray, atoms: Optional[Atoms] = None
+    def _group_anchor_position(
+        self,
+        group: np.ndarray,
+        atoms: Optional[Atoms] = None,
+        *,
+        spec: Optional[dict[str, object]] = None,
     ) -> np.ndarray:
         if atoms is None:
             atoms = self.atoms
-        anchor_idx = self._anchor_index_for_group(group, atoms=atoms)
-        return np.asarray(
+        group = np.asarray(group, dtype=int)
+        if spec is None:
+            spec = self._template_spec_for_group(group, atoms=atoms)
+
+        anchor_local = int(spec["anchor_index"])
+        anchor_idx = int(group[anchor_local])
+        mode = str(spec["anchor_mode"])
+        ref_indices = tuple(int(idx) for idx in spec["anchor_atom_indices"])
+        if mode == "atom":
+            return np.asarray(atoms.positions[anchor_idx], dtype=float).copy()
+
+        vectors = np.asarray(
             atoms.get_distances(
                 anchor_idx,
-                np.asarray(group, dtype=int),
+                group[np.asarray(ref_indices, dtype=int)],
                 mic=True,
                 vector=True,
             ),
             dtype=float,
         )
+        unwrapped = np.asarray(atoms.positions[anchor_idx], dtype=float) + vectors
+        if mode == "centroid":
+            return np.mean(unwrapped, axis=0)
+        masses = np.asarray(
+            [atomic_masses[atomic_numbers[atoms[int(group[idx])].symbol]] for idx in ref_indices],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(masses)) or float(np.sum(masses)) <= 0.0:
+            return np.mean(unwrapped, axis=0)
+        return np.average(unwrapped, axis=0, weights=masses)
+
+    def _current_group_relative_positions(
+        self, group: np.ndarray, atoms: Optional[Atoms] = None
+    ) -> np.ndarray:
+        if atoms is None:
+            atoms = self.atoms
+        group = np.asarray(group, dtype=int)
+        spec = self._template_spec_for_group(group, atoms=atoms)
+        anchor_local = int(spec["anchor_index"])
+        anchor_idx = int(group[anchor_local])
+        vectors = np.asarray(
+            atoms.get_distances(
+                anchor_idx,
+                group,
+                mic=True,
+                vector=True,
+            ),
+            dtype=float,
+        )
+        unwrapped = np.asarray(atoms.positions[anchor_idx], dtype=float) + vectors
+        return unwrapped - self._group_anchor_position(group, atoms=atoms, spec=spec)
+
+    def _template_group_relative_positions(
+        self, group: np.ndarray, atoms: Optional[Atoms] = None
+    ) -> np.ndarray:
+        """Return template-relative adsorbate coordinates for compatible groups."""
+
+        if atoms is None:
+            atoms = self.atoms
+        group = np.asarray(group, dtype=int)
+        if len(group) != self.adsorbate_size:
+            return self._current_group_relative_positions(group, atoms=atoms)
+
+        group_symbols = tuple(atoms[int(i)].symbol for i in group)
+        if group_symbols != self.adsorbate_symbols:
+            return self._current_group_relative_positions(group, atoms=atoms)
+
+        template_positions = np.asarray(
+            self.adsorbate_template.get_positions(),
+            dtype=float,
+        )
+        spec = self._template_spec_for_group(group, atoms=atoms)
+        return np.asarray(spec["relative"], dtype=float).copy()
+
+    def _sample_template_group_relative_positions(self) -> np.ndarray:
+        spec = self._sample_template_spec()
+        return np.asarray(spec["relative"], dtype=float).copy()
+
+    def _molecular_move_relative_positions(
+        self,
+        group: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> np.ndarray:
+        if self.is_molecular_adsorbate:
+            return self._template_group_relative_positions(group, atoms=atoms)
+        return self._current_group_relative_positions(group, atoms=atoms)
+
+    def _group_orientation_is_valid(
+        self,
+        group: np.ndarray,
+        trial_positions: np.ndarray,
+        atoms: Optional[Atoms] = None,
+    ) -> bool:
+        if not self.molecular_upright_atom_indices:
+            return True
+        if atoms is None:
+            atoms = self.atoms
+
+        group = np.asarray(group, dtype=int)
+        trial_positions = np.asarray(trial_positions, dtype=float)
+        if len(group) != self.adsorbate_size or len(trial_positions) != len(group):
+            return True
+        group_symbols = tuple(atoms[int(i)].symbol for i in group)
+        if group_symbols != self.adsorbate_symbols:
+            return True
+
+        anchor_local = self._group_anchor_local_index(group, atoms=atoms)
+        side_sign = 1.0 if self.surface_side == "top" else -1.0
+        spec = self._template_spec_for_group(group, atoms=atoms)
+        if str(spec["anchor_mode"]) == "atom":
+            anchor_z = float(trial_positions[anchor_local, 2])
+        else:
+            ref_indices = np.asarray(spec["anchor_atom_indices"], dtype=int)
+            if str(spec["anchor_mode"]) == "centroid":
+                anchor_z = float(np.mean(trial_positions[ref_indices, 2]))
+            else:
+                weights = np.asarray(
+                    [
+                        atomic_masses[atomic_numbers[atoms[int(group[idx])].symbol]]
+                        for idx in ref_indices
+                    ],
+                    dtype=float,
+                )
+                anchor_z = float(np.average(trial_positions[ref_indices, 2], weights=weights))
+        min_gap = float(self.molecular_upright_min_z_A) - 1e-12
+        for local_idx in self.molecular_upright_atom_indices:
+            gap = side_sign * (float(trial_positions[int(local_idx), 2]) - anchor_z)
+            if gap < min_gap:
+                return False
+        return True
+
+    def _molecular_orientations_are_valid(self, atoms: Atoms) -> bool:
+        if not self.molecular_upright_atom_indices:
+            return True
+        for group in self._adsorbate_groups_for_atoms(atoms):
+            group = np.asarray(group, dtype=int)
+            if not self._group_orientation_is_valid(
+                group,
+                atoms.positions[group],
+                atoms=atoms,
+            ):
+                return False
+        return True
 
     def _adsorbate_groups_for_atoms(self, atoms: Atoms) -> list[np.ndarray]:
         if atoms is self.atoms:
@@ -781,6 +1199,8 @@ class AdsorbateCMC(SurfaceMCBase):
         adsorbate_element: str = "H",
         adsorbate: Optional[Union[str, Atoms]] = None,
         adsorbate_anchor_index: int = 0,
+        adsorbate_anchor_mode: str = "atom",
+        adsorbate_anchor_atom_indices: Optional[Sequence[int]] = None,
         substrate_elements: Tuple[str, ...] = ("Ti", "C"),
         top_layer_element: str = "Ti",
         site_elements: Optional[Union[str, Sequence[str]]] = None,
@@ -848,6 +1268,8 @@ class AdsorbateCMC(SurfaceMCBase):
             atoms,
             adsorbate_template,
             anchor_index=int(adsorbate_anchor_index),
+            anchor_mode=adsorbate_anchor_mode,
+            anchor_atom_indices=adsorbate_anchor_atom_indices,
             site_registry=site_registry,
             coverage=coverage,
             seed=seed,
@@ -862,6 +1284,8 @@ class AdsorbateCMC(SurfaceMCBase):
             adsorbate_element=adsorbate_element,
             adsorbate=adsorbate_template,
             adsorbate_anchor_index=adsorbate_anchor_index,
+            adsorbate_anchor_mode=adsorbate_anchor_mode,
+            adsorbate_anchor_atom_indices=adsorbate_anchor_atom_indices,
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
             top_layer_element=top_layer_element,
@@ -896,7 +1320,13 @@ class AdsorbateCMC(SurfaceMCBase):
             "sum_E": self.sum_E,
             "sum_E_sq": self.sum_E_sq,
             "n_samples": self.n_samples,
+            "accepted_moves": self.accepted_moves,
+            "total_moves": self.total_moves,
+            "md_attempted_moves": self.md_attempted_moves,
+            "md_accepted_moves": self.md_accepted_moves,
         }
+        if self.diagnostics_enabled:
+            state["move_diagnostics"] = self.move_diagnostics
         with open(self.checkpoint_file, "wb") as handle:
             pickle.dump(state, handle)
 
@@ -917,6 +1347,18 @@ class AdsorbateCMC(SurfaceMCBase):
         self.sum_E = state.get("sum_E", 0.0)
         self.sum_E_sq = state.get("sum_E_sq", 0.0)
         self.n_samples = state.get("n_samples", 0)
+        self.accepted_moves = int(state.get("accepted_moves", self.accepted_moves))
+        self.total_moves = int(state.get("total_moves", self.total_moves))
+        self.md_attempted_moves = int(
+            state.get("md_attempted_moves", self.md_attempted_moves)
+        )
+        self.md_accepted_moves = int(
+            state.get("md_accepted_moves", self.md_accepted_moves)
+        )
+        if self.diagnostics_enabled:
+            self.move_diagnostics = self._normalize_move_diagnostics(
+                state.get("move_diagnostics", self.move_diagnostics)
+            )
         self._site_registry = None
         self._update_indices()
         self._resumed_from_checkpoint = True
@@ -928,6 +1370,18 @@ class AdsorbateCMC(SurfaceMCBase):
         if beta is None:
             beta = 1.0 / (KB_EV_PER_K * self.T)
         return self.rng.random() < np.exp(-delta_e * beta)
+
+    def _metropolis_acceptance_probability(
+        self,
+        delta_e: float,
+        *,
+        beta: Optional[float] = None,
+    ) -> float:
+        if delta_e <= 0.0:
+            return 1.0
+        if beta is None:
+            beta = 1.0 / (KB_EV_PER_K * self.T)
+        return float(np.exp(-float(delta_e) * float(beta)))
 
     def _build_template_bond_limits(self) -> list[tuple[int, int, float]]:
         if not self.is_molecular_adsorbate:
@@ -988,6 +1442,78 @@ class AdsorbateCMC(SurfaceMCBase):
             )
             for group in groups
         )
+
+    def _empty_move_diagnostics(self) -> Dict[str, Dict[str, int]]:
+        return {
+            "attempted_by_move": {},
+            "accepted_by_move": {},
+            "rejected_by_move": {},
+            "rejected_by_reason": {},
+            "rejected_by_move_reason": {},
+        }
+
+    def _normalize_move_diagnostics(self, value: object) -> Dict[str, Dict[str, int]]:
+        diagnostics = self._empty_move_diagnostics()
+        if not isinstance(value, dict):
+            return diagnostics
+        for key in diagnostics:
+            raw = value.get(key, {})
+            if isinstance(raw, dict):
+                diagnostics[key] = {str(k): int(v) for k, v in raw.items()}
+        return diagnostics
+
+    def _increment_diagnostic(self, section: str, key: str) -> None:
+        if not self.diagnostics_enabled:
+            return
+        bucket = self.move_diagnostics.setdefault(section, {})
+        bucket[str(key)] = int(bucket.get(str(key), 0)) + 1
+
+    def _record_attempted_proposal(self, proposal: MoveProposal) -> None:
+        self._increment_diagnostic("attempted_by_move", proposal.move_name)
+
+    def _record_accepted_proposal(self, proposal: MoveProposal) -> None:
+        self._increment_diagnostic("accepted_by_move", proposal.move_name)
+
+    def _record_rejected_proposal(
+        self,
+        proposal: MoveProposal,
+        reason: str,
+    ) -> None:
+        reason = str(reason)
+        self._increment_diagnostic("rejected_by_move", proposal.move_name)
+        self._increment_diagnostic("rejected_by_reason", reason)
+        self._increment_diagnostic(
+            "rejected_by_move_reason",
+            f"{proposal.move_name}:{reason}",
+        )
+
+    def _top_diagnostics(self, section: str, *, limit: int = 3) -> str:
+        if not self.diagnostics_enabled:
+            return "disabled"
+        bucket = self.move_diagnostics.get(section, {})
+        if not bucket:
+            return "none"
+        items = sorted(bucket.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        return ",".join(f"{key}={value}" for key, value in items[:limit])
+
+    def _diagnostics_log_suffix(self) -> str:
+        if not (self.diagnostics_enabled and self.diagnostics_log):
+            return ""
+        top_n = int(self.diagnostics_top_n)
+        return (
+            f" | Moves: {self._top_diagnostics('attempted_by_move', limit=top_n)}"
+            f" | Rejects: {self._top_diagnostics('rejected_by_reason', limit=top_n)}"
+        )
+
+    def _diagnostic_stats(self) -> Dict[str, Dict[str, int]]:
+        if not self.diagnostics_enabled:
+            return self._empty_move_diagnostics()
+        return {
+            key: dict(value)
+            for key, value in self._normalize_move_diagnostics(
+                self.move_diagnostics
+            ).items()
+        }
 
     def _apply_planar_constraint(self, atoms_obj: Atoms) -> None:
         if not self.md_planar:
@@ -1059,7 +1585,7 @@ class AdsorbateCMC(SurfaceMCBase):
         n_ads = len(self.ads_groups)
         if n_ads == 0:
             return 0
-        if self.move_mode in ("site_hop", "puckering_hop", "hybrid"):
+        if self.move_mode in ("site_hop", "hybrid"):
             active_sites = sum(
                 1
                 for row in self._get_site_registry()
@@ -1071,21 +1597,27 @@ class AdsorbateCMC(SurfaceMCBase):
         return int(n_ads)
 
     def _candidate_support_z(
-        self, new_xy: np.ndarray, exclude_indices: Optional[Sequence[int]] = None
+        self,
+        new_xy: np.ndarray,
+        exclude_indices: Optional[Sequence[int]] = None,
+        atoms: Optional[Atoms] = None,
     ) -> Optional[float]:
-        all_pos = self.atoms.get_positions()
-        cell = self.atoms.get_cell()
-        pbc = self.atoms.get_pbc()
-        new_xyz = np.zeros((1, 3))
-        new_xyz[0, :2] = new_xy[:2]
-        all_xyz = np.zeros_like(all_pos)
-        all_xyz[:, :2] = all_pos[:, :2]
-        dxy = get_distances(new_xyz, all_xyz, cell=cell, pbc=pbc)[1].flatten()
+        if atoms is None:
+            atoms = self.atoms
+
+        all_pos = atoms.get_positions()
+        surface_indices = self._surface_reference_indices_for_atoms(
+            atoms,
+            np.asarray([], dtype=int),
+        )
         if exclude_indices is not None:
-            for exclude_index in exclude_indices:
-                if 0 <= int(exclude_index) < len(dxy):
-                    dxy[int(exclude_index)] = np.inf
-        support_indices = np.where(dxy < self.support_xy_tol)[0]
+            exclude = np.asarray([int(idx) for idx in exclude_indices], dtype=int)
+            surface_indices = surface_indices[~np.isin(surface_indices, exclude)]
+        if surface_indices.size == 0:
+            return None
+
+        dxy = self._xy_distances(new_xy, all_pos[surface_indices, :2], atoms=atoms)
+        support_indices = surface_indices[dxy < self.support_xy_tol]
         if len(support_indices) == 0:
             return None
         if self.surface_side == "top":
@@ -1168,21 +1700,16 @@ class AdsorbateCMC(SurfaceMCBase):
             return True
 
         reference_positions = atoms.get_positions()[reference_indices]
-        trial_xy = trial_positions.copy()
-        ref_xy = reference_positions.copy()
-        trial_xy[:, 2] = 0.0
-        ref_xy[:, 2] = 0.0
-
-        pbc_xy = np.asarray(atoms.get_pbc(), dtype=bool).copy()
-        if pbc_xy.size == 3:
-            pbc_xy[2] = False
-
-        dxy = get_distances(
-            trial_xy,
-            ref_xy,
-            cell=atoms.get_cell(),
-            pbc=pbc_xy,
-        )[1]
+        dxy = np.vstack(
+            [
+                self._xy_distances(
+                    trial_position[:2],
+                    reference_positions[:, :2],
+                    atoms=atoms,
+                )
+                for trial_position in trial_positions
+            ]
+        )
         local_mask = dxy < self.adsorbate_surface_xy_tol_A
         if not np.any(local_mask):
             return True
@@ -1220,7 +1747,7 @@ class AdsorbateCMC(SurfaceMCBase):
             other_pos = pos[other_indices]
             deltas, _ = get_distances(anchor_pos, other_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
-            dz = other_pos[:, 2] - anchor_pos[2]
+            dz = deltas[0, :, 2]
             side_sign = 1.0 if self.surface_side == "top" else -1.0
             mask = (dxy < support_xy_tol) & ((side_sign * dz) > z_tol)
             if not np.any(mask):
@@ -1265,7 +1792,7 @@ class AdsorbateCMC(SurfaceMCBase):
         support_pos = pos[support_indices]
         deltas = get_distances(anchor_pos, support_pos, cell=cell, pbc=pbc)[0]
         dxy = np.linalg.norm(deltas[:, :, :2], axis=2)
-        dz = anchor_pos[:, None, 2] - support_pos[None, :, 2]
+        dz = -deltas[:, :, 2]
 
         side_sign = 1.0 if self.surface_side == "top" else -1.0
         support_mask = (
@@ -1360,8 +1887,11 @@ class AdsorbateCMC(SurfaceMCBase):
         if atoms is None:
             atoms = self.atoms
         for group in self._adsorbate_groups_for_atoms(atoms):
-            anchor_idx = self._anchor_index_for_group(np.asarray(group, dtype=int), atoms=atoms)
-            if not self._point_within_site_region(atoms.positions[anchor_idx], atoms=atoms):
+            anchor_pos = self._group_anchor_position(
+                np.asarray(group, dtype=int),
+                atoms=atoms,
+            )
+            if not self._point_within_site_region(anchor_pos, atoms=atoms):
                 return False
         return True
 
@@ -1427,615 +1957,238 @@ class AdsorbateCMC(SurfaceMCBase):
             adjusted[:, 2] += direction * dz
             total_adjust += dz
 
-    def _rotate_group_about_anchor(
-        self,
-        group: np.ndarray,
-        axis: np.ndarray,
-        angle: float,
-        atoms: Optional[Atoms] = None,
-    ) -> np.ndarray:
-        if atoms is None:
-            atoms = self.atoms
-
-        group = np.asarray(group, dtype=int)
-        anchor_idx = self._anchor_index_for_group(group, atoms=atoms)
-        anchor_pos = atoms.positions[anchor_idx].copy()
-        relative = self._current_group_relative_positions(group, atoms=atoms)
-        rotation = _rotation_matrix(axis, angle)
-        return anchor_pos + relative @ rotation.T
-
-    def _proposal_for_mode(self, mode: str) -> Callable[[], Optional[Atoms]]:
-        proposals: dict[str, Callable[[], Optional[Atoms]]] = {
-            "displacement": self._propose_displacement,
-            "site_hop": self._propose_site_hop,
-            "reorientation": self._propose_reorientation,
-            "hop_reorientation": self._propose_hop_reorientation,
-            "hop_puckering": self._propose_hop_puckering,
-            "hop_puckering_reorientation": self._propose_hop_puckering_reorientation,
-            "puckering": self._propose_puckering,
-            "puckering_hop": self._propose_puckering_hop,
-        }
-        try:
-            return proposals[mode]
-        except KeyError as exc:
-            raise ValueError(f"Unknown adsorbate move mode: {mode!r}") from exc
-
-    def _build_hybrid_move_table(
-        self,
-    ) -> list[tuple[float, Callable[[], Optional[Atoms]]]]:
-        weighted_modes = (
-            (self.site_hop_prob, "site_hop"),
-            (self.reorientation_prob, "reorientation"),
-            (self.hop_reorientation_prob, "hop_reorientation"),
-            (self.hop_puckering_prob, "hop_puckering"),
-            (
-                self.hop_puckering_reorientation_prob,
-                "hop_puckering_reorientation",
-            ),
-            (self.puckering_prob, "puckering"),
-            (self.puckering_hop_prob, "puckering_hop"),
-        )
-        table = [
-            (float(weight), self._proposal_for_mode(mode))
-            for weight, mode in weighted_modes
-            if float(weight) > 0.0
-        ]
-        residual = 1.0 - sum(weight for weight, _ in table)
-        if residual > 1e-12:
-            table.append((residual, self._propose_displacement))
-        return table
-
-    def _propose_displacement(self) -> Optional[Atoms]:
-        movable_group_ids = self.get_non_buried_adsorbate_indices(
-            support_xy_tol=self.support_xy_tol
-        )
-        if not movable_group_ids:
-            return None
-
-        group_id = int(self.rng.choice(movable_group_ids))
-        group = np.asarray(self.ads_groups[group_id], dtype=int)
-        anchor_idx = self.ads_anchor_indices[group_id]
-        anchor_pos = self.atoms.positions[anchor_idx].copy()
-        relative = self._current_group_relative_positions(group)
-        all_pos = self.atoms.get_positions()
-        cell = self.atoms.get_cell()
-        pbc = self.atoms.get_pbc()
-        xy_matrix = cell[:2, :2]
-
-        for _ in range(self.max_displacement_trials):
-            delta = self.rng.normal(0.0, self.displacement_sigma, size=2)
-            new_xy = anchor_pos[:2] + delta
-            if any(pbc[:2]):
-                frac = np.linalg.solve(xy_matrix.T, new_xy)
-                frac = frac % 1.0
-                new_xy = np.dot(xy_matrix.T, frac)
-
-            new_xyz = np.zeros((1, 3))
-            new_xyz[0, :2] = new_xy[:2]
-            all_xyz = np.zeros_like(all_pos)
-            all_xyz[:, :2] = all_pos[:, :2]
-            dxy = get_distances(new_xyz, all_xyz, cell=cell, pbc=pbc)[1].flatten()
-
-            dxy[group] = np.inf
-            support_indices = np.where(dxy < self.support_xy_tol)[0]
-            if len(support_indices) == 0:
-                new_z = float(anchor_pos[2])
-            else:
-                new_z = float(np.max(all_pos[support_indices, 2]) + self.vertical_offset)
-
-            new_anchor = np.array([new_xy[0], new_xy[1], new_z], dtype=float)
-            if not self._point_within_site_region(new_anchor):
-                continue
-            trial_positions = new_anchor + relative
-            trial_positions = self._adjust_trial_positions_vertically(
-                group, trial_positions
-            )
-            if trial_positions is None:
-                continue
-            atoms_new = self.atoms.copy()
-            atoms_new.positions[group] = trial_positions
-            return atoms_new
-
-        return None
-
-    def _same_site_as_current(
-        self,
-        current_anchor: np.ndarray,
-        target_xy: np.ndarray,
-    ) -> bool:
-        delta_xyz = np.zeros((1, 3), dtype=float)
-        delta_xyz[0, :2] = current_anchor[:2] - target_xy[:2]
-        mic_xy = get_distances(
-            np.zeros((1, 3)),
-            delta_xyz,
-            cell=self.atoms.get_cell(),
-            pbc=self.atoms.get_pbc(),
-        )[1].flatten()[0]
-        return mic_xy < self.same_site_tol
-
-    def _rotated_relative_positions_for_hop(
-        self,
-        relative: np.ndarray,
-        max_angle_rad: float,
-    ) -> Optional[np.ndarray]:
-        axis = self.rng.normal(size=3)
-        angle = self.rng.uniform(-max_angle_rad, max_angle_rad)
-        if np.linalg.norm(axis) <= 1e-12 or abs(angle) <= 1e-12:
-            return None
-        rotation = _rotation_matrix(axis, angle)
-        return relative @ rotation.T
-
-    def _propose_hop(self, *, reorient: bool, pucker: bool = False) -> Optional[Atoms]:
-        if reorient and (
-            (not self.is_molecular_adsorbate)
-            or self.hop_reorientation_angle_rad <= 0.0
+    def _validate_trial_atoms(self, atoms_trial: Atoms) -> Optional[str]:
+        if self.has_detached_functional_groups(
+            atoms_trial,
+            detach_tol=self.detach_tol,
         ):
-            return None
-        if pucker and self.puckering_height_A <= 0.0:
-            return None
+            return "detached_functional_group"
+        if self.has_afloat_adsorbates(
+            atoms_trial,
+            support_xy_tol=self.support_xy_tol,
+            z_max_support=self.z_max_support,
+        ):
+            return "afloat_adsorbate"
+        if not self._molecular_adsorbates_are_intact(atoms_trial):
+            return "molecular_integrity"
+        if not self._molecular_orientations_are_valid(atoms_trial):
+            return "molecular_orientation"
+        if not self._anchors_within_site_region(atoms_trial):
+            return "site_region"
+        return None
 
-        movable_group_ids = self.get_non_buried_adsorbate_indices(
-            support_xy_tol=self.support_xy_tol
+    def _write_debug_atoms(
+        self,
+        writer: Optional[Trajectory],
+        atoms: Atoms,
+        write_debug_frame: bool,
+        *,
+        proposal: MoveProposal,
+        event: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        if writer is None or not write_debug_frame:
+            return
+        frame = atoms.copy()
+        frame.info["mc_event"] = event
+        frame.info["mc_move_name"] = proposal.move_name
+        frame.info["mc_is_md"] = bool(proposal.is_md)
+        if reason is not None:
+            frame.info["mc_reject_reason"] = reason
+        for key, value in proposal.metadata.items():
+            frame.info[f"mc_{key}"] = value
+        writer.write(frame)
+
+    def _write_sampled_state(self, writer: Trajectory) -> None:
+        frame = self.atoms.copy()
+        frame.info["mc_event"] = "sampled"
+        frame.info["mc_sweep"] = int(self.sweep)
+        frame.info["mc_energy_eV"] = float(self.e_old)
+        writer.write(frame)
+
+    def _with_energy_metadata(
+        self,
+        proposal: MoveProposal,
+        *,
+        energy_eV: float,
+        delta_e_eV: float,
+        acceptance_delta_eV: float,
+        beta: float,
+        accepted: bool,
+        current_energy_eV: Optional[float] = None,
+        delta_h_eV: Optional[float] = None,
+        acceptance_mode: str = "potential",
+    ) -> MoveProposal:
+        metadata = dict(proposal.metadata)
+        metadata.update(
+            {
+                "energy_eV": float(energy_eV),
+                "delta_e_eV": float(delta_e_eV),
+                "acceptance_delta_eV": float(acceptance_delta_eV),
+                "accept_prob": self._metropolis_acceptance_probability(
+                    acceptance_delta_eV,
+                    beta=beta,
+                ),
+                "accepted": bool(accepted),
+                "acceptance_mode": str(acceptance_mode),
+            }
         )
-        if not movable_group_ids:
-            return None
-
-        site_registry = self._get_site_registry()
-        if not site_registry:
-            return None
-
-        group_id = int(self.rng.choice(movable_group_ids))
-        group = np.asarray(self.ads_groups[group_id], dtype=int)
-        anchor_idx = self.ads_anchor_indices[group_id]
-        current_anchor = self.atoms.positions[anchor_idx].copy()
-        relative = self._current_group_relative_positions(group)
-        if reorient and np.allclose(relative, 0.0):
-            return None
-        current_support = (
-            self._nearest_support_atom_for_anchor(group) if pucker else None
+        if current_energy_eV is not None:
+            metadata["current_energy_eV"] = float(current_energy_eV)
+        if delta_h_eV is not None:
+            metadata["delta_h_eV"] = float(delta_h_eV)
+        return MoveProposal(
+            atoms=proposal.atoms,
+            move_name=proposal.move_name,
+            is_md=proposal.is_md,
+            delta_e=proposal.delta_e,
+            delta_h=proposal.delta_h,
+            metadata=metadata,
         )
-        if pucker and current_support is None:
-            return None
 
-        site_order = self.rng.permutation(len(site_registry))
-        trials_per_site = (
-            max(1, int(self.max_hop_reorientation_trials)) if reorient else 1
+    def _relax_proposal(
+        self,
+        proposal: MoveProposal,
+        *,
+        move_ind: Sequence[int],
+    ) -> tuple[Optional[MoveProposal], Optional[str]]:
+        if proposal.is_md or not self.relax:
+            return proposal, None
+
+        atoms_trial, converged = self.relax_structure(
+            proposal.atoms,
+            move_ind=move_ind,
         )
-        direction = 1.0 if self.surface_side == "top" else -1.0
-        for site_idx in site_order:
-            site = site_registry[int(site_idx)]
-            if pucker and str(site.get("site_type", "")).lower() != "atop":
-                continue
-            if bool(site.get("blocked_by_termination", False)):
-                continue
-            if pucker:
-                suggested_z = self._reference_site_suggested_z(site)
+        relaxed = MoveProposal(
+            atoms=atoms_trial,
+            move_name=proposal.move_name,
+            is_md=proposal.is_md,
+            delta_e=proposal.delta_e,
+            delta_h=proposal.delta_h,
+            metadata={**proposal.metadata, "relaxed": bool(converged)},
+        )
+        return relaxed, None
+
+    def _process_move_proposal(
+        self,
+        proposal: MoveProposal,
+        *,
+        beta: float,
+        move_ind: Sequence[int],
+        write_debug_frame: bool,
+        attempted_writer: Optional[Trajectory],
+        accepted_writer: Optional[Trajectory],
+        rejected_writer: Optional[Trajectory],
+    ) -> None:
+        self._record_attempted_proposal(proposal)
+        self._write_debug_atoms(
+            attempted_writer,
+            proposal.atoms,
+            write_debug_frame,
+            proposal=proposal,
+            event="attempted",
+        )
+
+        proposal, reject_reason = self._relax_proposal(proposal, move_ind=move_ind)
+        if proposal is None:
+            return
+        if reject_reason is None:
+            reject_reason = self._validate_trial_atoms(proposal.atoms)
+        if reject_reason is not None:
+            self._record_rejected_proposal(proposal, reject_reason)
+            self._write_debug_atoms(
+                rejected_writer,
+                proposal.atoms,
+                write_debug_frame,
+                proposal=proposal,
+                event="rejected",
+                reason=reject_reason,
+            )
+            return
+
+        if proposal.is_md:
+            delta_e = float(proposal.delta_e if proposal.delta_e is not None else 0.0)
+            delta_h = float(proposal.delta_h if proposal.delta_h is not None else delta_e)
+            md_delta = delta_h if self.md_accept_mode == "hamiltonian" else delta_e
+            e_current = float(self.e_old)
+            e_new = e_current + delta_e
+            accepted = self._metropolis_accept(md_delta, beta=beta)
+            annotated = self._with_energy_metadata(
+                proposal,
+                energy_eV=e_new,
+                delta_e_eV=delta_e,
+                delta_h_eV=delta_h,
+                acceptance_delta_eV=md_delta,
+                beta=beta,
+                accepted=accepted,
+                current_energy_eV=e_current,
+                acceptance_mode=self.md_accept_mode,
+            )
+            if accepted:
+                self.e_old += delta_e
+                self.accepted_moves += 1
+                self.md_accepted_moves += 1
+                self._record_accepted_proposal(annotated)
+                self.atoms.positions = proposal.atoms.positions
+                self.atoms.cell = proposal.atoms.cell
+                self._site_registry = None
+                self._write_debug_atoms(
+                    accepted_writer,
+                    self.atoms,
+                    write_debug_frame,
+                    proposal=annotated,
+                    event="accepted",
+                )
             else:
-                suggested_z = float(site.get("suggested_z_A", np.nan))
-            if suggested_z is None or not np.isfinite(suggested_z):
-                continue
-            xy = np.asarray(site["xy"], dtype=float)
-            if self._same_site_as_current(current_anchor, xy):
-                continue
-
-            height = self._sample_puckering_height() if pucker else 0.0
-            if pucker and height <= 1e-12:
-                continue
-            dz = direction * height
-            new_anchor = np.array([xy[0], xy[1], suggested_z + dz], dtype=float)
-            if not self._point_within_site_region(new_anchor):
-                continue
-            target_support = None
-            if pucker:
-                target_support = self._support_atom_for_site(
-                    site,
-                    new_anchor,
-                    avoid_index=current_support,
+                self._record_rejected_proposal(annotated, "metropolis")
+                self._write_debug_atoms(
+                    rejected_writer,
+                    proposal.atoms,
+                    write_debug_frame,
+                    proposal=annotated,
+                    event="rejected",
+                    reason="metropolis",
                 )
-                if target_support is None:
-                    continue
+            return
 
-            for _ in range(trials_per_site):
-                trial_relative = relative
-                if reorient:
-                    trial_relative = self._rotated_relative_positions_for_hop(
-                        relative,
-                        self.hop_reorientation_angle_rad,
-                    )
-                    if trial_relative is None:
-                        continue
-
-                trial_positions = new_anchor + trial_relative
-                trial_positions = self._adjust_trial_positions_vertically(
-                    group, trial_positions
-                )
-                if trial_positions is None:
-                    continue
-
-                atoms_new = self.atoms.copy()
-                if pucker:
-                    atoms_new.positions[int(current_support), 2] = (
-                        self._puckering_reference_z(int(current_support))
-                    )
-                    atoms_new.positions[int(target_support), 2] = (
-                        self._puckering_reference_z(int(target_support)) + dz
-                    )
-                atoms_new.positions[group] = trial_positions
-                if not self._anchors_within_site_region(atoms=atoms_new):
-                    continue
-                if self.enforce_molecular_integrity and not (
-                    self._molecular_adsorbates_are_intact(atoms_new)
-                ):
-                    continue
-                return atoms_new
-
-        return None
-
-    def _propose_site_hop(self) -> Optional[Atoms]:
-        return self._propose_hop(reorient=False)
-
-    def _propose_reorientation(self) -> Optional[Atoms]:
-        if (not self.is_molecular_adsorbate) or self.rotation_max_angle_rad <= 0.0:
-            return None
-
-        movable_group_ids = self.get_non_buried_adsorbate_indices(
-            support_xy_tol=self.support_xy_tol
+        e_new = self.get_potential_energy(proposal.atoms)
+        delta_e = e_new - self.e_old
+        e_current = float(self.e_old)
+        accepted = self._metropolis_accept(delta_e, beta=beta)
+        annotated = self._with_energy_metadata(
+            proposal,
+            energy_eV=e_new,
+            delta_e_eV=delta_e,
+            acceptance_delta_eV=delta_e,
+            beta=beta,
+            accepted=accepted,
+            current_energy_eV=e_current,
+            acceptance_mode="potential",
         )
-        if not movable_group_ids:
-            return None
-
-        group_id = int(self.rng.choice(movable_group_ids))
-        group = np.asarray(self.ads_groups[group_id], dtype=int)
-        relative = self._current_group_relative_positions(group)
-        if np.allclose(relative, 0.0):
-            return None
-
-        for _ in range(self.max_reorientation_trials):
-            axis = self.rng.normal(size=3)
-            angle = self.rng.uniform(
-                -self.rotation_max_angle_rad, self.rotation_max_angle_rad
+        if accepted:
+            self.atoms = proposal.atoms
+            self.atoms.calc = self.calculator
+            self.e_old = e_new
+            self.accepted_moves += 1
+            self._record_accepted_proposal(annotated)
+            self._site_registry = None
+            self._write_debug_atoms(
+                accepted_writer,
+                self.atoms,
+                write_debug_frame,
+                proposal=annotated,
+                event="accepted",
             )
-            if np.linalg.norm(axis) <= 1e-12 or abs(angle) <= 1e-12:
-                continue
-
-            trial_positions = self._rotate_group_about_anchor(group, axis, angle)
-            if not self._group_positions_are_valid(group, trial_positions):
-                continue
-            if not self._group_clears_terminations(group, trial_positions):
-                continue
-
-            atoms_new = self.atoms.copy()
-            atoms_new.positions[group] = trial_positions
-            return atoms_new
-
-        return None
-
-    def _propose_hop_reorientation(self) -> Optional[Atoms]:
-        return self._propose_hop(reorient=True)
-
-    def _propose_hop_puckering(self) -> Optional[Atoms]:
-        return self._propose_hop(reorient=False, pucker=True)
-
-    def _propose_hop_puckering_reorientation(self) -> Optional[Atoms]:
-        return self._propose_hop(reorient=True, pucker=True)
-
-    def _nearest_support_atom_for_anchor(
-        self,
-        group: np.ndarray,
-        atoms: Optional[Atoms] = None,
-    ) -> Optional[int]:
-        if atoms is None:
-            atoms = self.atoms
-
-        group = np.asarray(group, dtype=int)
-        if group.size == 0:
-            return None
-
-        anchor_idx = self._anchor_index_for_group(group, atoms=atoms)
-        anchor_pos = atoms.positions[anchor_idx]
-        group_set = set(int(idx) for idx in group.tolist())
-        puckering_element_set = set(self.puckering_elements)
-        candidate_indices = np.asarray(
-            [
-                idx
-                for idx, atom in enumerate(atoms)
-                if idx not in group_set and atom.symbol in puckering_element_set
-            ],
-            dtype=int,
-        )
-        if candidate_indices.size == 0:
-            return None
-
-        candidate_pos = atoms.positions[candidate_indices]
-        deltas = get_distances(
-            anchor_pos.reshape(1, 3),
-            candidate_pos,
-            cell=atoms.get_cell(),
-            pbc=atoms.get_pbc(),
-        )[0][0]
-        dxy = np.linalg.norm(deltas[:, :2], axis=1)
-        side_sign = 1.0 if self.surface_side == "top" else -1.0
-        dz = side_sign * (anchor_pos[2] - candidate_pos[:, 2])
-        mask = (dxy < self.support_xy_tol) & (dz > 0.0) & (dz < self.z_max_support)
-        if not np.any(mask):
-            return None
-
-        masked_positions = np.where(mask)[0]
-        nearest_local = int(masked_positions[int(np.argmin(dxy[masked_positions]))])
-        return int(candidate_indices[nearest_local])
-
-    def _support_atom_for_site(
-        self,
-        site: dict[str, object],
-        anchor_position: np.ndarray,
-        *,
-        avoid_index: Optional[int] = None,
-        atoms: Optional[Atoms] = None,
-    ) -> Optional[int]:
-        if atoms is None:
-            atoms = self.atoms
-
-        support_indices = np.asarray(site.get("support_indices", ()), dtype=int)
-        support_indices = support_indices[
-            (support_indices >= 0) & (support_indices < len(atoms))
-        ]
-        puckering_element_set = set(self.puckering_elements)
-        support_indices = np.asarray(
-            [
-                idx
-                for idx in support_indices
-                if atoms[int(idx)].symbol in puckering_element_set
-            ],
-            dtype=int,
-        )
-        if support_indices.size == 0:
-            return self._nearest_support_atom_for_point(
-                anchor_position,
-                avoid_index=avoid_index,
-                atoms=atoms,
+        else:
+            self._record_rejected_proposal(annotated, "metropolis")
+            self._write_debug_atoms(
+                rejected_writer,
+                proposal.atoms,
+                write_debug_frame,
+                proposal=annotated,
+                event="rejected",
+                reason="metropolis",
             )
-
-        preferred = support_indices
-        if avoid_index is not None and support_indices.size > 1:
-            without_avoid = support_indices[support_indices != int(avoid_index)]
-            if without_avoid.size > 0:
-                preferred = without_avoid
-
-        deltas = get_distances(
-            np.asarray(anchor_position, dtype=float).reshape(1, 3),
-            atoms.positions[preferred],
-            cell=atoms.get_cell(),
-            pbc=atoms.get_pbc(),
-        )[0][0]
-        dxy = np.linalg.norm(deltas[:, :2], axis=1)
-        return int(preferred[int(np.argmin(dxy))])
-
-    def _nearest_support_atom_for_point(
-        self,
-        anchor_position: np.ndarray,
-        *,
-        avoid_index: Optional[int] = None,
-        atoms: Optional[Atoms] = None,
-    ) -> Optional[int]:
-        if atoms is None:
-            atoms = self.atoms
-
-        anchor_position = np.asarray(anchor_position, dtype=float)
-        puckering_element_set = set(self.puckering_elements)
-        candidate_indices = np.asarray(
-            [
-                idx
-                for idx, atom in enumerate(atoms)
-                if atom.symbol in puckering_element_set
-                and (avoid_index is None or idx != int(avoid_index))
-            ],
-            dtype=int,
-        )
-        if candidate_indices.size == 0:
-            return None
-
-        candidate_pos = atoms.positions[candidate_indices]
-        deltas = get_distances(
-            anchor_position.reshape(1, 3),
-            candidate_pos,
-            cell=atoms.get_cell(),
-            pbc=atoms.get_pbc(),
-        )[0][0]
-        dxy = np.linalg.norm(deltas[:, :2], axis=1)
-        side_sign = 1.0 if self.surface_side == "top" else -1.0
-        dz = side_sign * (anchor_position[2] - candidate_pos[:, 2])
-        mask = (dxy < self.support_xy_tol) & (dz > 0.0) & (dz < self.z_max_support)
-        if not np.any(mask):
-            return None
-
-        masked_positions = np.where(mask)[0]
-        nearest_local = int(masked_positions[int(np.argmin(dxy[masked_positions]))])
-        return int(candidate_indices[nearest_local])
-
-    def _puckering_reference_z(self, atom_index: int) -> float:
-        if 0 <= int(atom_index) < len(self._puckering_reference_positions):
-            return float(self._puckering_reference_positions[int(atom_index), 2])
-        return float(self.atoms.positions[int(atom_index), 2])
-
-    def _reference_site_suggested_z(self, site: dict[str, object]) -> Optional[float]:
-        support_indices = np.asarray(site.get("support_indices", ()), dtype=int)
-        support_indices = support_indices[
-            (support_indices >= 0)
-            & (support_indices < len(self._puckering_reference_positions))
-        ]
-        if support_indices.size == 0:
-            suggested_z = float(site.get("suggested_z_A", np.nan))
-            return suggested_z if np.isfinite(suggested_z) else None
-
-        ref_z = self._puckering_reference_positions[support_indices, 2]
-        if self.surface_side == "top":
-            return float(np.max(ref_z) + self.vertical_offset)
-        return float(np.min(ref_z) - self.vertical_offset)
-
-    def _sample_puckering_height(self) -> float:
-        if self.puckering_height_A <= 0.0:
-            return 0.0
-        jitter = max(0.0, float(self.puckering_height_jitter_A))
-        if jitter <= 1e-12:
-            return float(self.puckering_height_A)
-        low = max(0.0, float(self.puckering_height_A) - jitter)
-        high = float(self.puckering_height_A) + jitter
-        return float(self.rng.uniform(low, high))
-
-    def _propose_puckering(self) -> Optional[Atoms]:
-        if self.puckering_height_A <= 0.0:
-            return None
-
-        movable_group_ids = self.get_non_buried_adsorbate_indices(
-            support_xy_tol=self.support_xy_tol
-        )
-        if not movable_group_ids:
-            return None
-
-        direction = 1.0 if self.surface_side == "top" else -1.0
-        for _ in range(self.max_puckering_trials):
-            group_id = int(self.rng.choice(movable_group_ids))
-            group = np.asarray(self.ads_groups[group_id], dtype=int)
-            support_idx = self._nearest_support_atom_for_anchor(group)
-            if support_idx is None:
-                continue
-
-            height = self._sample_puckering_height()
-            if height <= 1e-12:
-                continue
-            dz = direction * height
-            atoms_new = self.atoms.copy()
-            support_target_z = self._puckering_reference_z(support_idx) + dz
-            anchor_idx = self._anchor_index_for_group(group)
-            anchor_target_z = support_target_z + direction * self.vertical_offset
-            group_shift_z = anchor_target_z - float(self.atoms.positions[anchor_idx, 2])
-            atoms_new.positions[support_idx, 2] = support_target_z
-            trial_positions = self.atoms.positions[group].copy()
-            trial_positions[:, 2] += group_shift_z
-            atoms_new.positions[group] = trial_positions
-
-            if not self._anchors_within_site_region(atoms=atoms_new):
-                continue
-            if not self._group_positions_are_valid(
-                group, trial_positions, atoms=atoms_new
-            ):
-                continue
-            if not self._group_clears_terminations(
-                group, trial_positions, atoms=atoms_new
-            ):
-                continue
-            if self.enforce_molecular_integrity and not (
-                self._molecular_adsorbates_are_intact(atoms_new)
-            ):
-                continue
-
-            return atoms_new
-
-        return None
-
-    def _propose_puckering_hop(self) -> Optional[Atoms]:
-        if self.puckering_height_A <= 0.0:
-            return None
-
-        movable_group_ids = self.get_non_buried_adsorbate_indices(
-            support_xy_tol=self.support_xy_tol
-        )
-        if not movable_group_ids:
-            return None
-
-        site_registry = self._get_site_registry()
-        if not site_registry:
-            return None
-
-        direction = 1.0 if self.surface_side == "top" else -1.0
-        for _ in range(self.max_puckering_trials):
-            group_id = int(self.rng.choice(movable_group_ids))
-            group = np.asarray(self.ads_groups[group_id], dtype=int)
-            anchor_idx = self.ads_anchor_indices[group_id]
-            current_anchor = self.atoms.positions[anchor_idx].copy()
-            current_support = self._nearest_support_atom_for_anchor(group)
-            if current_support is None:
-                continue
-
-            relative = self._current_group_relative_positions(group)
-            height = self._sample_puckering_height()
-            if height <= 1e-12:
-                continue
-            dz = direction * height
-
-            for site_idx in self.rng.permutation(len(site_registry)):
-                site = site_registry[int(site_idx)]
-                if str(site.get("site_type", "")).lower() != "atop":
-                    continue
-                if bool(site.get("blocked_by_termination", False)):
-                    continue
-                suggested_z = self._reference_site_suggested_z(site)
-                if suggested_z is None or not np.isfinite(suggested_z):
-                    continue
-                xy = np.asarray(site["xy"], dtype=float)
-                delta_xyz = np.zeros((1, 3), dtype=float)
-                delta_xyz[0, :2] = current_anchor[:2] - xy[:2]
-                mic_xy = get_distances(
-                    np.zeros((1, 3)),
-                    delta_xyz,
-                    cell=self.atoms.get_cell(),
-                    pbc=self.atoms.get_pbc(),
-                )[1].flatten()[0]
-                if mic_xy < self.same_site_tol:
-                    continue
-
-                target_anchor = np.array([xy[0], xy[1], suggested_z + dz], dtype=float)
-                if not self._point_within_site_region(target_anchor):
-                    continue
-                target_support = self._support_atom_for_site(
-                    site,
-                    target_anchor,
-                    avoid_index=current_support,
-                )
-                if target_support is None:
-                    continue
-
-                atoms_new = self.atoms.copy()
-                atoms_new.positions[current_support, 2] = self._puckering_reference_z(
-                    current_support
-                )
-                atoms_new.positions[target_support, 2] = (
-                    self._puckering_reference_z(target_support) + dz
-                )
-                trial_positions = target_anchor + relative
-                atoms_new.positions[group] = trial_positions
-
-                if not self._anchors_within_site_region(atoms=atoms_new):
-                    continue
-                if not self._group_positions_are_valid(
-                    group, trial_positions, atoms=atoms_new
-                ):
-                    continue
-                if not self._group_clears_terminations(
-                    group, trial_positions, atoms=atoms_new
-                ):
-                    continue
-                if self.enforce_molecular_integrity and not (
-                    self._molecular_adsorbates_are_intact(atoms_new)
-                ):
-                    continue
-
-                return atoms_new
-
-        return None
-
-    def _propose_move(self) -> Optional[Atoms]:
-        if self.move_mode != "hybrid":
-            return self._proposal_for_mode(self.move_mode)()
-
-        selector = self.rng.random()
-        cumulative = 0.0
-        for weight, propose in self._hybrid_move_table:
-            cumulative += weight
-            if selector < cumulative:
-                return propose()
-
-        return self._propose_displacement()
 
     def _open_optional_traj(self, filename: Optional[str]) -> Optional[Trajectory]:
         if not filename:
@@ -2101,6 +2254,7 @@ class AdsorbateCMC(SurfaceMCBase):
             self.total_moves = 0
             self.md_attempted_moves = 0
             self.md_accepted_moves = 0
+            self.move_diagnostics = self._empty_move_diagnostics()
         self._resumed_from_checkpoint = False
         remaining_sweeps = (
             max(0, target_sweeps - int(self.sweep))
@@ -2137,104 +2291,36 @@ class AdsorbateCMC(SurfaceMCBase):
                     atoms_trial, delta_e, delta_h = self._propose_md_move()
                     if atoms_trial is None:
                         continue
-
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
-                    ):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
-
-                    if self.has_afloat_adsorbates(
-                        atoms_trial,
-                        support_xy_tol=self.support_xy_tol,
-                        z_max_support=self.z_max_support,
-                    ):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
-
-                    if not self._molecular_adsorbates_are_intact(atoms_trial):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
-
-                    if not self._anchors_within_site_region(atoms_trial):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
-
-                    if attempted_writer is not None and write_debug_frame:
-                        attempted_writer.write(atoms_trial)
-
-                    md_delta = (
-                        delta_h if self.md_accept_mode == "hamiltonian" else delta_e
+                    proposal = MoveProposal(
+                        atoms=atoms_trial,
+                        move_name="md_boost",
+                        is_md=True,
+                        delta_e=delta_e,
+                        delta_h=delta_h,
                     )
-                    if self._metropolis_accept(md_delta, beta=beta):
-                        self.e_old += delta_e
-                        self.accepted_moves += 1
-                        self.md_accepted_moves += 1
-                        self.atoms.positions = atoms_trial.positions
-                        self.atoms.cell = atoms_trial.cell
-                        self._site_registry = None
-                        if accepted_writer is not None and write_debug_frame:
-                            accepted_writer.write(self.atoms)
-                    elif rejected_writer is not None and write_debug_frame:
-                        rejected_writer.write(atoms_trial)
-                    continue
-
-                atoms_trial = self._propose_move()
-                if atoms_trial is None:
-                    continue
-
-                if self.relax:
-                    atoms_trial, converged = self.relax_structure(
-                        atoms_trial, move_ind=[self.sweep, i]
+                else:
+                    atoms_trial = self._propose_move()
+                    if atoms_trial is None:
+                        continue
+                    proposal = MoveProposal(
+                        atoms=atoms_trial,
+                        move_name=getattr(
+                            self,
+                            "_last_proposal_move_name",
+                            None,
+                        )
+                        or self.move_mode,
                     )
-                    if not converged:
-                        continue
-                    if self.has_detached_functional_groups(
-                        atoms_trial, detach_tol=self.detach_tol
-                    ):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
 
-                    if not self._molecular_adsorbates_are_intact(atoms_trial):
-                        if rejected_writer is not None and write_debug_frame:
-                            rejected_writer.write(atoms_trial)
-                        continue
-
-                if self.has_afloat_adsorbates(
-                    atoms_trial,
-                    support_xy_tol=self.support_xy_tol,
-                    z_max_support=self.z_max_support,
-                ):
-                    if rejected_writer is not None and write_debug_frame:
-                        rejected_writer.write(atoms_trial)
-                    continue
-
-                if not self._anchors_within_site_region(atoms_trial):
-                    if rejected_writer is not None and write_debug_frame:
-                        rejected_writer.write(atoms_trial)
-                    continue
-
-                if attempted_writer is not None and write_debug_frame:
-                    attempted_writer.write(atoms_trial)
-
-                e_new = self.get_potential_energy(atoms_trial)
-                delta_e = e_new - self.e_old
-
-                if self._metropolis_accept(delta_e, beta=beta):
-                    self.atoms = atoms_trial
-                    self.atoms.calc = self.calculator
-                    self.e_old = e_new
-                    self.accepted_moves += 1
-                    self._site_registry = None
-                    if accepted_writer is not None and write_debug_frame:
-                        accepted_writer.write(self.atoms)
-                elif rejected_writer is not None and write_debug_frame:
-                    rejected_writer.write(atoms_trial)
+                self._process_move_proposal(
+                    proposal,
+                    beta=beta,
+                    move_ind=(self.sweep, i),
+                    write_debug_frame=write_debug_frame,
+                    attempted_writer=attempted_writer,
+                    accepted_writer=accepted_writer,
+                    rejected_writer=rejected_writer,
+                )
 
             self.sweep += 1
             completed_sweep = int(self.sweep)
@@ -2248,7 +2334,7 @@ class AdsorbateCMC(SurfaceMCBase):
 
             report_counter = local_completed_sweep if chunk_mode else completed_sweep
             if report_counter % interval == 0:
-                traj_writer.write(self.atoms)
+                self._write_sampled_state(traj_writer)
                 if thermo_handle is None:
                     with open(self.thermo_file, "a") as handle:
                         handle.write(f"{self.sweep} {self.e_old:.6f}\n")
@@ -2282,6 +2368,7 @@ class AdsorbateCMC(SurfaceMCBase):
                             f" | planar: {self.md_planar}"
                         )
                     )
+                    + self._diagnostics_log_suffix()
                 )
 
             if (
@@ -2316,4 +2403,5 @@ class AdsorbateCMC(SurfaceMCBase):
             "md_attempted": self.md_attempted_moves,
             "md_accepted": self.md_accepted_moves,
             "md_accept_mode": self.md_accept_mode,
+            "move_diagnostics": self._diagnostic_stats(),
         }

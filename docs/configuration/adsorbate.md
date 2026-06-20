@@ -26,6 +26,8 @@ This page documents the YAML keys used by:
 | `min_clearance` | all | `0.9` | Generic minimum distance from the adsorbate to the slab. |
 | `adsorbate_surface_clearance_A` | Ad-CMC/PT | `0.0` | Minimum z-side gap requiring each adsorbate atom to remain on the requested `surface_side` of nearby slab atoms. This rejects molecular trials whose distal atoms are buried inside the slab even when pair distances are not too short. |
 | `adsorbate_surface_xy_tol_A` | Ad-CMC/PT | `null` | Lateral radius used for the surface-side envelope check. `null` uses `support_xy_tol`. |
+| `molecular_upright_atom_indices` | Ad-CMC/PT | `null` | Optional adsorbate-template atom indices that must stay above the anchor atom for `surface_side: top`, or below it for `surface_side: bottom`. For OOH with anchor atom index `0`, use `[2]` to keep H above the anchoring O. |
+| `molecular_upright_min_z_A` | Ad-CMC/PT | `null` | Minimum signed z gap for `molecular_upright_atom_indices` relative to the anchor. `0.0` rejects H-down OOH orientations. |
 | `vertical_offset` | all | `1.8` | Initial anchor height above the site support plane. |
 | `vertical_adjust_step` | all | `0.25` | Increment used by bounded vertical retry when a trial starts too close to the surface. |
 | `max_vertical_adjust` | all | `1.5` | Maximum total vertical lifting applied during bounded retry. |
@@ -41,7 +43,7 @@ This page documents the YAML keys used by:
 
 | Key | Workflows | Default | Meaning |
 | --- | --- | --- | --- |
-| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. Supported values: `displacement`, `site_hop`, `reorientation`, `puckering`, `puckering_hop`, `hybrid`. |
+| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. Supported values: `displacement`, `site_hop`, `reorientation`, `hop_reorientation`, `hop_puckering`, `hop_puckering_reorientation`, `puckering`, `hybrid`. |
 | `displacement_sigma` | all | `0.6` for CMC, `0.25` for GCMC | Step size for local displacement moves. |
 | `max_displacement_trials` | all | `20` | Retry budget for generating a valid displacement proposal. |
 | `site_hop_prob` | all | `0.5` for CMC, `0.25` for GCMC | In `move_mode: hybrid`, probability of selecting a site hop. |
@@ -49,8 +51,7 @@ This page documents the YAML keys used by:
 | `hop_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a combined site-hop plus rigid-body reorientation. Useful for molecular adsorbates such as OOH where the anchor site and molecular orientation should be sampled together. |
 | `hop_puckering_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that also transfers the local puckering to the target atop metal atom. |
 | `hop_puckering_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that transfers puckering and reorients the molecule around the new anchor. |
-| `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, probability of selecting a coupled local surface-atom puckering move. |
-| `puckering_hop_prob` | all | `0.0` | In `move_mode: hybrid`, probability of resetting the current puckered support atom to its initial local-CMC height, hopping to another site, and puckering a support atom at the target site. |
+| `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, probability of selecting a coupled local-coordinate puckering move. The support atom is placed at its reference lateral position plus the sampled outward lift, and the adsorbate anchor is reseated above that support atom by `vertical_offset`. |
 | `puckering_elements` | all | `None` | Elements eligible for puckering. `None` uses `site_elements`; for MXenes set this to the metal elements, e.g. `[Ti]` or `[Ti, Zr, Mo]`. |
 | `puckering_height_A` | all | `0.15` | Target outward displacement relative to the initial local-CMC support-atom height for puckering proposals. |
 | `puckering_height_jitter_A` | all | `null` | Uniform half-width around `puckering_height_A`; `null` uses 10% of `puckering_height_A`. Set `0.0` for a fixed lift. |
@@ -67,9 +68,13 @@ This page documents the YAML keys used by:
 - Internal bond lengths and angles are preserved.
 - For `OH`, the H rotates around the anchored O.
 - For `H2O`, both H atoms rotate as a rigid body around the anchored O.
-- `hop_reorientation` first moves the anchor to a different eligible registry site,
-  then applies a random rigid-body rotation about that new anchor before the usual
-  clearance and surface-side filters.
+- Molecular hop-family moves rebuild compatible molecular groups from the
+  adsorbate template before placing them at the target site. This applies to
+  plain `site_hop`, `hop_reorientation`, and `hop_puckering`, so a previously
+  flipped or distorted molecular geometry is
+  not carried into later hops.
+- Standalone `reorientation` also rebuilds compatible molecular groups from
+  the adsorbate template before rotating about the anchor.
 
 ### Nested move syntax
 
@@ -79,6 +84,13 @@ For adsorbate CMC/PT, the hop controls may also be written as a nested block:
 cmc:
   moves:
     mode: hybrid
+    orientation_filter:
+      atom_indices: [2]
+      min_z_above_anchor_A: 0.0
+    diagnostics:
+      enabled: false
+      log: false
+      top_n: 3
     hop:
       prob: 0.60
       reorient:
@@ -126,8 +138,8 @@ These keys live under the `cmc:` section in nested YAML.
 | `ray_task_max_retries` | `0` | Ray task retry count for multi-seed CMC. `0` fails fast on worker crashes. |
 | `ray_retry_exceptions` | `False` | Whether Ray retries tasks that raise Python exceptions. |
 | `ray_get_timeout_s` | `None` | Optional timeout for waiting on Ray task results. |
-| `relax` | `False` | Enable local geometry relaxation after accepted moves. |
-| `relax_steps` | `20` | Maximum local relax steps. |
+| `relax` | `False` | Enable local geometry relaxation of trial moves before the MC acceptance test. |
+| `relax_steps` | `20` | Maximum local relax steps. Hitting this limit does not reject the trial by itself; the resulting geometry is still validated and Metropolis-tested. |
 | `relax_z_only` | `False` | Restrict relaxation to `z` when supported by the local relaxer. |
 | `verbose_relax` | `False` | Print relaxer output. |
 | `fmax` | `0.05` | Force convergence threshold for local relaxation. |
@@ -182,9 +194,12 @@ These keys live under the `pt:` section in nested YAML for `AdsorbateReplicaExch
 | `results_file` | `results.csv` | Per-cycle replica summary written under `output_dir`. |
 | `checkpoint_file` | `pt_state.pkl` | PT master checkpoint written under `output_dir`. |
 | `initial_traj_file` | `adsorbate_pt_initial.traj` | Shared initialized adsorbate structure written once before PT starts. |
-| `write_debug_trajs` | `False` | Write per-replica attempted/accepted/rejected debug trajectories. |
+| `write_debug_trajs` | `False` | Write per-replica attempted/accepted/rejected debug trajectories. Attempted trajectories contain materialized trial structures before the shared filter/acceptance pipeline. Metropolis-tested accepted/rejected frames include `Atoms.info` fields such as `mc_energy_eV`, `mc_current_energy_eV`, `mc_delta_e_eV`, `mc_acceptance_delta_eV`, `mc_accept_prob`, `mc_move_name`, `mc_event`, and `mc_reject_reason`. Geometry-filter rejections may not have energy fields because no calculator call is made. |
 | `write_accepted_traj`, `write_rejected_traj` | `False` | Individually enable accepted or rejected debug trajectories. |
 | `debug_traj_interval` | `1` | Write only every Nth debug event to attempted/accepted/rejected trajectories. |
+| `diagnostics_enabled` / `moves.diagnostics.enabled` | `False` | Collect `move_diagnostics` counters by move type and rejection reason in returned stats and checkpoints. Keep disabled for lean production runs. |
+| `diagnostics_log` / `moves.diagnostics.log` | `False` | Append compact move/rejection summaries to normal report logs when diagnostics are enabled. |
+| `diagnostics_top_n` / `moves.diagnostics.top_n` | `3` | Number of top move/rejection counters shown in report logs. |
 
 On resume, PT output files are truncated back to the master-checkpoint boundary
 before new rows are appended.  This avoids duplicate sweep/cycle segments in
@@ -292,8 +307,8 @@ These keys are available in all adsorbate workflows unless noted otherwise.
 
 | Key | Workflows | Default | Meaning |
 | --- | --- | --- | --- |
-| `relax` | all | `False` | Perform local structural relaxation after accepted moves. |
-| `relax_steps` | all | `10` in GCMC, `20` in CMC | Maximum local relaxation steps. |
+| `relax` | all | `False` | Perform local structural relaxation of trial moves before acceptance. |
+| `relax_steps` | all | `10` in GCMC, `20` in CMC | Maximum local relaxation steps. Non-convergence at this limit is recorded but does not reject the trial by itself. |
 | `fmax` | all | `0.05` | Force threshold for local relaxation. |
 | `enable_hybrid_md` | all | `False` in GCMC, `False` in CMC defaults but examples often enable it | Enable short MD bursts as proposal moves. |
 | `md_move_prob` | all | `0.0` in GCMC, `0.1` in CMC | Probability of attempting an MD proposal instead of an MC move. |

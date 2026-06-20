@@ -357,7 +357,7 @@ class SurfaceMCBase(BaseMC):
             support_pos = pos[support_indices]
             deltas, _ = get_distances(ads_pos, support_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
-            dz = ads_pos[2] - support_pos[:, 2]
+            dz = -deltas[0, :, 2]
 
             lateral_mask = dxy < support_xy_tol
             dz_lateral = dz[lateral_mask]
@@ -431,7 +431,7 @@ class SurfaceMCBase(BaseMC):
             other_pos = pos[other_indices]
             deltas, _ = get_distances(ads_pos, other_pos, cell=cell, pbc=pbc)
             dxy = np.linalg.norm(deltas[0, :, :2], axis=1)
-            dz = other_pos[:, 2] - ads_pos[2]
+            dz = deltas[0, :, 2]
 
             mask = (dxy < support_xy_tol) & (dz > z_tol)
             if not np.any(mask):

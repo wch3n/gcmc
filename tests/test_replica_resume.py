@@ -3,13 +3,45 @@ import unittest
 from pathlib import Path
 
 from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
 from ase.io import Trajectory
 
 from gcmc.replica import ReplicaExchange
 from gcmc.workflows import load_alloy_pt_config
 
 
+class ZeroCalculator(Calculator):
+    implemented_properties = ["energy", "forces"]
+
+    def calculate(
+        self,
+        atoms=None,
+        properties=("energy",),
+        system_changes=all_changes,
+    ):
+        super().calculate(atoms, properties, system_changes)
+        self.results = {"energy": 0.0, "forces": [[0.0, 0.0, 0.0] for _ in atoms]}
+
+
+class DummyMC:
+    pass
+
+
 class ReplicaResumeTests(unittest.TestCase):
+    def test_fresh_replica_states_defer_initial_energy_to_worker(self):
+        pt = ReplicaExchange.from_auto_config(
+            atoms_template=Atoms("H", positions=[[0.0, 0.0, 0.0]]),
+            T_start=300.0,
+            T_end=400.0,
+            T_step=100.0,
+            calculator_class=ZeroCalculator,
+            mc_class=DummyMC,
+            n_gpus=1,
+            workers_per_gpu=1,
+        )
+
+        self.assertEqual([state["e_old"] for state in pt.replica_states], [None, None])
+
     def test_resume_cleanup_truncates_outputs_to_checkpoint_boundary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

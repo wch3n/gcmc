@@ -84,7 +84,6 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "site_hop_prob": 0.25,
     "reorientation_prob": 0.0,
     "puckering_prob": 0.0,
-    "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
@@ -188,7 +187,6 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "site_hop_prob": 0.25,
     "reorientation_prob": 0.0,
     "puckering_prob": 0.0,
-    "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
@@ -257,6 +255,9 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "lj_cutoff": 6.0,
     "adsorbate": "H",
     "adsorbate_anchor_index": 0,
+    "adsorbate_anchor_mode": "atom",
+    "adsorbate_anchor_atom_indices": None,
+    "adsorbate_templates": None,
     "temperature": 300.0,
     "initialization_mode": "clean_surface",
     "coverage": 1.0,
@@ -274,7 +275,6 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "hop_puckering_prob": 0.0,
     "hop_puckering_reorientation_prob": 0.0,
     "puckering_prob": 0.0,
-    "puckering_hop_prob": 0.0,
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
@@ -288,6 +288,8 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "min_clearance": 0.9,
     "adsorbate_surface_clearance_A": 0.0,
     "adsorbate_surface_xy_tol_A": None,
+    "molecular_upright_atom_indices": None,
+    "molecular_upright_min_z_A": None,
     "site_match_tol": 0.6,
     "support_xy_tol": None,
     "termination_site_xy_tol": None,
@@ -305,6 +307,9 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "fmax": 0.05,
     "verbose_relax": False,
     "debug_traj_interval": 1,
+    "diagnostics_enabled": False,
+    "diagnostics_log": False,
+    "diagnostics_top_n": 3,
     "enable_hybrid_md": False,
     "md_move_prob": 0.1,
     "md_steps": 50,
@@ -460,6 +465,12 @@ _DEFAULT_ALLOY_CMC_CONFIG = {
     "seed": 67,
     "resume": False,
     "checkpoint_interval": 100,
+    "write_debug_trajs": False,
+    "write_attempted_traj": False,
+    "write_accepted_traj": False,
+    "write_rejected_traj": False,
+    "debug_traj_interval": 1,
+    "output_dir": None,
     "output_prefix": "alloy_cmc",
 }
 
@@ -543,6 +554,11 @@ _DEFAULT_ALLOY_PT_CONFIG = {
     "results_file": "results.csv",
     "checkpoint_file": "pt_state.pkl",
     "output_dir": "alloy_pt",
+    "write_debug_trajs": False,
+    "write_attempted_traj": False,
+    "write_accepted_traj": False,
+    "write_rejected_traj": False,
+    "debug_traj_interval": 1,
 }
 
 
@@ -732,9 +748,124 @@ def build_adsorbate_template(name_or_path: str | Atoms) -> tuple[Atoms, int]:
 
     path = Path(str(name_or_path))
     if path.exists():
-        return read(path), 0
+        try:
+            return read(path), 0
+        except Exception:
+            return read(path, format="vasp"), 0
 
     return Atoms(str(name_or_path), positions=[(0.0, 0.0, 0.0)]), 0
+
+
+def _resolve_adsorbate_path_value(value, base_dir: Path):
+    if not isinstance(value, str):
+        return value
+    adsorbate_path = base_dir / value
+    if Path(value).is_absolute() or adsorbate_path.exists() or Path(value).suffix:
+        path = Path(value)
+        return str(path if path.is_absolute() else adsorbate_path.resolve())
+    return value
+
+
+def _resolve_adsorbate_template_paths(flat_config: dict, base_dir: Path) -> dict:
+    flat_config["adsorbate"] = _resolve_adsorbate_path_value(
+        flat_config.get("adsorbate"),
+        base_dir,
+    )
+    templates = flat_config.get("adsorbate_templates")
+    if templates is None:
+        return flat_config
+    resolved = []
+    for entry in templates:
+        if isinstance(entry, str):
+            resolved.append(_resolve_adsorbate_path_value(entry, base_dir))
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError("adsorbate_templates entries must be strings or mappings.")
+        item = dict(entry)
+        for key in ("adsorbate", "template", "path"):
+            if key in item:
+                item[key] = _resolve_adsorbate_path_value(item[key], base_dir)
+        resolved.append(item)
+    flat_config["adsorbate_templates"] = resolved
+    return flat_config
+
+
+def _template_entry_to_mc_spec(entry, cfg: SimpleNamespace) -> dict:
+    if isinstance(entry, str):
+        return {"adsorbate": entry}
+    if not isinstance(entry, dict):
+        raise ValueError("adsorbate_templates entries must be strings or mappings.")
+    spec = dict(entry)
+    if "template" in spec and "adsorbate" not in spec:
+        spec["adsorbate"] = spec.pop("template")
+    if "path" in spec and "adsorbate" not in spec:
+        spec["adsorbate"] = spec.pop("path")
+    return spec
+
+
+def _adsorbate_template_library_from_config(cfg: SimpleNamespace) -> list[dict] | None:
+    entries = getattr(cfg, "adsorbate_templates", None)
+    if entries is None:
+        return None
+    specs = [_template_entry_to_mc_spec(entry, cfg) for entry in entries]
+    for spec in specs:
+        anchor = spec.get("anchor")
+        if not isinstance(anchor, dict):
+            spec.setdefault(
+                "anchor_mode",
+                getattr(cfg, "adsorbate_anchor_mode", "atom"),
+            )
+            if getattr(cfg, "adsorbate_anchor_atom_indices", None) is not None:
+                spec.setdefault(
+                    "anchor_atom_indices",
+                    getattr(cfg, "adsorbate_anchor_atom_indices"),
+                )
+    return specs
+
+
+def _select_initial_adsorbate_template(
+    cfg: SimpleNamespace,
+    seed: int,
+) -> tuple[Atoms, int, str, object, list[dict] | None]:
+    library = _adsorbate_template_library_from_config(cfg)
+    if not library:
+        template, default_anchor_index = build_adsorbate_template(cfg.adsorbate)
+        anchor_index = int(getattr(cfg, "adsorbate_anchor_index", default_anchor_index))
+        return (
+            template,
+            anchor_index,
+            str(getattr(cfg, "adsorbate_anchor_mode", "atom")),
+            getattr(cfg, "adsorbate_anchor_atom_indices", None),
+            None,
+        )
+
+    weights = np.asarray([float(spec.get("weight", 1.0)) for spec in library], dtype=float)
+    if np.any(weights < 0.0) or float(np.sum(weights)) <= 0.0:
+        raise ValueError("adsorbate_templates weights must be non-negative and sum positive.")
+    rng = np.random.default_rng(seed)
+    chosen = dict(library[int(rng.choice(len(library), p=weights / np.sum(weights)))])
+    template, default_anchor_index = build_adsorbate_template(chosen["adsorbate"])
+    anchor_cfg = chosen.get("anchor", None)
+    anchor_index = int(chosen.get("anchor_index", default_anchor_index))
+    if isinstance(anchor_cfg, dict):
+        anchor_index = int(
+            anchor_cfg.get(
+                "reference_atom_index",
+                anchor_cfg.get("atom_index", anchor_index),
+            )
+        )
+    anchor_mode = str(chosen.get("anchor_mode", getattr(cfg, "adsorbate_anchor_mode", "atom")))
+    anchor_atom_indices = chosen.get(
+        "anchor_atom_indices",
+        chosen.get("atom_indices", getattr(cfg, "adsorbate_anchor_atom_indices", None)),
+    )
+    if isinstance(anchor_cfg, dict):
+        anchor_mode = str(anchor_cfg.get("mode", anchor_mode))
+        anchor_atom_indices = anchor_cfg.get(
+            "atom_indices",
+            anchor_cfg.get("indices", anchor_atom_indices),
+        )
+    return template, anchor_index, anchor_mode, anchor_atom_indices, library
 
 
 def _infer_functional_elements_from_config(
@@ -997,19 +1128,7 @@ def load_adsorbate_gcmc_scan_config(config_path: str | Path) -> SimpleNamespace:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
     flat_config = _resolve_mu_scan_values(flat_config)
-    adsorbate_value = flat_config.get("adsorbate")
-    if isinstance(adsorbate_value, str):
-        adsorbate_path = config_path.parent / adsorbate_value
-        if (
-            Path(adsorbate_value).is_absolute()
-            or adsorbate_path.exists()
-            or Path(adsorbate_value).suffix
-        ):
-            path = Path(adsorbate_value)
-            if not path.is_absolute():
-                flat_config["adsorbate"] = str(adsorbate_path.resolve())
-            else:
-                flat_config["adsorbate"] = str(path)
+    flat_config = _resolve_adsorbate_template_paths(flat_config, config_path.parent)
     return SimpleNamespace(**flat_config)
 
 
@@ -1041,19 +1160,7 @@ def load_adsorbate_gcmc_config(config_path: str | Path) -> SimpleNamespace:
     if "interval" in flat_config:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
-    adsorbate_value = flat_config.get("adsorbate")
-    if isinstance(adsorbate_value, str):
-        adsorbate_path = config_path.parent / adsorbate_value
-        if (
-            Path(adsorbate_value).is_absolute()
-            or adsorbate_path.exists()
-            or Path(adsorbate_value).suffix
-        ):
-            path = Path(adsorbate_value)
-            if not path.is_absolute():
-                flat_config["adsorbate"] = str(adsorbate_path.resolve())
-            else:
-                flat_config["adsorbate"] = str(path)
+    flat_config = _resolve_adsorbate_template_paths(flat_config, config_path.parent)
     output_prefix = flat_config.get("output_prefix")
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
@@ -1101,19 +1208,7 @@ def load_adsorbate_cmc_config(config_path: str | Path) -> SimpleNamespace:
         flat_config["write_interval"] = flat_config.pop("interval")
     flat_config = normalize_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
-    adsorbate_value = flat_config.get("adsorbate")
-    if isinstance(adsorbate_value, str):
-        adsorbate_path = config_path.parent / adsorbate_value
-        if (
-            Path(adsorbate_value).is_absolute()
-            or adsorbate_path.exists()
-            or Path(adsorbate_value).suffix
-        ):
-            path = Path(adsorbate_value)
-            if not path.is_absolute():
-                flat_config["adsorbate"] = str(adsorbate_path.resolve())
-            else:
-                flat_config["adsorbate"] = str(path)
+    flat_config = _resolve_adsorbate_template_paths(flat_config, config_path.parent)
     output_prefix = flat_config.get("output_prefix")
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
@@ -1173,19 +1268,7 @@ def load_adsorbate_pt_config(config_path: str | Path) -> SimpleNamespace:
 
     flat_config = normalize_adsorbate_move_config(flat_config)
     flat_config = _resolve_path_fields(flat_config, config_path.parent)
-    adsorbate_value = flat_config.get("adsorbate")
-    if isinstance(adsorbate_value, str):
-        adsorbate_path = config_path.parent / adsorbate_value
-        if (
-            Path(adsorbate_value).is_absolute()
-            or adsorbate_path.exists()
-            or Path(adsorbate_value).suffix
-        ):
-            path = Path(adsorbate_value)
-            if not path.is_absolute():
-                flat_config["adsorbate"] = str(adsorbate_path.resolve())
-            else:
-                flat_config["adsorbate"] = str(path)
+    flat_config = _resolve_adsorbate_template_paths(flat_config, config_path.parent)
 
     output_dir = Path(flat_config["output_dir"])
     for key in ("stats_file", "results_file", "checkpoint_file", "initial_traj_file"):
@@ -1232,9 +1315,12 @@ def load_alloy_cmc_config(config_path: str | Path) -> SimpleNamespace:
     if output_prefix is not None:
         output_prefix_path = Path(output_prefix)
         if not output_prefix_path.is_absolute():
-            flat_config["output_prefix"] = str(
-                (config_path.parent / output_prefix_path).resolve()
-            )
+            if flat_config.get("output_dir") is None:
+                flat_config["output_prefix"] = str(
+                    (config_path.parent / output_prefix_path).resolve()
+                )
+            else:
+                flat_config["output_prefix"] = str(output_prefix_path)
         else:
             flat_config["output_prefix"] = str(output_prefix_path)
     return SimpleNamespace(**flat_config)
@@ -1645,7 +1731,6 @@ class AdsorbateGCMCScanWorkflow:
                 0.0 if len(adsorbate_template) == 1 else 0.2,
             ),
             puckering_prob=getattr(cfg, "puckering_prob", 0.0),
-            puckering_hop_prob=getattr(cfg, "puckering_hop_prob", 0.0),
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
@@ -1749,7 +1834,6 @@ class AdsorbateGCMCScanWorkflow:
                 0.0 if len(adsorbate_template) == 1 else 0.2,
             ),
             "puckering_prob": getattr(cfg, "puckering_prob", 0.0),
-            "puckering_hop_prob": getattr(cfg, "puckering_hop_prob", 0.0),
             "puckering_elements": _parse_symbols(
                 getattr(cfg, "puckering_elements", ())
             )
@@ -2211,12 +2295,11 @@ class AdsorbateCMCWorkflow:
             "site_overlay_file": str(prefix.parent / f"{prefix.name}_sites.traj"),
         }
 
-    def _build_adsorbate_template(self) -> tuple[Atoms, int]:
-        template, default_anchor_index = build_adsorbate_template(self.config.adsorbate)
-        anchor_index = int(
-            getattr(self.config, "adsorbate_anchor_index", default_anchor_index)
-        )
-        return template, anchor_index
+    def _build_adsorbate_template(
+        self,
+        seed: int,
+    ) -> tuple[Atoms, int, str, object, list[dict] | None]:
+        return _select_initial_adsorbate_template(self.config, seed)
 
     def _ray_num_gpus_per_task(self) -> float:
         value = getattr(self.config, "ray_num_gpus_per_task", None)
@@ -2267,7 +2350,13 @@ class AdsorbateCMCWorkflow:
             output_file=output_paths["site_overlay_file"],
             functional_elements=functional_elements,
         )
-        adsorbate_template, anchor_index = self._build_adsorbate_template()
+        (
+            adsorbate_template,
+            anchor_index,
+            anchor_mode,
+            anchor_atom_indices,
+            template_library,
+        ) = self._build_adsorbate_template(run_seed)
         anchor_symbol = adsorbate_template[anchor_index].symbol
         init_mode = str(getattr(cfg, "initialization_mode", "clean_surface")).lower()
 
@@ -2276,6 +2365,9 @@ class AdsorbateCMCWorkflow:
             adsorbate_element=anchor_symbol,
             adsorbate=adsorbate_template,
             adsorbate_anchor_index=anchor_index,
+            adsorbate_anchor_mode=anchor_mode,
+            adsorbate_anchor_atom_indices=anchor_atom_indices,
+            adsorbate_template_library=template_library,
             substrate_elements=substrate_elements,
             functional_elements=functional_elements,
             top_layer_element=getattr(cfg, "top_layer_element", None),
@@ -2291,7 +2383,6 @@ class AdsorbateCMCWorkflow:
                 cfg, "hop_puckering_reorientation_prob", 0.0
             ),
             puckering_prob=getattr(cfg, "puckering_prob", 0.0),
-            puckering_hop_prob=getattr(cfg, "puckering_hop_prob", 0.0),
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
@@ -2314,6 +2405,10 @@ class AdsorbateCMCWorkflow:
             adsorbate_surface_xy_tol_A=getattr(
                 cfg, "adsorbate_surface_xy_tol_A", None
             ),
+            molecular_upright_atom_indices=getattr(
+                cfg, "molecular_upright_atom_indices", None
+            ),
+            molecular_upright_min_z_A=getattr(cfg, "molecular_upright_min_z_A", None),
             site_match_tol=cfg.site_match_tol,
             support_xy_tol=_resolve_support_xy_tol(cfg),
             termination_site_xy_tol=_resolve_termination_site_xy_tol(cfg),
@@ -2335,6 +2430,9 @@ class AdsorbateCMCWorkflow:
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
             debug_traj_interval=int(getattr(cfg, "debug_traj_interval", 1)),
+            diagnostics_enabled=bool(getattr(cfg, "diagnostics_enabled", False)),
+            diagnostics_log=bool(getattr(cfg, "diagnostics_log", False)),
+            diagnostics_top_n=int(getattr(cfg, "diagnostics_top_n", 3)),
             seed=run_seed,
             resume=bool(getattr(cfg, "resume", False)),
             enable_hybrid_md=bool(getattr(cfg, "enable_hybrid_md", False)),
@@ -2390,6 +2488,8 @@ class AdsorbateCMCWorkflow:
                     termination_elements=functional_elements,
                     min_termination_dist=cfg.termination_clearance,
                     anchor_index=anchor_index,
+                    anchor_mode=anchor_mode,
+                    anchor_atom_indices=anchor_atom_indices,
                     seed=run_seed,
                 )
             )
@@ -2559,12 +2659,11 @@ class AdsorbateReplicaExchangeWorkflow:
         atoms = self.snapshot_loader(Path(self.config.snapshot), int(self.config.frame))
         return _prepare_adsorbate_scan_atoms(atoms, self.config, {})
 
-    def _build_adsorbate_template(self) -> tuple[Atoms, int]:
-        template, default_anchor_index = build_adsorbate_template(self.config.adsorbate)
-        anchor_index = int(
-            getattr(self.config, "adsorbate_anchor_index", default_anchor_index)
-        )
-        return template, anchor_index
+    def _build_adsorbate_template(
+        self,
+        seed: int,
+    ) -> tuple[Atoms, int, str, object, list[dict] | None]:
+        return _select_initial_adsorbate_template(self.config, seed)
 
     def _write_initial_traj(self, atoms: Atoms) -> None:
         initial_traj = Path(self.config.initial_traj_file)
@@ -2575,7 +2674,7 @@ class AdsorbateReplicaExchangeWorkflow:
 
     def _initialize_atoms(
         self,
-    ) -> tuple[Atoms, dict, tuple[str, ...], tuple[str, ...], Atoms, int]:
+    ) -> tuple[Atoms, dict, tuple[str, ...], tuple[str, ...], Atoms, int, str, object, list[dict] | None]:
         cfg = self.config
         atoms = self._load_atoms()
         substrate_elements = _parse_symbols(getattr(cfg, "substrate_elements", ()))
@@ -2586,9 +2685,15 @@ class AdsorbateReplicaExchangeWorkflow:
             output_file=Path(cfg.output_dir) / "site_overlay.traj",
             functional_elements=functional_elements,
         )
-        adsorbate_template, anchor_index = self._build_adsorbate_template()
         init_mode = str(getattr(cfg, "initialization_mode", "clean_surface")).lower()
         init_seed = int(getattr(cfg, "initialization_seed", 81))
+        (
+            adsorbate_template,
+            anchor_index,
+            anchor_mode,
+            anchor_atom_indices,
+            template_library,
+        ) = self._build_adsorbate_template(init_seed)
 
         init_summary = {
             "snapshot": str(cfg.snapshot),
@@ -2627,6 +2732,8 @@ class AdsorbateReplicaExchangeWorkflow:
                 atoms,
                 adsorbate_template,
                 anchor_index=anchor_index,
+                anchor_mode=anchor_mode,
+                anchor_atom_indices=anchor_atom_indices,
                 site_registry=site_registry,
                 coverage=float(cfg.coverage),
                 seed=init_seed,
@@ -2656,6 +2763,8 @@ class AdsorbateReplicaExchangeWorkflow:
                     termination_elements=functional_elements,
                     min_termination_dist=cfg.termination_clearance,
                     anchor_index=anchor_index,
+                    anchor_mode=anchor_mode,
+                    anchor_atom_indices=anchor_atom_indices,
                     seed=init_seed,
                 )
             )
@@ -2683,6 +2792,9 @@ class AdsorbateReplicaExchangeWorkflow:
             functional_elements,
             adsorbate_template,
             anchor_index,
+            anchor_mode,
+            anchor_atom_indices,
+            template_library,
         )
 
     def _mc_kwargs(
@@ -2692,12 +2804,18 @@ class AdsorbateReplicaExchangeWorkflow:
         functional_elements: tuple[str, ...],
         adsorbate_template: Atoms,
         anchor_index: int,
+        anchor_mode: str = "atom",
+        anchor_atom_indices=None,
+        template_library: list[dict] | None = None,
     ) -> dict:
         cfg = self.config
         return {
             "adsorbate_element": adsorbate_template[anchor_index].symbol,
             "adsorbate": adsorbate_template,
             "adsorbate_anchor_index": anchor_index,
+            "adsorbate_anchor_mode": anchor_mode,
+            "adsorbate_anchor_atom_indices": anchor_atom_indices,
+            "adsorbate_template_library": template_library,
             "substrate_elements": substrate_elements,
             "functional_elements": functional_elements,
             "top_layer_element": getattr(cfg, "top_layer_element", None),
@@ -2713,7 +2831,6 @@ class AdsorbateReplicaExchangeWorkflow:
                 cfg, "hop_puckering_reorientation_prob", 0.0
             ),
             "puckering_prob": getattr(cfg, "puckering_prob", 0.0),
-            "puckering_hop_prob": getattr(cfg, "puckering_hop_prob", 0.0),
             "puckering_elements": _parse_symbols(
                 getattr(cfg, "puckering_elements", ())
             )
@@ -2740,6 +2857,12 @@ class AdsorbateReplicaExchangeWorkflow:
             "adsorbate_surface_xy_tol_A": getattr(
                 cfg, "adsorbate_surface_xy_tol_A", None
             ),
+            "molecular_upright_atom_indices": getattr(
+                cfg, "molecular_upright_atom_indices", None
+            ),
+            "molecular_upright_min_z_A": getattr(
+                cfg, "molecular_upright_min_z_A", None
+            ),
             "site_match_tol": cfg.site_match_tol,
             "support_xy_tol": _resolve_support_xy_tol(cfg),
             "termination_site_xy_tol": _resolve_termination_site_xy_tol(cfg),
@@ -2757,6 +2880,9 @@ class AdsorbateReplicaExchangeWorkflow:
             "fmax": float(cfg.fmax),
             "verbose_relax": bool(getattr(cfg, "verbose_relax", False)),
             "debug_traj_interval": int(getattr(cfg, "debug_traj_interval", 1)),
+            "diagnostics_enabled": bool(getattr(cfg, "diagnostics_enabled", False)),
+            "diagnostics_log": bool(getattr(cfg, "diagnostics_log", False)),
+            "diagnostics_top_n": int(getattr(cfg, "diagnostics_top_n", 3)),
             "checkpoint_interval": int(
                 getattr(cfg, "worker_checkpoint_interval", 0)
             ),
@@ -2895,6 +3021,9 @@ class AdsorbateReplicaExchangeWorkflow:
             functional_elements,
             adsorbate_template,
             anchor_index,
+            anchor_mode,
+            anchor_atom_indices,
+            template_library,
         ) = self._initialize_atoms()
         calc_class, calc_kwargs = build_replica_calculator_spec(cfg)
         mc_kwargs = self._mc_kwargs(
@@ -2902,6 +3031,9 @@ class AdsorbateReplicaExchangeWorkflow:
             functional_elements=functional_elements,
             adsorbate_template=adsorbate_template,
             anchor_index=anchor_index,
+            anchor_mode=anchor_mode,
+            anchor_atom_indices=anchor_atom_indices,
+            template_library=template_library,
         )
 
         out_dir = Path(cfg.output_dir)
@@ -3069,7 +3201,6 @@ class AdsorbateGCMCWorkflow:
                 0.0 if len(adsorbate_template) == 1 else 0.2,
             ),
             puckering_prob=getattr(cfg, "puckering_prob", 0.0),
-            puckering_hop_prob=getattr(cfg, "puckering_hop_prob", 0.0),
             puckering_elements=_parse_symbols(getattr(cfg, "puckering_elements", ()))
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
@@ -3172,13 +3303,34 @@ class AlloyCMCWorkflow:
 
     def _build_output_paths(self) -> dict[str, str]:
         prefix = Path(self.config.output_prefix)
+        output_dir = getattr(self.config, "output_dir", None)
+        if output_dir is not None and not prefix.is_absolute():
+            prefix = Path(output_dir) / prefix
         prefix.parent.mkdir(parents=True, exist_ok=True)
-        return {
+        paths = {
             "traj_file": str(prefix.with_suffix(".traj")),
-            "accepted_traj_file": str(prefix.parent / f"{prefix.name}_accepted.traj"),
             "thermo_file": str(prefix.with_suffix(".dat")),
             "checkpoint_file": str(prefix.with_suffix(".pkl")),
         }
+        if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+            getattr(self.config, "write_attempted_traj", False)
+        ):
+            paths["attempted_traj_file"] = str(
+                prefix.parent / f"{prefix.name}_attempted.traj"
+            )
+        if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+            getattr(self.config, "write_accepted_traj", False)
+        ):
+            paths["accepted_traj_file"] = str(
+                prefix.parent / f"{prefix.name}_accepted.traj"
+            )
+        if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+            getattr(self.config, "write_rejected_traj", False)
+        ):
+            paths["rejected_traj_file"] = str(
+                prefix.parent / f"{prefix.name}_rejected.traj"
+            )
+        return paths
 
     def _build_simulation(self):
         cfg = self.config
@@ -3228,7 +3380,10 @@ class AlloyCMCWorkflow:
             relax_radius=float(getattr(cfg, "relax_radius", 4.0)),
             fmax=float(cfg.fmax),
             traj_file=output_paths["traj_file"],
-            accepted_traj_file=output_paths["accepted_traj_file"],
+            accepted_traj_file=output_paths.get("accepted_traj_file"),
+            attempted_traj_file=output_paths.get("attempted_traj_file"),
+            rejected_traj_file=output_paths.get("rejected_traj_file"),
+            debug_traj_interval=int(getattr(cfg, "debug_traj_interval", 1)),
             thermo_file=output_paths["thermo_file"],
             checkpoint_file=output_paths["checkpoint_file"],
             checkpoint_interval=int(getattr(cfg, "checkpoint_interval", 100)),
@@ -3349,6 +3504,7 @@ class AlloyReplicaExchangeWorkflow:
             "md_planar_axis": int(getattr(cfg, "md_planar_axis", 2)),
             "md_init_momenta": bool(getattr(cfg, "md_init_momenta", True)),
             "md_remove_drift": bool(getattr(cfg, "md_remove_drift", True)),
+            "debug_traj_interval": int(getattr(cfg, "debug_traj_interval", 1)),
         }
         return kwargs
 
@@ -3456,6 +3612,19 @@ class AlloyReplicaExchangeWorkflow:
             state["traj_file"] = str(out_dir / Path(state["traj_file"]).name)
             state["thermo_file"] = str(out_dir / Path(state["thermo_file"]).name)
             state["checkpoint_file"] = str(out_dir / Path(state["checkpoint_file"]).name)
+            stem = Path(state["traj_file"]).with_suffix("").name
+            if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+                getattr(self.config, "write_attempted_traj", False)
+            ):
+                state["attempted_traj_file"] = str(out_dir / f"{stem}_attempted.traj")
+            if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+                getattr(self.config, "write_accepted_traj", False)
+            ):
+                state["accepted_traj_file"] = str(out_dir / f"{stem}_accepted.traj")
+            if bool(getattr(self.config, "write_debug_trajs", False)) or bool(
+                getattr(self.config, "write_rejected_traj", False)
+            ):
+                state["rejected_traj_file"] = str(out_dir / f"{stem}_rejected.traj")
 
     def run(self) -> ReplicaExchange:
         cfg = self.config

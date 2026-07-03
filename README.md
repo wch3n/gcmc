@@ -83,48 +83,43 @@ tests/
 
 ## Quick Start
 
-The recommended entry points are YAML-driven runners. In practice, edit the YAML and keep the Python launcher unchanged.
+The recommended entry points are installed YAML-driven commands. In practice,
+edit the YAML and keep the command unchanged.
 
 Alloy CMC:
 
 ```bash
-python3 examples/alloy/runners/run_cmc_alloy.py \
-  --config examples/alloy/configs/alloy_cmc.yaml
+gcmc-run-alloy-cmc --config examples/alloy/configs/alloy_cmc.yaml
 ```
 
 Alloy replica exchange:
 
 ```bash
-python3 examples/alloy/runners/run_pt_cmc_alloy.py \
-  --config examples/alloy/configs/alloy_pt.yaml
+gcmc-run-alloy-pt --config examples/alloy/configs/alloy_pt.yaml
 ```
 
 Ray-backed alloy replica exchange:
 
 ```bash
-python3 examples/alloy/runners/run_pt_cmc_alloy_ray.py \
-  --config examples/alloy/configs/alloy_pt_ray.yaml
+gcmc-run-alloy-pt --config examples/alloy/configs/alloy_pt_ray.yaml
 ```
 
 Adsorbate CMC:
 
 ```bash
-python3 examples/adsorbate/runners/run_adsorbate_cmc.py \
-  --config examples/adsorbate/configs/adsorbate_cmc.yaml
+gcmc-run-adsorbate-cmc --config examples/adsorbate/configs/adsorbate_cmc.yaml
 ```
 
 Adsorbate GCMC:
 
 ```bash
-python3 examples/adsorbate/runners/run_adsorbate_gcmc.py \
-  --config examples/adsorbate/configs/adsorbate_gcmc.yaml
+gcmc-run-adsorbate-gcmc --config examples/adsorbate/configs/adsorbate_gcmc.yaml
 ```
 
 Adsorbate GCMC scan or `mu` exchange:
 
 ```bash
-python3 examples/adsorbate/runners/run_adsorbate_gcmc_scan.py \
-  --config examples/adsorbate/configs/adsorbate_gcmc_scan.yaml
+gcmc-run-adsorbate-gcmc-scan --config examples/adsorbate/configs/adsorbate_gcmc_scan.yaml
 ```
 
 ## Configuration

@@ -1,3 +1,5 @@
+"""Command-line entry point for adsorbate GCMC scan workflows."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,16 +8,14 @@ from pathlib import Path
 from gcmc.workflows import AdsorbateGCMCScanWorkflow
 
 
-THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = THIS_DIR.parent / "configs" / "adsorbate_gcmc_scan.yaml"
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Run adsorbate GCMC scan or mu-exchange from a YAML config."
+    )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
+        required=True,
         help="Path to the adsorbate GCMC scan YAML config.",
     )
     args = parser.parse_args()

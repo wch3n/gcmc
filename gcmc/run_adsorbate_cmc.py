@@ -1,3 +1,5 @@
+"""Command-line entry point for canonical adsorbate CMC workflows."""
+
 from __future__ import annotations
 
 import argparse
@@ -6,16 +8,14 @@ from pathlib import Path
 from gcmc.workflows import AdsorbateCMCWorkflow
 
 
-THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = THIS_DIR.parent / "configs" / "adsorbate_cmc.yaml"
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Run a canonical adsorbate CMC workflow from a YAML config."
+    )
     parser.add_argument(
         "--config",
         type=Path,
-        default=DEFAULT_CONFIG,
+        required=True,
         help="Path to the canonical adsorbate CMC YAML config.",
     )
     args = parser.parse_args()

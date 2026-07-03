@@ -2947,11 +2947,15 @@ class AdsorbateReplicaExchangeWorkflow:
         if num_gpus is not None:
             actor_options["num_gpus"] = num_gpus
 
+        init_kwargs = {
+            "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
+        }
+        ray_address = getattr(self.config, "ray_address", None) or os.getenv("RAY_ADDRESS")
+        if ray_address:
+            init_kwargs["address"] = ray_address
+
         return {
-            "init_kwargs": {
-                "address": getattr(self.config, "ray_address", None) or "auto",
-                "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
-            },
+            "init_kwargs": init_kwargs,
             "actor_options": actor_options,
             "max_restarts": int(
                 getattr(self.config, "ray_actor_max_restarts", 0)
@@ -3556,11 +3560,15 @@ class AlloyReplicaExchangeWorkflow:
         if num_gpus is not None:
             actor_options["num_gpus"] = num_gpus
 
+        init_kwargs = {
+            "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
+        }
+        ray_address = getattr(self.config, "ray_address", None) or os.getenv("RAY_ADDRESS")
+        if ray_address:
+            init_kwargs["address"] = ray_address
+
         return {
-            "init_kwargs": {
-                "address": getattr(self.config, "ray_address", None) or "auto",
-                "log_to_driver": bool(getattr(self.config, "ray_log_to_driver", False)),
-            },
+            "init_kwargs": init_kwargs,
             "actor_options": actor_options,
             "max_restarts": int(
                 getattr(self.config, "ray_actor_max_restarts", 0)

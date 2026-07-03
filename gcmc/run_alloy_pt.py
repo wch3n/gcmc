@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+"""Command-line entry point for alloy parallel-tempering CMC workflows."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from gcmc.workflows import AlloyReplicaExchangeWorkflow
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run Ray-backed alloy replica exchange from a YAML configuration."
+        description="Run alloy parallel-tempering CMC from a YAML config."
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "configs" / "alloy_pt_ray.yaml",
-        help="Path to YAML config file.",
+        required=True,
+        help="Path to the alloy PT YAML config.",
     )
     args = parser.parse_args()
 

@@ -1,0 +1,147 @@
+# Example input for gcmc-prepare-adsorbate-cmc.
+# Use adsorbate.species: OH, O, or OOH for the three OER intermediates.
+
+workflow: cmc  # cmc or pt
+
+source:
+  snapshot: /path/to/pristine_slab_trajectory.traj
+  dat: /path/to/optional_source_trajectory.dat
+  out_dir: /path/to/generated_adsorbate_cmc_inputs
+  n_frames: 1
+  frame_start: 0
+  frame_stop: -1
+  # Explicit frame lists still work and take precedence over n_frames:
+  # frames: [700, 760, 820, 880, 940, 1000, 1060, 1124]
+  frame_selection:
+    method: evenly_spaced
+    # Use SOAP farthest-point sampling instead of time spacing:
+    # method: diverse
+    descriptor: soap
+    candidate_stride: 1
+    soap:
+      r_cut: 5.0
+      n_max: 6
+      l_max: 4
+      sigma: 0.5
+      average: inner
+      periodic: true
+      # species: [Ti, Zr, C, O]
+  seeds: [67, 211]
+
+output:
+  # Directory inside each generated task directory.
+  run_output_dir: results
+  output_prefix: adsorbate_cmc
+
+adsorbate:
+  species: OH
+  anchor_index: 0
+  n_adsorbates: 1
+  vertical_offset: 1.5
+  # For OOH, multiple templates can be used instead of a single species.
+  # templates:
+  #   - adsorbate: OOH
+  #     weight: 0.5
+  #     anchor:
+  #       mode: atom
+  #       index: 0
+  #   - path: /path/to/flat_ooh_template.xyz
+  #     weight: 0.5
+  #     anchor:
+  #       mode: center_of_mass
+  #       indices: [0, 1]
+
+sites:
+  elements: [Ti, Zr]
+  types: [atop, fcc, hcp]
+  surface_side: top
+
+slab:
+  substrate_elements: [Ti, Zr, C]
+  functional_elements: [O]
+
+cmc:
+  temperature: 300.0
+  nsweeps: 800
+  equilibration: 200
+  write_interval: 10
+  sample_interval: 5
+  checkpoint_interval: 100
+  relax: true
+  relax_steps: 20
+  fmax: 0.2
+  enable_hybrid_md: false
+  md_move_prob: 0.0
+  md_steps: 10
+  md_timestep_fs: 0.5
+  md_ensemble: nve
+  md_accept_mode: hamiltonian
+  displacement_sigma: 0.25
+  max_displacement_trials: 20
+  min_clearance: 0.8
+  adsorbate_surface_clearance_A: 0.2
+  adsorbate_surface_xy_tol_A: 2.5
+  diagnostics: false
+  diagnostics_log: false
+  # For OOH H-up proposals:
+  # molecular_upright_atom_indices: [2]
+  # molecular_upright_min_z_A: 0.0
+
+# Used only when workflow: pt.
+pt:
+  T_start: 800.0
+  T_end: 300.0
+  n_replicas: 8
+  grid_space: beta
+  swap_interval: 20
+  n_cycles: 150
+  equilibration_cycles: 20
+  sampling_interval: 2
+  report_interval: 5
+  checkpoint_interval: 10
+  resume: false
+
+# Used only when workflow: pt.
+backend:
+  backend: ray
+  n_gpus: 4
+  workers_per_gpu: 2
+  ray_address: null
+  ray_num_cpus_per_task: 2
+  ray_num_gpus_per_task: 0.5
+  ray_log_to_driver: false
+
+moves:
+  hop:
+    prob: 0.8
+    reorient:
+      prob: 0.5
+      angle_deg: 45.0
+      max_trials: 20
+    puckering:
+      prob: 0.0
+      elements: [Ti, Zr]
+      height_A: 0.5
+      height_jitter_A: 0.1
+      max_trials: 20
+  reorientation:
+    prob: 0.2
+    angle_deg: 45.0
+    max_trials: 20
+
+calculator:
+  calculator: symmetrix
+  model_file: /path/to/model.pt
+  device: cuda
+  use_kokkos: true
+
+slurm:
+  repo_root: /gpfs/home/acad/ucl-modl/wchen/mxene_proj/gcmc
+  partition: gpu
+  account: htbase
+  time: "12:00:00"
+  gres: gpu:1
+  cpus_per_task: 8
+  mem_per_cpu: 8gb
+  array_concurrency: 4
+  job_name: adsorbate_cmc

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+"""Command-line entry point for canonical alloy CMC workflows."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from gcmc.workflows import AlloyCMCWorkflow
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run canonical alloy MC from a YAML configuration."
+        description="Run canonical alloy CMC from a YAML config."
     )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "configs" / "alloy_cmc.yaml",
-        help="Path to YAML config file.",
+        required=True,
+        help="Path to the alloy CMC YAML config.",
     )
     args = parser.parse_args()
 

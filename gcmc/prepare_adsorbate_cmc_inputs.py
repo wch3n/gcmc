@@ -325,6 +325,8 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
         "equilibration",
         "write_interval",
         "sample_interval",
+        "write_debug_trajs",
+        "debug_traj_interval",
         "checkpoint_interval",
         "displacement_sigma",
         "max_displacement_trials",
@@ -535,6 +537,8 @@ def _config_for_task(
         "equilibration": args.equilibration,
         "write_interval": args.write_interval,
         "sample_interval": args.sample_interval,
+        "write_debug_trajs": bool(args.write_debug_trajs),
+        "debug_traj_interval": args.debug_traj_interval,
         "seed": int(seed),
         "resume": False,
         "checkpoint_interval": args.checkpoint_interval,
@@ -1059,6 +1063,22 @@ def build_parser(defaults: dict[str, object] | None = None) -> argparse.Argument
     parser.add_argument("--equilibration", type=int, default=default("equilibration", 200))
     parser.add_argument("--write-interval", type=int, default=default("write_interval", 10))
     parser.add_argument("--sample-interval", type=int, default=default("sample_interval", 5))
+    parser.add_argument(
+        "--write-debug-trajs",
+        dest="write_debug_trajs",
+        action="store_true",
+        default=default("write_debug_trajs", False),
+    )
+    parser.add_argument(
+        "--no-write-debug-trajs",
+        dest="write_debug_trajs",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--debug-traj-interval",
+        type=int,
+        default=default("debug_traj_interval", 1),
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=default("checkpoint_interval", 100))
 
     parser.add_argument("--displacement-sigma", type=float, default=default("displacement_sigma", 0.25))

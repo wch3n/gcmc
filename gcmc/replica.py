@@ -2,6 +2,8 @@ import numpy as np
 import logging
 import os
 import pickle
+import signal
+import threading
 import time
 from ase import Atoms
 from ase.io import Trajectory
@@ -92,6 +94,7 @@ class ReplicaExchange:
         self.resume = bool(resume)
         self.cycle_start = 0
         self._resume_outputs_prepared = False
+        self._stop_requested = False
         self.has_adsorbate_observables = any(
             (
                 _count_tagged_adsorbate_groups(state["atoms"]) > 0
@@ -287,14 +290,50 @@ class ReplicaExchange:
             **pt_kwargs,
         )
 
+    def request_stop(self):
+        """Request a clean stop at the next complete PT-cycle boundary."""
+        self._stop_requested = True
+
+    def _install_stop_signal_handler(self):
+        stop_signal = getattr(signal, "SIGUSR1", None)
+        if (
+            stop_signal is None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return None
+
+        previous_handler = signal.getsignal(stop_signal)
+
+        def handle_stop_signal(_signum, _frame):
+            self.request_stop()
+
+        signal.signal(stop_signal, handle_stop_signal)
+        return stop_signal, previous_handler
+
+    @staticmethod
+    def _restore_stop_signal_handler(installed_handler):
+        if installed_handler is not None:
+            stop_signal, previous_handler = installed_handler
+            signal.signal(stop_signal, previous_handler)
+
     def run(self, n_cycles, equilibration_cycles=0):
-        self._prepare_resume_outputs()
-        self._start_workers()
-        logger.info(f"Starting PT Loop: Cycles {self.cycle_start} -> {n_cycles}")
-        kB = KB_EV_PER_K
+        self._stop_requested = False
+        installed_handler = self._install_stop_signal_handler()
+        completed_cycles = self.cycle_start
+        last_checkpoint_cycle = None
+        stopped_early = False
 
         try:
+            self._prepare_resume_outputs()
+            self._start_workers()
+            logger.info(f"Starting PT Loop: Cycles {self.cycle_start} -> {n_cycles}")
+            kB = KB_EV_PER_K
+
             for cycle in range(self.cycle_start, n_cycles):
+                if self._stop_requested:
+                    stopped_early = True
+                    break
+
                 logger.info(f"--- PT Cycle {cycle+1}/{n_cycles} ---")
 
                 is_equilibrating = cycle < equilibration_cycles
@@ -475,22 +514,38 @@ class ReplicaExchange:
                 )
 
                 self._attempt_swaps(cycle)
+                completed_cycles = cycle + 1
 
                 if (
                     self.checkpoint_interval > 0
                     and (cycle + 1) % self.checkpoint_interval == 0
                 ):
                     self._save_master_checkpoint(cycle + 1)
+                    last_checkpoint_cycle = cycle + 1
 
-            if (
+                if self._stop_requested:
+                    stopped_early = True
+                    break
+
+            if stopped_early:
+                if last_checkpoint_cycle != completed_cycles:
+                    self._save_master_checkpoint(completed_cycles)
+                logger.info(
+                    "Graceful stop completed at PT cycle %d.", completed_cycles
+                )
+            elif (
                 self.checkpoint_interval > 0
                 and (n_cycles == 0 or n_cycles % self.checkpoint_interval != 0)
             ):
                 self._save_master_checkpoint(n_cycles)
 
         finally:
-            self.stop()
-            logger.info("PT Completed.")
+            try:
+                self.stop()
+            finally:
+                self._restore_stop_signal_handler(installed_handler)
+            if not stopped_early:
+                logger.info("PT Completed.")
 
     def _attempt_swaps(self, cycle):
         kB = KB_EV_PER_K

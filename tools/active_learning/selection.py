@@ -1771,7 +1771,9 @@ def main() -> None:
             )
     print(
         f"Selected {len(train_selected)} training and {len(test_selected)} "
-        f"test structures from {len(eligible)} eligible frames"
+        f"test structures from {len(eligible)} committee-eligible frames "
+        f"({len(pool_candidate_indices)} uncertainty-shortlisted for SOAP; "
+        f"{len(valid_pool_positions)} passed SOAP-distance filters)"
     )
     print(f"Manifest: {manifest}")
     print(f"Training trajectory: {train_trajectory}")

@@ -26,6 +26,11 @@ dependencies = [
 speedups = [
     "matscipy"
 ]
+active-learning = [
+    "dscribe",
+    "h5py",
+    "pymatgen",
+]
 
 [project.urls]
 Homepage = "https://github.com/wch3n/gcmc"
@@ -41,6 +46,8 @@ gcmc-run-adsorbate-pt = "gcmc.run_adsorbate_pt:main"
 gcmc-run-adsorbate-gcmc = "gcmc.run_adsorbate_gcmc:main"
 gcmc-run-adsorbate-gcmc-scan = "gcmc.run_adsorbate_gcmc_scan:main"
 gcmc-prepare-adsorbate-cmc = "gcmc.prepare_adsorbate_cmc_inputs:main"
+gcmc-active-learning-select = "tools.active_learning.selection:main"
+gcmc-active-learning-evaluate = "tools.active_learning.evaluation:main"
 
 [tool.setuptools.packages.find]
-include = ["gcmc*", "reaction*"]
+include = ["gcmc*", "reaction*", "tools*"]

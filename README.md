@@ -33,6 +33,7 @@ Optional extras:
 
 ```bash
 pip3 install .[speedups]
+pip3 install '.[active-learning]'
 pip3 install ray
 ```
 
@@ -58,6 +59,9 @@ Notes:
   - single-`mu`, `mu`-scan, and fixed-`T` `mu`-replica-exchange workflows
 - `gcmc.analysis`
   - MXene ordering, motif, adsorption-site, and SRO analysis utilities
+- auxiliary active-learning tools
+  - committee/SOAP trajectory selection and VASP input preparation
+  - committee validation with persistent error histories
 
 ## Repository Layout
 
@@ -76,6 +80,8 @@ docs/
 examples/
   alloy/
   adsorbate/
+tools/
+  active_learning/
 scripts/
   slurm/
 tests/
@@ -121,6 +127,16 @@ Adsorbate GCMC scan or `mu` exchange:
 ```bash
 gcmc-run-adsorbate-gcmc-scan --config examples/adsorbate/configs/adsorbate_gcmc_scan.yaml
 ```
+
+Active-learning selection and committee evaluation:
+
+```bash
+gcmc-active-learning-select --help
+gcmc-active-learning-evaluate --help
+```
+
+These are auxiliary tools rather than part of the core `gcmc` namespace. See
+`docs/active_learning.md` for their workflow and defaults.
 
 ## Configuration
 

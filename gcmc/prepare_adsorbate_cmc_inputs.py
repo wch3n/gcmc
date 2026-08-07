@@ -326,6 +326,9 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
         "write_interval",
         "sample_interval",
         "write_debug_trajs",
+        "write_attempted_traj",
+        "write_accepted_traj",
+        "write_rejected_traj",
         "debug_traj_interval",
         "checkpoint_interval",
         "displacement_sigma",
@@ -361,6 +364,7 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
             defaults[key] = cmc[key]
             if key == "checkpoint_interval":
                 defaults.setdefault("pt_worker_checkpoint_interval", cmc[key])
+    defaults["cmc_resume"] = bool(cmc.get("resume", False))
 
     hop = moves.get("hop", {}) or {}
     reorientation = moves.get("reorientation", {}) or {}
@@ -456,6 +460,7 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
         "mem_per_cpu",
         "array_concurrency",
         "job_name",
+        "signal_seconds_before_timeout",
     ):
         if key in slurm:
             defaults[key] = slurm[key]
@@ -538,9 +543,12 @@ def _config_for_task(
         "write_interval": args.write_interval,
         "sample_interval": args.sample_interval,
         "write_debug_trajs": bool(args.write_debug_trajs),
+        "write_attempted_traj": bool(args.write_attempted_traj),
+        "write_accepted_traj": bool(args.write_accepted_traj),
+        "write_rejected_traj": bool(args.write_rejected_traj),
         "debug_traj_interval": args.debug_traj_interval,
         "seed": int(seed),
-        "resume": False,
+        "resume": bool(args.cmc_resume),
         "checkpoint_interval": args.checkpoint_interval,
         "displacement_sigma": args.displacement_sigma,
         "max_displacement_trials": args.max_displacement_trials,
@@ -730,6 +738,49 @@ def _write_slurm(root: Path, n_tasks: int, args: argparse.Namespace) -> None:
     module = "gcmc.run_adsorbate_pt" if workflow == "pt" else "gcmc.run_adsorbate_cmc"
     label = "adsorbate PT" if workflow == "pt" else "adsorbate CMC"
     nodes = int(getattr(args, "nodes", 1) or 1)
+    signal_seconds = int(getattr(args, "signal_seconds_before_timeout", 0) or 0)
+    if signal_seconds < 0:
+        raise ValueError("signal_seconds_before_timeout must be >= 0")
+    graceful_pt_stop = workflow == "pt" and signal_seconds > 0
+    signal_directive = (
+        f"#SBATCH --signal=B:USR1@{signal_seconds}\n" if graceful_pt_stop else ""
+    )
+    signal_handler = (
+        """
+driver_pid=""
+
+forward_stop_signal() {
+  if [[ -n "${driver_pid}" ]] && kill -0 "${driver_pid}" 2>/dev/null; then
+    echo "Received SIGUSR1; requesting a graceful PT checkpoint and stop."
+    kill -USR1 "${driver_pid}"
+  fi
+}
+trap forward_stop_signal USR1
+"""
+        if graceful_pt_stop
+        else ""
+    )
+    if graceful_pt_stop:
+        driver_command = f"""python3 -u -m {module} --config "${{CONFIG}}" &
+driver_pid=$!
+
+driver_status=0
+while true; do
+  set +e
+  wait "${{driver_pid}}"
+  wait_status=$?
+  set -e
+  if kill -0 "${{driver_pid}}" 2>/dev/null; then
+    continue
+  fi
+  driver_status=${{wait_status}}
+  break
+done
+exit "${{driver_status}}"
+"""
+    else:
+        driver_command = f"""python3 -u -m {module} --config "${{CONFIG}}"
+"""
 
     if workflow == "pt" and backend == "ray":
         gres = str(getattr(args, "gres", ""))
@@ -746,7 +797,7 @@ def _write_slurm(root: Path, n_tasks: int, args: argparse.Namespace) -> None:
 #SBATCH --output=logs/%A_%a.log
 #SBATCH --account={args.account}
 #SBATCH --time={args.time}
-#SBATCH --gres={args.gres}
+{signal_directive}#SBATCH --gres={args.gres}
 #SBATCH --cpus-per-task={args.cpus_per_task}
 #SBATCH --mem-per-cpu={args.mem_per_cpu}
 #SBATCH --array={array_spec}
@@ -795,6 +846,7 @@ cleanup() {{
   done
 }}
 trap cleanup EXIT
+{signal_handler}
 
 for n in "${{nodes[@]}}"; do
   srun -N1 -n1 -w "${{n}}" ray stop --force >/dev/null 2>&1 || true
@@ -840,7 +892,7 @@ done
 cd "$(dirname "${{CONFIG}}")"
 echo "Running {label} config: ${{CONFIG}}"
 echo "Ray address: ${{RAY_ADDRESS}}"
-python3 -u -m {module} --config "${{CONFIG}}"
+{driver_command}
 """
     else:
         text = f"""#!/bin/bash
@@ -852,7 +904,7 @@ python3 -u -m {module} --config "${{CONFIG}}"
 #SBATCH --output=logs/%A_%a.log
 #SBATCH --account={args.account}
 #SBATCH --time={args.time}
-#SBATCH --gres={args.gres}
+{signal_directive}#SBATCH --gres={args.gres}
 #SBATCH --cpus-per-task={args.cpus_per_task}
 #SBATCH --mem-per-cpu={args.mem_per_cpu}
 #SBATCH --array={array_spec}
@@ -876,10 +928,11 @@ if [[ -z "${{CONFIG}}" || ! -f "${{CONFIG}}" ]]; then
   echo "ERROR: no config for SLURM_ARRAY_TASK_ID=${{SLURM_ARRAY_TASK_ID}}" >&2
   exit 1
 fi
+{signal_handler}
 
 cd "$(dirname "${{CONFIG}}")"
 echo "Running {label} config: ${{CONFIG}}"
-python3 -u -m {module} --config "${{CONFIG}}"
+{driver_command}
 """
     path = root / "run_array.slurm"
     path.write_text(text)
@@ -1074,12 +1127,36 @@ def build_parser(defaults: dict[str, object] | None = None) -> argparse.Argument
         dest="write_debug_trajs",
         action="store_false",
     )
+    for option, description in (
+        ("attempted", "materialized proposals before validation"),
+        ("accepted", "accepted energy-evaluated proposals"),
+        ("rejected", "rejected validation and Metropolis proposals"),
+    ):
+        parser.add_argument(
+            f"--write-{option}-traj",
+            dest=f"write_{option}_traj",
+            action=argparse.BooleanOptionalAction,
+            default=default(f"write_{option}_traj", False),
+            help=f"Write {description} to a per-replica debug trajectory.",
+        )
     parser.add_argument(
         "--debug-traj-interval",
         type=int,
         default=default("debug_traj_interval", 1),
     )
     parser.add_argument("--checkpoint-interval", type=int, default=default("checkpoint_interval", 100))
+    parser.add_argument(
+        "--cmc-resume",
+        dest="cmc_resume",
+        action="store_true",
+        default=default("cmc_resume", False),
+        help="Resume generated single-temperature CMC runs from their checkpoints.",
+    )
+    parser.add_argument(
+        "--no-cmc-resume",
+        dest="cmc_resume",
+        action="store_false",
+    )
 
     parser.add_argument("--displacement-sigma", type=float, default=default("displacement_sigma", 0.25))
     parser.add_argument("--max-displacement-trials", type=int, default=default("max_displacement_trials", 20))
@@ -1184,6 +1261,15 @@ def build_parser(defaults: dict[str, object] | None = None) -> argparse.Argument
     parser.add_argument("--mem-per-cpu", default=default("mem_per_cpu", "8gb"))
     parser.add_argument("--array-concurrency", type=int, default=default("array_concurrency", 4))
     parser.add_argument("--job-name", default=default("job_name", "adsorbate_cmc"))
+    parser.add_argument(
+        "--signal-seconds-before-timeout",
+        type=int,
+        default=default("signal_seconds_before_timeout", 0),
+        help=(
+            "For PT workflows, ask Slurm to send SIGUSR1 this many seconds "
+            "before walltime so the driver checkpoints and stops cleanly; 0 disables it."
+        ),
+    )
     parser.set_defaults(
         adsorbate_templates=default("adsorbate_templates", None),
         system_extra=default("system_extra", {}),

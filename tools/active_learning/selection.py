@@ -31,6 +31,14 @@ from .models import (
 
 
 DEFAULT_SOAP_SPECIES = ("H", "C", "O", "Ti", "Zr", "Mo")
+CAMPAIGN_TRAJECTORY_KINDS = ("sampled", "accepted", "rejected", "attempted")
+DEFAULT_CAMPAIGN_TRAJECTORY_KINDS = ("sampled", "accepted", "rejected")
+REPLICA_TRAJECTORY_PATTERN = re.compile(
+    r"^replica_(?P<temperature>[-+]?\d+(?:\.\d+)?)K"
+    r"(?:_(?P<kind>accepted|rejected|attempted))?\.traj$"
+)
+SNAPSHOT_DIRECTORY_PATTERN = re.compile(r"^snapshot_(?P<index>\d+)$")
+SEED_DIRECTORY_PATTERN = re.compile(r"^seed_(?P<index>\d+)$")
 
 
 @dataclass
@@ -155,17 +163,87 @@ def structure_hash(atoms, decimals: int = 6) -> str:
     return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
 
 
-def resolve_input_trajectories(values: list[str] | None) -> list[Path]:
+def replica_temperature(path: Path) -> float | None:
+    match = REPLICA_TRAJECTORY_PATTERN.fullmatch(path.name)
+    return float(match.group("temperature")) if match else None
+
+
+def replica_trajectory_kind(path: Path) -> str | None:
+    match = REPLICA_TRAJECTORY_PATTERN.fullmatch(path.name)
+    if not match:
+        return None
+    return str(match.group("kind") or "sampled")
+
+
+def discover_campaign_trajectories(
+    root: Path,
+    temperatures: set[float] | None = None,
+    trajectory_kinds: set[str] | None = None,
+) -> list[Path]:
+    """Find requested PT trajectory pools below an adsorbate-CMC campaign."""
+    trajectories = []
+    for path in root.rglob("replica_*K*.traj"):
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        temperature = replica_temperature(path)
+        kind = replica_trajectory_kind(path)
+        if temperature is None or kind is None:
+            continue
+        if temperatures is not None and temperature not in temperatures:
+            continue
+        if trajectory_kinds is not None and kind not in trajectory_kinds:
+            continue
+        trajectories.append(path.resolve())
+    return sorted(trajectories, key=lambda path: str(path))
+
+
+def resolve_input_trajectories(
+    values: list[str] | None,
+    temperatures: set[float] | None = None,
+    trajectory_kinds: set[str] | None = None,
+) -> list[Path]:
     if values:
-        paths = list(
-            dict.fromkeys(
-                Path(value).expanduser().resolve() for value in values
-            )
-        )
-        missing = [str(path) for path in paths if not path.is_file()]
+        paths: list[Path] = []
+        missing: list[str] = []
+        empty_directories: list[str] = []
+        for value in values:
+            path = Path(value).expanduser().resolve()
+            if path.is_file():
+                paths.append(path)
+            elif path.is_dir():
+                requested_kinds = (
+                    trajectory_kinds
+                    if trajectory_kinds is not None
+                    else set(DEFAULT_CAMPAIGN_TRAJECTORY_KINDS)
+                )
+                discovered = discover_campaign_trajectories(
+                    path,
+                    temperatures,
+                    requested_kinds,
+                )
+                if not discovered:
+                    empty_directories.append(str(path))
+                paths.extend(discovered)
+            else:
+                missing.append(str(path))
         if missing:
             raise FileNotFoundError(
-                "Input trajectory file(s) not found: " + ", ".join(missing)
+                "Input path(s) not found: " + ", ".join(missing)
+            )
+        if empty_directories:
+            suffix = (
+                " at the requested temperature(s)"
+                if temperatures is not None
+                else ""
+            )
+            raise FileNotFoundError(
+                "No requested replica trajectory files were found"
+                f"{suffix} below: " + ", ".join(empty_directories)
+            )
+        paths = list(dict.fromkeys(paths))
+        if not paths:
+            raise FileNotFoundError(
+                "No input trajectories remain after temperature filtering."
             )
         return paths
 
@@ -186,32 +264,118 @@ def resolve_input_trajectories(values: list[str] | None) -> list[Path]:
 
 
 def load_trajectory_frames(
-    trajectory_path: Path, frame_stride: int
+    trajectory_path: Path,
+    frame_stride: int,
+    *,
+    tail_fraction: float = 1.0,
+    max_frames: int = 0,
+    require_mc_energy: bool = False,
 ) -> tuple[list, list[int]]:
     if frame_stride < 1:
         raise ValueError("--frame-stride must be at least 1")
+    if not 0.0 < tail_fraction <= 1.0:
+        raise ValueError("--input-tail-fraction must be in (0, 1]")
+    if max_frames < 0:
+        raise ValueError("--max-frames-per-trajectory cannot be negative")
+
+    def candidate_indices(n_frames: int) -> list[int]:
+        start = int(math.floor(n_frames * (1.0 - tail_fraction)))
+        return list(range(start, n_frames, frame_stride))
+
+    def cap_indices(indices: list[int]) -> list[int]:
+        if max_frames and len(indices) > max_frames:
+            positions = np.linspace(0, len(indices) - 1, max_frames, dtype=int)
+            indices = [indices[int(position)] for position in positions]
+        return indices
+
+    def has_mc_energy(atoms: Atoms) -> bool:
+        value = atoms.info.get("mc_energy_eV")
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
     if trajectory_path.name == "XDATCAR":
         from pymatgen.core.trajectory import Trajectory as PymatgenTrajectory
         from pymatgen.io.ase import AseAtomsAdaptor
 
         trajectory = PymatgenTrajectory.from_file(str(trajectory_path))
-        source_indices = list(range(0, len(trajectory), frame_stride))
+        source_indices = candidate_indices(len(trajectory))
+        if require_mc_energy:
+            candidate_frames = [
+                AseAtomsAdaptor.get_atoms(trajectory.get_structure(index))
+                for index in source_indices
+            ]
+            source_indices = [
+                index
+                for index, atoms in zip(source_indices, candidate_frames)
+                if has_mc_energy(atoms)
+            ]
+        source_indices = cap_indices(source_indices)
         frames = [
             AseAtomsAdaptor.get_atoms(trajectory.get_structure(index))
             for index in source_indices
         ]
+    elif trajectory_path.suffix.lower() == ".traj":
+        with AseTrajectory(str(trajectory_path), "r") as trajectory:
+            source_indices = candidate_indices(len(trajectory))
+            if require_mc_energy:
+                source_indices = [
+                    index
+                    for index in source_indices
+                    if has_mc_energy(trajectory[index])
+                ]
+            source_indices = cap_indices(source_indices)
+            frames = [trajectory[index].copy() for index in source_indices]
     else:
         loaded = read(str(trajectory_path), index=":")
         frames_all = loaded if isinstance(loaded, list) else [loaded]
-        source_indices = list(range(0, len(frames_all), frame_stride))
+        source_indices = candidate_indices(len(frames_all))
+        if require_mc_energy:
+            source_indices = [
+                index
+                for index in source_indices
+                if has_mc_energy(frames_all[index])
+            ]
+        source_indices = cap_indices(source_indices)
         frames = [frames_all[index].copy() for index in source_indices]
     if not frames:
+        if require_mc_energy:
+            print(
+                f"Skipping {trajectory_path}: no sampled frames contain "
+                "finite mc_energy_eV metadata"
+            )
+            return [], []
         raise ValueError(f"No frames loaded from {trajectory_path}")
     print(
         f"Loaded {len(frames)} frames from {trajectory_path} "
-        f"(stride={frame_stride})"
+        f"(stride={frame_stride}, tail_fraction={tail_fraction:g}, "
+        f"max_frames={max_frames or 'none'}, "
+        f"require_mc_energy={require_mc_energy})"
     )
     return frames, source_indices
+
+
+def trajectory_provenance(path: str | Path) -> dict[str, object]:
+    """Extract prepared-campaign provenance from a trajectory path."""
+    trajectory = Path(path)
+    snapshot = ""
+    seed: int | str = ""
+    for part in trajectory.parts:
+        snapshot_match = SNAPSHOT_DIRECTORY_PATTERN.fullmatch(part)
+        if snapshot_match:
+            snapshot = part
+        seed_match = SEED_DIRECTORY_PATTERN.fullmatch(part)
+        if seed_match:
+            seed = int(seed_match.group("index"))
+    temperature = replica_temperature(trajectory)
+    trajectory_kind = replica_trajectory_kind(trajectory) or "explicit"
+    return {
+        "source_snapshot": snapshot,
+        "source_seed": seed,
+        "source_temperature_K": "" if temperature is None else temperature,
+        "source_trajectory_kind": trajectory_kind,
+    }
 
 
 def resolve_reference_pools(
@@ -473,10 +637,12 @@ def deduplicate_candidates(
         zip(frames, source_trajectories, source_indices)
     ):
         key = structure_hash(atoms, decimals=decimals)
+        provenance = trajectory_provenance(source_trajectory)
         record: dict[str, object] = {
             "sampled_index": sampled_index,
             "source_trajectory": source_trajectory,
             "source_frame": source_index,
+            **provenance,
             "structure_hash": key,
             "n_atoms": len(atoms),
             "formula": atoms.get_chemical_formula(),
@@ -951,6 +1117,7 @@ def priority_aware_maxmin(
     descriptors: np.ndarray,
     priority_scores: np.ndarray,
     n_select: int,
+    initial_indices: list[int] | None = None,
 ) -> list[int]:
     if len(descriptors) == 0 or n_select <= 0:
         return []
@@ -958,7 +1125,15 @@ def priority_aware_maxmin(
     if len(descriptors) == 1:
         return [0]
     distances = cdist(descriptors, descriptors, metric="euclidean")
-    selected = [int(np.argmax(priority_scores))]
+    selected = list(
+        dict.fromkeys(int(index) for index in (initial_indices or []))
+    )
+    if any(index < 0 or index >= len(descriptors) for index in selected):
+        raise IndexError("Initial max-min index is outside the descriptor pool")
+    if len(selected) > n_select:
+        raise ValueError("Initial max-min selection exceeds n_select")
+    if not selected:
+        selected = [int(np.argmax(priority_scores))]
     while len(selected) < n_select:
         remaining = np.asarray(
             [index for index in range(len(descriptors)) if index not in selected],
@@ -1013,6 +1188,12 @@ def write_selected_trajectory(
                 {
                     "source_trajectory": str(record["source_trajectory"]),
                     "source_frame": int(record["source_frame"]),
+                    "source_snapshot": str(record["source_snapshot"]),
+                    "source_seed": record["source_seed"],
+                    "source_temperature_K": record["source_temperature_K"],
+                    "source_trajectory_kind": str(
+                        record["source_trajectory_kind"]
+                    ),
                     "candidate_index": candidate_index,
                     "dataset_role": dataset_role,
                     "selection_rank": int(record["selection_rank"]),
@@ -1046,6 +1227,10 @@ def write_manifest(path: Path, records: list[dict[str, object]]) -> None:
         "sampled_index",
         "source_trajectory",
         "source_frame",
+        "source_snapshot",
+        "source_seed",
+        "source_temperature_K",
+        "source_trajectory_kind",
         "structure_hash",
         "n_atoms",
         "formula",
@@ -1166,11 +1351,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         action="append",
         help=(
-            "XDATCAR or ASE-readable trajectory. Repeat to merge multiple "
-            "trajectory pools; auto-detected when omitted."
+            "XDATCAR, ASE-readable trajectory, or prepared adsorbate-CMC "
+            "campaign directory. Campaign directories are searched "
+            "recursively for requested replica trajectory pools. Repeat to "
+            "merge input pools; auto-detected when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        dest="temperatures",
+        action="append",
+        type=float,
+        help=(
+            "Replica temperature to include when --input is a campaign "
+            "directory. Repeat for multiple temperatures."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-kind",
+        dest="trajectory_kinds",
+        action="append",
+        choices=CAMPAIGN_TRAJECTORY_KINDS,
+        help=(
+            "Campaign trajectory pool to include. Repeat as needed. The "
+            "default combines sampled, accepted, and rejected trajectories; "
+            "attempted proposals are opt-in."
+        ),
+    )
+    parser.add_argument(
+        "--include-unevaluated-rejected",
+        action="store_true",
+        help=(
+            "Include rejected frames without mc_energy_eV metadata. By "
+            "default these geometry-filter failures are excluded."
         ),
     )
     parser.add_argument("--frame-stride", type=int, default=2)
+    parser.add_argument(
+        "--input-tail-fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction from the end of every input trajectory that may be "
+            "sampled (default: 1.0, the complete trajectory)."
+        ),
+    )
+    parser.add_argument(
+        "--max-frames-per-trajectory",
+        type=int,
+        default=0,
+        help=(
+            "Evenly cap sampled frames from each trajectory after applying "
+            "the tail fraction and stride. Zero disables the cap."
+        ),
+    )
     parser.add_argument(
         "--train-size",
         type=int,
@@ -1196,6 +1430,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Uncertainty-ranked pool passed to SOAP. "
             "0 uses ten times the requested total selection."
+        ),
+    )
+    parser.add_argument(
+        "--min-per-trajectory-kind",
+        type=int,
+        default=0,
+        help=(
+            "Minimum selected structures from each available requested "
+            "campaign trajectory kind. Zero disables outcome stratification."
+        ),
+    )
+    parser.add_argument(
+        "--min-per-temperature",
+        type=int,
+        default=0,
+        help=(
+            "Minimum selected structures from each available campaign "
+            "replica temperature. Zero disables temperature stratification."
         ),
     )
     add_model_arguments(parser, default_device="cpu")
@@ -1331,6 +1583,14 @@ def main() -> None:
         raise ValueError("--min-model-soap-distance cannot be negative")
     if args.min_dft_soap_distance < 0.0:
         raise ValueError("--min-dft-soap-distance cannot be negative")
+    if not 0.0 < args.input_tail_fraction <= 1.0:
+        raise ValueError("--input-tail-fraction must be in (0, 1]")
+    if args.max_frames_per_trajectory < 0:
+        raise ValueError("--max-frames-per-trajectory cannot be negative")
+    if args.min_per_trajectory_kind < 0:
+        raise ValueError("--min-per-trajectory-kind cannot be negative")
+    if args.min_per_temperature < 0:
+        raise ValueError("--min-per-temperature cannot be negative")
 
     output_root = args.output_root.expanduser().resolve()
     if args.legacy_flat_output:
@@ -1371,7 +1631,51 @@ def main() -> None:
         test_trajectory = round_root / "selected_test.traj"
 
     target_total = n_train + n_test
-    input_paths = resolve_input_trajectories(args.input)
+    temperature_filter = (
+        set(args.temperatures) if args.temperatures is not None else None
+    )
+    trajectory_kind_filter = set(
+        args.trajectory_kinds or DEFAULT_CAMPAIGN_TRAJECTORY_KINDS
+    )
+    input_paths = resolve_input_trajectories(
+        args.input,
+        temperatures=temperature_filter,
+        trajectory_kinds=trajectory_kind_filter,
+    )
+    if args.input and any(
+        Path(value).expanduser().is_dir() for value in args.input
+    ):
+        print(
+            f"Discovered {len(input_paths)} replica trajectories "
+            "from the input campaign directory/directories"
+        )
+        discovered_kind_counts = {
+            kind: sum(
+                replica_trajectory_kind(path) == kind for path in input_paths
+            )
+            for kind in CAMPAIGN_TRAJECTORY_KINDS
+        }
+        print(
+            "Campaign trajectory pools: "
+            + ", ".join(
+                f"{kind}={discovered_kind_counts[kind]}"
+                for kind in CAMPAIGN_TRAJECTORY_KINDS
+                if kind in trajectory_kind_filter
+            )
+        )
+        missing_kinds = sorted(
+            kind
+            for kind in trajectory_kind_filter
+            if discovered_kind_counts[kind] == 0
+        )
+        if missing_kinds:
+            message = (
+                "No files were found for requested trajectory pool(s): "
+                + ", ".join(missing_kinds)
+            )
+            if args.trajectory_kinds is not None:
+                raise FileNotFoundError(message)
+            print("Warning: " + message)
     models = resolve_models(
         args.model_path,
         args.calculator,
@@ -1433,12 +1737,22 @@ def main() -> None:
     source_indices = []
     source_trajectories = []
     for input_path in input_paths:
+        input_kind = replica_trajectory_kind(input_path)
         input_frames, input_source_indices = load_trajectory_frames(
-            input_path, args.frame_stride
+            input_path,
+            args.frame_stride,
+            tail_fraction=args.input_tail_fraction,
+            max_frames=args.max_frames_per_trajectory,
+            require_mc_energy=(
+                input_kind == "rejected"
+                and not args.include_unevaluated_rejected
+            ),
         )
         frames.extend(input_frames)
         source_indices.extend(input_source_indices)
         source_trajectories.extend([str(input_path)] * len(input_frames))
+    if not frames:
+        raise ValueError("No usable frames remain in the requested input pools.")
     print(
         f"Combined input pool: {len(frames)} sampled frames from "
         f"{len(input_paths)} trajectories"
@@ -1494,8 +1808,63 @@ def main() -> None:
     pool_size = args.candidate_pool_size or max(target_total * 10, target_total)
     pool_order = np.argsort(-uncertainty, kind="stable")[:pool_size]
     pool_candidate_indices = [eligible[index] for index in pool_order]
+    uncertainty_by_candidate = {
+        candidate_index: float(uncertainty[position])
+        for position, candidate_index in enumerate(eligible)
+    }
+    if args.min_per_trajectory_kind:
+        per_kind_shortlist = max(args.min_per_trajectory_kind * 10, 10)
+        for kind in sorted(trajectory_kind_filter):
+            group_candidates = [
+                candidate_index
+                for candidate_index in eligible
+                if record_by_candidate[candidate_index][
+                    "source_trajectory_kind"
+                ]
+                == kind
+            ]
+            group_candidates.sort(
+                key=lambda candidate_index: uncertainty_by_candidate[
+                    candidate_index
+                ],
+                reverse=True,
+            )
+            pool_candidate_indices.extend(
+                group_candidates[:per_kind_shortlist]
+            )
+        pool_candidate_indices = list(dict.fromkeys(pool_candidate_indices))
+    if args.min_per_temperature:
+        per_temperature_shortlist = max(args.min_per_temperature * 10, 10)
+        available_temperatures = sorted(
+            {
+                float(record_by_candidate[index]["source_temperature_K"])
+                for index in eligible
+                if record_by_candidate[index]["source_temperature_K"] != ""
+            }
+        )
+        for temperature in available_temperatures:
+            group_candidates = [
+                candidate_index
+                for candidate_index in eligible
+                if record_by_candidate[candidate_index][
+                    "source_temperature_K"
+                ]
+                == temperature
+            ]
+            group_candidates.sort(
+                key=lambda candidate_index: uncertainty_by_candidate[
+                    candidate_index
+                ],
+                reverse=True,
+            )
+            pool_candidate_indices.extend(
+                group_candidates[:per_temperature_shortlist]
+            )
+        pool_candidate_indices = list(dict.fromkeys(pool_candidate_indices))
     pool_frames = [candidates[index] for index in pool_candidate_indices]
-    pool_uncertainty = uncertainty[pool_order]
+    pool_uncertainty = np.asarray(
+        [uncertainty_by_candidate[index] for index in pool_candidate_indices]
+    )
     pool_descriptors = soap_descriptors(
         pool_frames,
         species=species,
@@ -1582,10 +1951,81 @@ def main() -> None:
 
     valid_descriptors = pool_descriptors[valid_pool_positions]
     valid_priority = priority[valid_pool_positions]
+    required_valid_positions: list[int] = []
+    if args.min_per_trajectory_kind:
+        for kind in sorted(trajectory_kind_filter):
+            group_valid_positions = [
+                valid_position
+                for valid_position, pool_position in enumerate(
+                    valid_pool_positions
+                )
+                if record_by_candidate[
+                    pool_candidate_indices[pool_position]
+                ]["source_trajectory_kind"]
+                == kind
+            ]
+            if not group_valid_positions:
+                continue
+            group_count = min(
+                args.min_per_trajectory_kind,
+                len(group_valid_positions),
+            )
+            group_selected = priority_aware_maxmin(
+                valid_descriptors[group_valid_positions],
+                valid_priority[group_valid_positions],
+                n_select=group_count,
+            )
+            required_valid_positions.extend(
+                group_valid_positions[index] for index in group_selected
+            )
+    if args.min_per_temperature:
+        available_temperatures = sorted(
+            {
+                record_by_candidate[pool_candidate_indices[pool_position]][
+                    "source_temperature_K"
+                ]
+                for pool_position in valid_pool_positions
+                if record_by_candidate[
+                    pool_candidate_indices[pool_position]
+                ]["source_temperature_K"]
+                != ""
+            }
+        )
+        for temperature in available_temperatures:
+            group_valid_positions = [
+                valid_position
+                for valid_position, pool_position in enumerate(
+                    valid_pool_positions
+                )
+                if record_by_candidate[
+                    pool_candidate_indices[pool_position]
+                ]["source_temperature_K"]
+                == temperature
+            ]
+            group_count = min(
+                args.min_per_temperature,
+                len(group_valid_positions),
+            )
+            group_selected = priority_aware_maxmin(
+                valid_descriptors[group_valid_positions],
+                valid_priority[group_valid_positions],
+                n_select=group_count,
+            )
+            required_valid_positions.extend(
+                group_valid_positions[index] for index in group_selected
+            )
+    required_valid_positions = list(dict.fromkeys(required_valid_positions))
+    if len(required_valid_positions) > target_total:
+        raise ValueError(
+            "The requested trajectory-kind/temperature minima require "
+            f"{len(required_valid_positions)} selections, but train-size + "
+            f"test-size is only {target_total}."
+        )
     selected_valid_positions = priority_aware_maxmin(
         valid_descriptors,
         valid_priority,
         n_select=min(target_total, len(valid_pool_positions)),
+        initial_indices=required_valid_positions,
     )
     selected_pool_positions = [
         valid_pool_positions[index] for index in selected_valid_positions
@@ -1723,6 +2163,16 @@ def main() -> None:
             {
                 "round": round_number,
                 "inputs": [str(path) for path in input_paths],
+                "input_values": list(args.input or []),
+                "input_temperatures_K": sorted(temperature_filter or []),
+                "input_trajectory_kinds": sorted(trajectory_kind_filter),
+                "include_unevaluated_rejected": (
+                    args.include_unevaluated_rejected
+                ),
+                "input_tail_fraction": args.input_tail_fraction,
+                "max_frames_per_trajectory": args.max_frames_per_trajectory,
+                "min_per_trajectory_kind": args.min_per_trajectory_kind,
+                "min_per_temperature": args.min_per_temperature,
                 "models": [str(model) for model in models],
                 "model_backends": [
                     resolve_calculator_backend(model, args.calculator)

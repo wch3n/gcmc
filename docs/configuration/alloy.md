@@ -119,3 +119,38 @@ These keys work together with the shared backend options documented in `docs/con
 - On resume, PT output files are truncated back to the master-checkpoint boundary before new rows are appended, preventing duplicate sweep/cycle segments in `replica_*K.dat`, `replica_*K.traj`, `results.csv`, and `replica_stats.csv`.
 - Resume safety depends on keeping the same replica grid and MC kernel settings between runs.
 - For multi-node Ray jobs, keep the Slurm bootstrap in `scripts/slurm/ray_slurm_common.sh` and put job-specific resource settings in the local `run.slurm`.
+
+## 7. SRO and layer-LRO analysis
+
+Use the packaged analysis command to summarize all fixed-temperature PT
+trajectories below a run directory:
+
+```bash
+gcmc-analyze-alloy-ordering \
+  --run-dir /path/to/alloy/run \
+  --start-fraction 0.5 \
+  --step 10 \
+  --n-blocks 5
+```
+
+The command infers the alloy elements and output directory from `config.yaml`.
+It builds fixed reference-lattice neighbor lists once, inferring the first
+intralayer and nearest-interlayer coordinations from gaps in the ranked metal
+distances. The two SRO curves are therefore not mixed by thermal distortions or
+a shared distance cutoff. Use `--intralayer-coordination` and
+`--interlayer-coordination` to override the inferred values.
+
+The command writes a two-panel PDF/PNG, a temperature summary CSV, and the
+underlying block means. The left panel reports separate intralayer-1NN and
+nearest-interlayer unlike-pair Warren-Cowley parameters. Its dashed random
+reference is determined automatically for the fixed-composition finite cell as
+`-1 / (N_alloy - 1)` and is also recorded in the summary CSV. Values below that
+line indicate enhanced unlike-neighbor preference; values above it indicate
+enhanced like-neighbor preference. The right panel reports the two-metal-layer
+polarization `|x_A(top) - x_A(bottom)|`, which is a long-range order parameter
+for layer segregation. It shows zero for identical layer compositions and an
+automatically determined finite-cell random expectation as a dashed line. The
+latter is calculated exactly from the reference layer sizes, global target-
+element count, and canonical combinatorial distribution; it is also included
+in the summary CSV. A general in-plane LRO parameter requires an explicitly
+chosen ordered phase or ordering wavevector.

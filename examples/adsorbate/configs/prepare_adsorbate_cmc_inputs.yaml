@@ -61,6 +61,7 @@ slab:
   functional_elements: [O]
 
 cmc:
+  resume: false
   temperature: 300.0
   nsweeps: 800
   equilibration: 200
@@ -140,6 +141,7 @@ slurm:
   partition: gpu
   account: htbase
   time: "12:00:00"
+  signal_seconds_before_timeout: 600
   gres: gpu:1
   cpus_per_task: 8
   mem_per_cpu: 8gb

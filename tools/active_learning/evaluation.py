@@ -82,10 +82,20 @@ def iter_structure_dirs(
     label_set = set(labels)
     directories: list[Path]
     if recursive:
-        directories = [
+        test_dirs = [
             path
-            for path in root.rglob("*")
-            if path.is_dir() and path.name in label_set
+            for path in root.rglob("test")
+            if path.is_dir() and re.fullmatch(r"al_\d+", path.parent.name)
+        ]
+        if root.name == "test" and re.fullmatch(r"al_\d+", root.parent.name):
+            test_dirs.append(root)
+        directories = [
+            test_dir / label
+            for test_dir in sorted(
+                set(test_dirs), key=lambda path: natural_key(str(path))
+            )
+            for label in label_set
+            if (test_dir / label).is_dir()
         ]
     else:
         directories = [root / label for label in labels]
@@ -94,8 +104,11 @@ def iter_structure_dirs(
     entries = []
     for subdir in directories:
         relative = subdir.relative_to(root)
-        series_path = relative.parent
-        series = "." if str(series_path) == "." else str(series_path)
+        if recursive:
+            series = subdir.parent.parent.name
+        else:
+            series_path = relative.parent
+            series = "." if str(series_path) == "." else str(series_path)
         entries.append(
             (str(relative), series, subdir, find_structure_file(subdir))
         )
@@ -151,6 +164,25 @@ def finite_mean(values: Iterable[float]) -> float:
     return float(np.mean(array)) if len(array) else float("nan")
 
 
+def centered_error_values(
+    records: list[dict[str, object]], key: str
+) -> np.ndarray:
+    """Return composition-centered per-atom errors for comparable structures."""
+    grouped: dict[str, list[float]] = {}
+    for record in records:
+        value = float(record.get(key, float("nan")))
+        if math.isfinite(value):
+            grouped.setdefault(str(record.get("formula", "")), []).append(value)
+
+    centered = []
+    for values in grouped.values():
+        if len(values) < 2:
+            continue
+        array = np.asarray(values, dtype=float)
+        centered.extend(array - np.mean(array))
+    return np.asarray(centered, dtype=float)
+
+
 def metric_summary(records: list[dict[str, object]], labels: list[str]) -> dict:
     valid_energy = [
         record
@@ -169,6 +201,9 @@ def metric_summary(records: list[dict[str, object]], labels: list[str]) -> dict:
         ],
         dtype=float,
     )
+    ensemble_relative_errors = centered_error_values(
+        valid_energy, "_ensemble_energy_error_per_atom"
+    )
     summary: dict[str, object] = {
         "n_configurations": len(records),
         "n_with_dft_energy": len(valid_energy),
@@ -181,6 +216,17 @@ def metric_summary(records: list[dict[str, object]], labels: list[str]) -> dict:
         "ensemble_energy_rmse_meV_atom": (
             float(math.sqrt(np.mean(ensemble_energy_errors**2)) * 1000.0)
             if len(ensemble_energy_errors)
+            else float("nan")
+        ),
+        "n_relative_energy_configurations": len(ensemble_relative_errors),
+        "ensemble_relative_energy_mae_meV_atom": (
+            float(np.mean(np.abs(ensemble_relative_errors)) * 1000.0)
+            if len(ensemble_relative_errors)
+            else float("nan")
+        ),
+        "ensemble_relative_energy_rmse_meV_atom": (
+            float(math.sqrt(np.mean(ensemble_relative_errors**2)) * 1000.0)
+            if len(ensemble_relative_errors)
             else float("nan")
         ),
         "ensemble_force_mae_eV_A": finite_mean(
@@ -209,6 +255,9 @@ def metric_summary(records: list[dict[str, object]], labels: list[str]) -> dict:
             ],
             dtype=float,
         )
+        model_relative_errors = centered_error_values(
+            valid_energy, f"_{label}_energy_error_per_atom"
+        )
         model_force_records = [
             record
             for record in records
@@ -224,6 +273,11 @@ def metric_summary(records: list[dict[str, object]], labels: list[str]) -> dict:
         summary[f"{label}_energy_rmse_meV_atom"] = (
             float(math.sqrt(np.mean(model_energy_errors**2)) * 1000.0)
             if len(model_energy_errors)
+            else float("nan")
+        )
+        summary[f"{label}_relative_energy_rmse_meV_atom"] = (
+            float(math.sqrt(np.mean(model_relative_errors**2)) * 1000.0)
+            if len(model_relative_errors)
             else float("nan")
         )
         summary[f"{label}_force_rmse_eV_A"] = (
@@ -279,6 +333,554 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({key: public_value(row.get(key, "")) for key in fieldnames})
+
+
+def relative_energy_plot_data(
+    records: list[dict[str, object]], energies: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return indices and composition-centered DFT/model energies in meV/atom."""
+    grouped: dict[str, list[int]] = {}
+    for index, record in enumerate(records):
+        dft_energy = float(record.get("_dft_energy", float("nan")))
+        if math.isfinite(dft_energy) and np.all(np.isfinite(energies[index])):
+            grouped.setdefault(str(record.get("formula", "")), []).append(index)
+
+    selected: list[int] = []
+    dft_relative: list[float] = []
+    model_relative: list[np.ndarray] = []
+    for indices in grouped.values():
+        if len(indices) < 2:
+            continue
+        n_atoms = np.asarray(
+            [float(records[index]["n_atoms"]) for index in indices], dtype=float
+        )
+        dft_per_atom = np.asarray(
+            [float(records[index]["_dft_energy"]) for index in indices],
+            dtype=float,
+        ) / n_atoms
+        model_per_atom = energies[indices] / n_atoms[:, None]
+        dft_relative.extend((dft_per_atom - np.mean(dft_per_atom)) * 1000.0)
+        model_relative.extend(
+            (model_per_atom - np.mean(model_per_atom, axis=0)) * 1000.0
+        )
+        selected.extend(indices)
+
+    n_models = energies.shape[1]
+    if not selected:
+        return (
+            np.empty(0, dtype=int),
+            np.empty(0, dtype=float),
+            np.empty((0, n_models), dtype=float),
+        )
+    return (
+        np.asarray(selected, dtype=int),
+        np.asarray(dft_relative, dtype=float),
+        np.asarray(model_relative, dtype=float),
+    )
+
+
+def plot_output_paths(output_prefix: str | Path) -> list[Path]:
+    prefix = Path(output_prefix).expanduser().resolve()
+    if prefix.suffix.lower() in {".pdf", ".png"}:
+        prefix = prefix.with_suffix("")
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    return [prefix.with_suffix(".pdf"), prefix.with_suffix(".png")]
+
+
+def load_pyplot():
+    if "MPLCONFIGDIR" not in os.environ:
+        cache = Path(os.environ.get("TMPDIR", "/tmp")) / (
+            f"gcmc-matplotlib-{os.getuid()}"
+        )
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(cache)
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def save_figure(figure, output_prefix: str | Path) -> list[Path]:
+    paths = plot_output_paths(output_prefix)
+    for path in paths:
+        figure.savefig(path, dpi=300, bbox_inches="tight")
+    return paths
+
+
+def add_identity_line(axis, x_values: np.ndarray, y_values: np.ndarray) -> None:
+    finite = np.concatenate(
+        [
+            np.asarray(x_values, dtype=float).ravel(),
+            np.asarray(y_values, dtype=float).ravel(),
+        ]
+    )
+    finite = finite[np.isfinite(finite)]
+    if not len(finite):
+        return
+    lower = float(np.min(finite))
+    upper = float(np.max(finite))
+    padding = max((upper - lower) * 0.06, 1.0e-8)
+    limits = (lower - padding, upper + padding)
+    axis.plot(limits, limits, color="0.45", linewidth=0.8, linestyle="--", zorder=0)
+    axis.set_xlim(limits)
+    axis.set_ylim(limits)
+
+
+def add_calibration_line(axis, x_values: np.ndarray, y_values: np.ndarray) -> None:
+    finite = np.concatenate(
+        [
+            np.asarray(x_values, dtype=float).ravel(),
+            np.asarray(y_values, dtype=float).ravel(),
+        ]
+    )
+    finite = finite[np.isfinite(finite)]
+    if not len(finite):
+        return
+    upper = max(float(np.max(finite)) * 1.08, 1.0e-8)
+    axis.plot(
+        [0.0, upper],
+        [0.0, upper],
+        color="0.45",
+        linewidth=0.8,
+        linestyle="--",
+        zorder=0,
+    )
+    axis.set_xlim(0.0, upper)
+    axis.set_ylim(0.0, upper)
+
+
+def style_diagnostic_axis(axis, panel: str) -> None:
+    axis.text(
+        -0.10,
+        1.02,
+        panel,
+        transform=axis.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        fontweight="bold",
+    )
+    axis.tick_params(direction="in", top=True, right=True, labelsize=7.5)
+    for spine in axis.spines.values():
+        spine.set_linewidth(0.7)
+
+
+def plot_committee_diagnostics(
+    records: list[dict[str, object]],
+    energies: np.ndarray,
+    forces_by_model: list[list[np.ndarray]],
+    dft_forces: list[np.ndarray | None],
+    labels: list[str],
+    output_prefix: str | Path,
+) -> list[Path]:
+    """Plot accuracy and committee-calibration diagnostics."""
+    plt = load_pyplot()
+    with plt.rc_context(
+        {
+            "font.size": 8,
+            "axes.labelsize": 8,
+            "axes.linewidth": 0.7,
+            "legend.fontsize": 6.5,
+            "xtick.labelsize": 7.5,
+            "ytick.labelsize": 7.5,
+        }
+    ):
+        figure, axes = plt.subplots(2, 2, figsize=(7.2, 6.1))
+        axes = axes.ravel()
+
+        selected, dft_relative, model_relative = relative_energy_plot_data(
+            records, energies
+        )
+        axis = axes[0]
+        if len(selected):
+            colors = plt.get_cmap("tab10")(
+                np.linspace(0.0, 0.9, max(len(labels), 2))
+            )
+            for model_index, label in enumerate(labels):
+                axis.scatter(
+                    dft_relative,
+                    model_relative[:, model_index],
+                    s=14,
+                    facecolors="none",
+                    edgecolors=colors[model_index],
+                    linewidths=0.7,
+                    alpha=0.7,
+                    label=label,
+                )
+            ensemble_relative = np.mean(model_relative, axis=1)
+            ensemble_std = np.std(model_relative, axis=1)
+            axis.errorbar(
+                dft_relative,
+                ensemble_relative,
+                yerr=ensemble_std,
+                fmt="o",
+                markersize=3.5,
+                color="black",
+                ecolor="0.35",
+                elinewidth=0.7,
+                capsize=1.5,
+                label="committee mean",
+                zorder=5,
+            )
+            relative_rmse = math.sqrt(
+                float(np.mean((ensemble_relative - dft_relative) ** 2))
+            )
+            axis.text(
+                0.98,
+                0.04,
+                rf"RMSE = {relative_rmse:.1f} meV atom$^{{-1}}$",
+                transform=axis.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=7,
+            )
+            add_identity_line(axis, dft_relative, model_relative)
+            axis.legend(frameon=False, loc="upper left", bbox_to_anchor=(0.0, 0.91))
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "At least two structures per composition are required",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+        axis.set_xlabel(r"DFT relative energy (meV atom$^{-1}$)")
+        axis.set_ylabel(r"Model relative energy (meV atom$^{-1}$)")
+        style_diagnostic_axis(axis, "a")
+
+        reference_components: list[np.ndarray] = []
+        predicted_components: list[np.ndarray] = []
+        for config_index, reference in enumerate(dft_forces):
+            if reference is None:
+                continue
+            predicted = np.mean(
+                np.stack(
+                    [
+                        forces_by_model[model_index][config_index]
+                        for model_index in range(len(labels))
+                    ],
+                    axis=0,
+                ),
+                axis=0,
+            )
+            reference_components.append(np.asarray(reference).ravel())
+            predicted_components.append(predicted.ravel())
+        axis = axes[1]
+        if reference_components:
+            reference_flat = np.concatenate(reference_components)
+            predicted_flat = np.concatenate(predicted_components)
+            if len(reference_flat) >= 100:
+                axis.hexbin(
+                    reference_flat,
+                    predicted_flat,
+                    gridsize=42,
+                    mincnt=1,
+                    cmap="Blues",
+                    linewidths=0.0,
+                )
+            else:
+                axis.scatter(
+                    reference_flat,
+                    predicted_flat,
+                    s=8,
+                    color="#2b6f92",
+                    alpha=0.65,
+                    linewidths=0,
+                )
+            force_rmse = math.sqrt(
+                float(np.mean((predicted_flat - reference_flat) ** 2))
+            )
+            axis.text(
+                0.98,
+                0.04,
+                rf"RMSE = {force_rmse:.3f} eV $\AA^{{-1}}$",
+                transform=axis.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=7,
+            )
+            add_identity_line(axis, reference_flat, predicted_flat)
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No DFT force references",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+        axis.set_xlabel(r"DFT force component (eV $\AA^{-1}$)")
+        axis.set_ylabel(r"Committee force component (eV $\AA^{-1}$)")
+        style_diagnostic_axis(axis, "b")
+
+        series_names = sorted(
+            {str(record.get("series", ".")) for record in records},
+            key=natural_key,
+        )
+        series_colors = {
+            series: color
+            for series, color in zip(
+                series_names,
+                plt.get_cmap("viridis")(
+                    np.linspace(0.12, 0.88, max(len(series_names), 1))
+                ),
+            )
+        }
+        ensemble_relative = (
+            np.mean(model_relative, axis=1)
+            if len(selected)
+            else np.empty(0, dtype=float)
+        )
+        relative_errors = np.abs(ensemble_relative - dft_relative)
+        relative_uncertainty = (
+            np.std(model_relative, axis=1)
+            if len(selected)
+            else np.empty(0, dtype=float)
+        )
+        axis = axes[2]
+        for series in series_names:
+            positions = [
+                position
+                for position, record_index in enumerate(selected)
+                if str(records[record_index].get("series", ".")) == series
+            ]
+            if not positions:
+                continue
+            uncertainty = np.asarray(
+                [relative_uncertainty[position] for position in positions],
+                dtype=float,
+            )
+            errors = relative_errors[positions]
+            axis.scatter(
+                uncertainty,
+                errors,
+                s=24,
+                color=series_colors[series],
+                edgecolors="white",
+                linewidths=0.4,
+                label=series,
+                zorder=3,
+            )
+            if len(selected) <= 12:
+                for x_value, y_value, position in zip(uncertainty, errors, positions):
+                    record = records[selected[position]]
+                    short_label = (
+                        f"{series.removeprefix('al_')}:"
+                        f"{Path(str(record['directory'])).name}"
+                    )
+                    right_side = x_value >= float(np.median(relative_uncertainty))
+                    axis.annotate(
+                        short_label,
+                        (x_value, y_value),
+                        xytext=((-3 if right_side else 3), 3),
+                        textcoords="offset points",
+                        ha="right" if right_side else "left",
+                        fontsize=5.5,
+                    )
+        if len(selected):
+            add_calibration_line(
+                axis,
+                relative_uncertainty,
+                relative_errors,
+            )
+            axis.legend(frameon=False, loc="best")
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No relative-energy calibration data",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+        axis.set_xlabel(r"Committee relative-energy std. (meV atom$^{-1}$)")
+        axis.set_ylabel(r"Absolute relative-energy error (meV atom$^{-1}$)")
+        style_diagnostic_axis(axis, "c")
+
+        axis = axes[3]
+        plotted_force_records = []
+        for series in series_names:
+            series_records = [
+                record
+                for record in records
+                if str(record.get("series", ".")) == series
+                and math.isfinite(
+                    float(
+                        record.get("committee_force_std_rms_eV_A", float("nan"))
+                    )
+                )
+                and math.isfinite(
+                    float(record.get("ensemble_force_rmse_eV_A", float("nan")))
+                )
+            ]
+            if not series_records:
+                continue
+            plotted_force_records.extend(series_records)
+            uncertainty = np.asarray(
+                [
+                    float(record["committee_force_std_rms_eV_A"])
+                    for record in series_records
+                ]
+            )
+            errors = np.asarray(
+                [
+                    math.sqrt(3.0) * float(record["ensemble_force_rmse_eV_A"])
+                    for record in series_records
+                ]
+            )
+            axis.scatter(
+                uncertainty,
+                errors,
+                s=24,
+                color=series_colors[series],
+                edgecolors="white",
+                linewidths=0.4,
+                label=series,
+                zorder=3,
+            )
+            if len(records) <= 12:
+                for x_value, y_value, record in zip(
+                    uncertainty, errors, series_records
+                ):
+                    short_label = (
+                        f"{series.removeprefix('al_')}:"
+                        f"{Path(str(record['directory'])).name}"
+                    )
+                    right_side = x_value >= float(np.median(uncertainty))
+                    axis.annotate(
+                        short_label,
+                        (x_value, y_value),
+                        xytext=((-3 if right_side else 3), 3),
+                        textcoords="offset points",
+                        ha="right" if right_side else "left",
+                        fontsize=5.5,
+                    )
+        if plotted_force_records:
+            add_calibration_line(
+                axis,
+                np.asarray(
+                    [
+                        float(record["committee_force_std_rms_eV_A"])
+                        for record in plotted_force_records
+                    ]
+                ),
+                np.asarray(
+                    [
+                        math.sqrt(3.0)
+                        * float(record["ensemble_force_rmse_eV_A"])
+                        for record in plotted_force_records
+                    ]
+                ),
+            )
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No force-calibration data",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+        axis.set_xlabel(r"Committee force std. RMS (eV $\AA^{-1}$)")
+        axis.set_ylabel(r"Force-error vector RMS (eV $\AA^{-1}$)")
+        style_diagnostic_axis(axis, "d")
+
+        figure.subplots_adjust(wspace=0.30, hspace=0.30)
+        paths = save_figure(figure, output_prefix)
+        plt.close(figure)
+    return paths
+
+
+def plot_learning_curve(
+    rows: list[dict[str, object]], output_prefix: str | Path
+) -> list[Path]:
+    plt = load_pyplot()
+    series_names = sorted(
+        {str(row["series"]) for row in rows if row.get("scope") == "round"},
+        key=natural_key,
+    )
+    if not series_names:
+        return []
+
+    relative_values = [
+        float(row.get("ensemble_relative_energy_rmse_meV_atom", float("nan")))
+        for row in rows
+    ]
+    energy_key = (
+        "ensemble_relative_energy_rmse_meV_atom"
+        if any(math.isfinite(value) for value in relative_values)
+        else "ensemble_energy_rmse_meV_atom"
+    )
+    energy_label = (
+        r"Relative-energy RMSE (meV atom$^{-1}$)"
+        if energy_key.startswith("ensemble_relative")
+        else r"Energy RMSE (meV atom$^{-1}$)"
+    )
+    metrics = [
+        (energy_key, energy_label),
+        ("ensemble_force_rmse_eV_A", r"Force RMSE (eV $\AA^{-1}$)"),
+    ]
+    row_lookup = {
+        (str(row["scope"]), str(row["series"])): row for row in rows
+    }
+    x_values = np.arange(len(series_names))
+    with plt.rc_context(
+        {
+            "font.size": 8,
+            "axes.labelsize": 8,
+            "axes.linewidth": 0.7,
+            "legend.fontsize": 7,
+            "xtick.labelsize": 7.5,
+            "ytick.labelsize": 7.5,
+        }
+    ):
+        figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.0))
+        for panel, (axis, (metric, ylabel)) in enumerate(zip(axes, metrics)):
+            for scope, color, linestyle, marker in (
+                ("round", "#2b6f92", "-", "o"),
+                ("cumulative", "#c65d21", "--", "s"),
+            ):
+                values = np.asarray(
+                    [
+                        float(
+                            row_lookup.get((scope, series), {}).get(
+                                metric, float("nan")
+                            )
+                        )
+                        for series in series_names
+                    ],
+                    dtype=float,
+                )
+                axis.plot(
+                    x_values,
+                    values,
+                    color=color,
+                    linestyle=linestyle,
+                    marker=marker,
+                    markersize=4,
+                    linewidth=1.1,
+                    label=scope,
+                )
+            axis.set_xticks(x_values, series_names)
+            if len(series_names) > 8:
+                axis.tick_params(axis="x", labelrotation=45)
+                for tick in axis.get_xticklabels():
+                    tick.set_ha("right")
+            axis.set_xlabel("Active-learning round")
+            axis.set_ylabel(ylabel)
+            axis.legend(frameon=False)
+            style_diagnostic_axis(axis, chr(ord("a") + panel))
+        figure.subplots_adjust(wspace=0.30)
+        paths = save_figure(figure, output_prefix)
+        plt.close(figure)
+    return paths
 
 
 def model_file_signatures(models: list[Path]) -> list[dict[str, object]]:
@@ -384,6 +986,7 @@ def archive_history(
     metrics_path: Path,
     learning_curve_path: Path,
     summary_path: Path,
+    plot_paths: list[Path],
 ) -> Path:
     history_dir.mkdir(parents=True, exist_ok=True)
     run_dir = history_dir / run_id
@@ -391,6 +994,9 @@ def archive_history(
     shutil.copy2(metrics_path, run_dir / "metrics.csv")
     shutil.copy2(learning_curve_path, run_dir / "learning_curve.csv")
     shutil.copy2(summary_path, run_dir / "summary.json")
+    for plot_path in plot_paths:
+        if plot_path.exists():
+            shutil.copy2(plot_path, run_dir / plot_path.name)
 
     aggregate = dict(summary["aggregate"])
     series_rows = summary["per_series_and_cumulative"]
@@ -687,6 +1293,26 @@ def evaluate(args: argparse.Namespace) -> list[dict[str, object]]:
     learning_rows = build_learning_curve(valid_records, labels)
     learning_curve_path = Path(args.learning_curve).expanduser().resolve()
     write_csv(learning_curve_path, learning_rows)
+    plot_paths: list[Path] = []
+    if not args.no_plots:
+        for plotter, plot_arguments in (
+            (
+                plot_committee_diagnostics,
+                (
+                    valid_records,
+                    energies,
+                    forces_by_model,
+                    dft_forces,
+                    labels,
+                    args.plot_output,
+                ),
+            ),
+            (plot_learning_curve, (learning_rows, args.learning_curve_plot)),
+        ):
+            try:
+                plot_paths.extend(plotter(*plot_arguments))
+            except Exception as exc:
+                print(f"Warning: could not generate {plotter.__name__}: {exc}")
     timestamp = datetime.now(timezone.utc)
     timestamp_utc = timestamp.isoformat(timespec="microseconds")
     run_id = timestamp.strftime("%Y%m%dT%H%M%S.%fZ")
@@ -710,6 +1336,7 @@ def evaluate(args: argparse.Namespace) -> list[dict[str, object]]:
         "model_signatures": model_signatures,
         "model_set_id": model_set_id,
         "dataset_fingerprint": data_fingerprint,
+        "plots": [str(path) for path in plot_paths],
         "aggregate": metric_summary(valid_records, labels),
         "per_series_and_cumulative": learning_rows,
         "model_elapsed_s": {
@@ -739,10 +1366,13 @@ def evaluate(args: argparse.Namespace) -> list[dict[str, object]]:
             metrics_path=output,
             learning_curve_path=learning_curve_path,
             summary_path=summary_path,
+            plot_paths=plot_paths,
         )
     print(f"Per-configuration metrics: {output}")
     print(f"Learning curve: {learning_curve_path}")
     print(f"Summary: {summary_path}")
+    for plot_path in plot_paths:
+        print(f"Diagnostic plot: {plot_path}")
     if history_run_dir is not None:
         print(f"History snapshot: {history_run_dir}")
     return public_records
@@ -769,7 +1399,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recursive",
         action="store_true",
-        help="Find numbered directories below all active-learning series under root.",
+        help=(
+            "Find numbered held-out directories only under "
+            "al_NNN/test below root; training directories are excluded."
+        ),
     )
     add_model_arguments(parser, default_device="cuda")
     parser.add_argument(
@@ -780,6 +1413,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--learning-curve", default="mace_learning_curve.csv"
+    )
+    parser.add_argument(
+        "--plot-output",
+        default="mace_committee_diagnostics",
+        help="Output prefix for committee diagnostic plots (PDF and PNG).",
+    )
+    parser.add_argument(
+        "--learning-curve-plot",
+        default="mace_learning_curve",
+        help="Output prefix for learning-curve plots (PDF and PNG).",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Disable diagnostic and learning-curve plot generation.",
     )
     parser.add_argument(
         "--history-dir",

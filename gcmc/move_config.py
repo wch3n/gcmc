@@ -120,6 +120,8 @@ def _apply_standalone_puckering_config(flat_config: dict, puckering: object) -> 
 def _apply_puckering_geometry_config(flat_config: dict, puckering: dict) -> None:
     if "elements" in puckering:
         flat_config["puckering_elements"] = puckering["elements"]
+    if "heights" in puckering:
+        flat_config["puckering_heights"] = puckering["heights"]
     if "height_A" in puckering:
         flat_config["puckering_height_A"] = puckering["height_A"]
     if "height_jitter_A" in puckering:

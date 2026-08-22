@@ -121,6 +121,10 @@ cmc:
         elements: [Pt]
         height_A: 0.3
         height_jitter_A: 0.02
+        heights:
+          Pt:
+            height_A: 0.4
+            height_jitter_A: 0.03
 output:
   output_dir: results
   stats_file: stats.csv
@@ -157,6 +161,10 @@ output:
         self.assertEqual(cfg.puckering_elements, ["Pt"])
         self.assertEqual(cfg.puckering_height_A, 0.3)
         self.assertEqual(cfg.puckering_height_jitter_A, 0.02)
+        self.assertEqual(
+            cfg.puckering_heights,
+            {"Pt": {"height_A": 0.4, "height_jitter_A": 0.03}},
+        )
         self.assertEqual(cfg.molecular_upright_atom_indices, [2])
         self.assertEqual(cfg.molecular_upright_min_z_A, 0.1)
         self.assertTrue(cfg.diagnostics_enabled)

@@ -282,7 +282,7 @@ local adsorbate CMC samples constrained around a matched parent-state anchor.
 | `sequential.enabled` | Enables reaction-step-conditioned local CMC seed generation. Set `false` to disable all sequential rules, including automatic compatibility rules. |
 | `sequential.rules` | Ordered local transition rules. Each rule gives `source_state`, `target_state`, `builder`, and optional builder controls such as `n_orientations`. The built-in `ooh_from_o` builder regenerates OOH* seeds from locally sampled O* candidates and records generic parent metadata (`parent_state_dir`, `parent_state_candidate_id`, `transition_builder`) plus the legacy `parent_o_candidate_id`. |
 | `sequential_ooh_from_o`, `sequential_ooh_orientations` | Legacy OER shortcut for the `02_O -> 03_OOH` `ooh_from_o` rule. Existing configs remain valid. For new configs, prefer `sequential.rules`. |
-| `move_mode`, `site_hop_prob`, `reorientation_prob`, `hop_reorientation_prob`, `hop_puckering_prob`, `hop_puckering_reorientation_prob`, `puckering_prob`, `puckering_elements`, `puckering_height_A`, `puckering_height_jitter_A`, `max_puckering_trials`, `displacement_sigma`, `adsorbate_surface_clearance_A`, `adsorbate_surface_xy_tol_A`, `molecular_upright_atom_indices`, `molecular_upright_min_z_A` | Adsorbate CMC proposal controls. Molecular hop-family moves rebuild compatible molecules from the adsorbate template before placing them at the target site, so flipped or distorted current geometries are not propagated by later hops. `hop_puckering_reorientation_prob` transfers the coupled local-coordinate puckering to the target atop metal: the metal is placed at its reference lateral position plus the sampled lift, and the adsorbate anchor is reseated above it by `vertical_offset`. `puckering_height_A` is the target lift; `puckering_height_jitter_A` controls the uniform variation around it. |
+| `move_mode`, `site_hop_prob`, `reorientation_prob`, `hop_reorientation_prob`, `hop_puckering_prob`, `hop_puckering_reorientation_prob`, `puckering_prob`, `puckering_elements`, `puckering_height_A`, `puckering_height_jitter_A`, `max_puckering_trials`, `displacement_sigma`, `adsorbate_surface_clearance_A`, `adsorbate_surface_xy_tol_A`, `molecular_upright_atom_indices`, `molecular_upright_min_z_A` | Adsorbate CMC proposal controls. Hybrid spatial moves use a fixed adsorption-channel registry: ordinary sites have a `base` channel and eligible atop sites have separate `low` and `high` channels. A single target channel is drawn, basin changes use `h' = H - h`, and invalid proposals become self-transitions. |
 | `enable_hybrid_md`, `md_move_prob`, `md_steps`, `md_timestep_fs` | Optional short MD proposal controls. |
 | `write_debug_trajs` | If true, write `seedNNN_attempted.traj`, `seedNNN_accepted.traj`, and `seedNNN_rejected.traj` under each `local_cmc` directory. Attempted trajectories contain every materialized trial structure before the shared filter/acceptance pipeline. Rejected trajectories include invalid-filter rejects and Metropolis rejects, with `Atoms.info` fields such as `mc_move_name`, `mc_event`, and `mc_reject_reason`. |
 | `write_attempted_traj`, `write_accepted_traj`, `write_rejected_traj` | Individually enable specific debug trajectory files. |
@@ -341,12 +341,18 @@ local_cmc:
       reorient:
         prob: 0.75
         angle_deg: 180.0
-        max_trials: 20
       puckering:
         prob: 0.5
-        elements: [Ti]
+        elements: [Ti, Zr]
         height_A: 0.15
         height_jitter_A: 0.02
+        heights:
+          Ti:
+            height_A: 1.20
+            height_jitter_A: 0.30
+          Zr:
+            height_A: 0.55
+            height_jitter_A: 0.15
   relaxation:
     enabled: true
     steps: 50
@@ -359,11 +365,12 @@ local_cmc:
     progress_log: local_cmc.log
 ```
 
-In this nested syntax, `moves.hop.prob` is the total hop-family probability.
-`moves.hop.reorient.prob` and `moves.hop.puckering.prob` are conditional on
-choosing a hop, so the example maps to `site_hop_prob = 0.075`,
-`hop_reorientation_prob = 0.225`, `hop_puckering_prob = 0.075`, and
-`hop_puckering_reorientation_prob = 0.225`.
+In this nested syntax, `moves.hop.prob` is the total adsorption-channel hop
+probability and `moves.hop.reorient.prob` is the conditional probability of a
+symmetric rotation during a spatial hop. A positive
+`moves.hop.puckering.prob` enables separate low/high channels for puckerable
+atop sites. The compatibility loader still exposes the four historical flat
+probabilities, but the hybrid sampler combines them into one channel kernel.
 
 ### `state_relaxation`
 

@@ -43,23 +43,24 @@ This page documents the YAML keys used by:
 
 | Key | Workflows | Default | Meaning |
 | --- | --- | --- | --- |
-| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. Supported values: `displacement`, `site_hop`, `reorientation`, `hop_reorientation`, `hop_puckering`, `hop_puckering_reorientation`, `puckering`, `hybrid`. |
+| `move_mode` | all | `displacement` for CMC, `hybrid` for GCMC | Canonical move family. `hybrid` uses the adsorption-channel kernel for all spatial hops, and `channel_hop` selects that kernel directly. The older spatial mode names remain available for legacy direct-mode runs. |
 | `displacement_sigma` | all | `0.6` for CMC, `0.25` for GCMC | Step size for local displacement moves. |
 | `max_displacement_trials` | all | `20` | Retry budget for generating a valid displacement proposal. |
-| `site_hop_prob` | all | `0.5` for CMC, `0.25` for GCMC | In `move_mode: hybrid`, probability of selecting a site hop. |
+| `site_hop_prob` | all | `0.5` for CMC, `0.25` for GCMC | Compatibility contribution to the unified adsorption-channel hop probability in `move_mode: hybrid`. Prefer the nested `moves.hop.prob` syntax. |
 | `reorientation_prob` | all | `0.2` for CMC, `0.0` for GCMC | In `move_mode: hybrid`, probability of selecting a rigid-body reorientation. |
-| `hop_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a combined site-hop plus rigid-body reorientation. Useful for molecular adsorbates such as OOH where the anchor site and molecular orientation should be sampled together. |
-| `hop_puckering_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that also transfers the local puckering to the target atop metal atom. |
-| `hop_puckering_reorientation_prob` | Ad-CMC/PT | `0.0` | In `move_mode: hybrid`, probability of selecting a site hop that transfers puckering and reorients the molecule around the new anchor. |
-| `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, probability of selecting a coupled local-coordinate puckering move. The support atom is placed at its reference lateral position plus the sampled outward lift, and the adsorbate anchor is reseated above that support atom by `vertical_offset`. |
+| `hop_reorientation_prob` | Ad-CMC/PT | `0.0` | Compatibility contribution used to determine the conditional probability of a symmetric molecular rotation during a spatial channel hop. |
+| `hop_puckering_prob` | Ad-CMC/PT | `0.0` | Compatibility contribution to the channel-hop probability. A positive value enables low/high channels on eligible atop sites. |
+| `hop_puckering_reorientation_prob` | Ad-CMC/PT | `0.0` | Compatibility contribution that both enables atop low/high channels and contributes to the conditional hop-reorientation probability. |
+| `puckering_prob` | all | `0.0` | In `move_mode: hybrid`, adds to the unified channel-hop probability and enables atop low/high channels. Same-site low/high targets provide reversible in-place toggles. |
 | `puckering_elements` | all | `None` | Elements eligible for puckering. `None` uses `site_elements`; for MXenes set this to the metal elements, e.g. `[Ti]` or `[Ti, Zr, Mo]`. |
-| `puckering_height_A` | all | `0.15` | Target outward displacement relative to the initial local-CMC support-atom height for puckering proposals. |
-| `puckering_height_jitter_A` | all | `null` | Uniform half-width around `puckering_height_A`; `null` uses 10% of `puckering_height_A`. Set `0.0` for a fixed lift. |
-| `max_puckering_trials` | all | `None` | Retry budget for puckering proposals. `None` uses the displacement retry budget. |
+| `puckering_height_A` | all | `0.15` | Center `H` of the complementary puckering transformation `h' = H - h`. The outward coordinate `h` is measured relative to a drift-corrected local surface plane. |
+| `puckering_height_jitter_A` | all | `null` | Uniform half-width used when drawing `H`; `null` uses 10% of `puckering_height_A`. The same density applies to the reverse transformation. Set `0.0` for a deterministic involution. |
+| `puckering_heights` | all | `null` | Optional element-keyed height distributions. Each entry defines `height_A` and optionally `height_jitter_A`; listed elements override the global height settings. |
+| `max_puckering_trials` | all | `None` | Legacy accepted key. Reversible puckering proposals now make one attempt and do not retry after a failed validation. |
 | `rotation_max_angle_deg` | all | `25.0` | Maximum absolute rotation angle used for reorientation. |
 | `max_reorientation_trials` | all | `None` | Retry budget for rigid-body reorientation proposals. `None` lets the engine use its internal default. |
 | `hop_reorientation_angle_deg` | Ad-CMC/PT | `180.0` | Maximum absolute rotation angle used after the anchor hops to a new site. |
-| `max_hop_reorientation_trials` | Ad-CMC/PT | `None` | Number of random orientations tried per target site for hop+reorientation proposals. `None` uses the displacement retry budget. |
+| `max_hop_reorientation_trials` | Ad-CMC/PT | `None` | Legacy accepted key. Hop proposals now draw one target and, when requested, one rotation increment. |
 
 ### Reorientation semantics
 
@@ -68,11 +69,10 @@ This page documents the YAML keys used by:
 - Internal bond lengths and angles are preserved.
 - For `OH`, the H rotates around the anchored O.
 - For `H2O`, both H atoms rotate as a rigid body around the anchored O.
-- Molecular hop-family moves rebuild compatible molecular groups from the
-  adsorbate template before placing them at the target site. This applies to
-  plain `site_hop`, `hop_reorientation`, and `hop_puckering`, so a previously
-  flipped or distorted molecular geometry is
-  not carried into later hops.
+- Hybrid spatial moves preserve the current molecular coordinates while moving
+  between adsorption channels. A selected hop reorientation applies one
+  symmetric rigid rotation increment, so the inverse increment has the same
+  proposal density.
 - Standalone `reorientation` also rebuilds compatible molecular groups from
   the adsorbate template before rotating about the anchor.
 
@@ -96,20 +96,67 @@ cmc:
       reorient:
         prob: 0.75
         angle_deg: 180.0
-        max_trials: 20
       puckering:
         prob: 0.50
-        elements: [Mo]
-        height_A: 1.10
-        height_jitter_A: 0.05
+        elements: [Ti, Zr]
+        height_A: 0.50
+        height_jitter_A: 0.10
+        heights:
+          Ti:
+            height_A: 1.20
+            height_jitter_A: 0.30
+          Zr:
+            height_A: 0.55
+            height_jitter_A: 0.15
 ```
 
-Here `moves.hop.prob` is the total hop-family probability. The loader maps
-`moves.hop.reorient.prob` and `moves.hop.puckering.prob` as conditional
-probabilities within that hop family. For the example, the effective weights are
-plain hop `0.60 * 0.25 * 0.50`, hop+reorientation `0.60 * 0.75 * 0.50`,
-hop+puckering `0.60 * 0.25 * 0.50`, and hop+puckering+reorientation
-`0.60 * 0.75 * 0.50`.
+Here `moves.hop.prob` is the total adsorption-channel hop probability and
+`moves.hop.reorient.prob` is the conditional probability of adding a symmetric
+rotation to a spatial hop. A positive `moves.hop.puckering.prob` enables the
+expanded low/high atop channels; its magnitude is retained only for old flat
+configuration compatibility and does not bias selection among those channels.
+
+The fixed registry contains one `base` channel for each ordinary adsorption
+site and separate `low` and `high` channels for each puckerable atop site. A
+move draws exactly one of the other channels with uniform probability. Thus the
+allowed transitions include hollow-to-puckered-atop, low-to-high on the same
+atop site, and low/high-atop-to-low/high-atop on another site. Invalid draws
+become self-transitions; the code does not retry another target.
+
+When a transition changes an atop basin, its support coordinate is reflected
+as `h' = H - h`. A departing high support returns to the low basin and a high
+target is created from a low support. Entries under `heights` apply independently
+to each endpoint's element. Elements without an entry use the global
+`height_A` and `height_jitter_A` values.
+
+The puckering coordinate removes collective substrate motion. For support atom
+`i`, the code evaluates
+`h_i = s[(z_i-z_i^0)-delta_z_local(i)]`, where `s` is the outward surface
+direction and `delta_z_local` is an affine fit to as many as eight fixed
+neighboring surface supports. The fit weights are cached. For a channel move,
+both endpoint atoms are excluded from both local fits, so the forward and
+reverse moves use the same reference planes and the departing support returns
+to its pre-puckering local position. Rigid translation and local slab tilt
+therefore do not make every surface atom appear puckered.
+
+The low/high boundary is `0.5 * height_A`. A reversible endpoint must remain
+between `-0.5 * height_A` and `height_A + height_jitter_A`; proposals outside
+that interval become self-transitions. Endpoint eligibility is tested in both
+directions with the same fixed basin bounds.
+
+The fixed registry preserves site IDs, types, support-atom membership, and
+target counts. Actual placement heights still follow the current coordinates
+of those support atoms. This distinction keeps proposal probabilities stable
+without freezing the substrate.
+
+Energy-only Metropolis acceptance is appropriate for the reversible channel
+kernel. Enabling local relaxation changes the calculation to
+basin-hopping sampling because minimization is not an invertible proposal.
+
+Checkpoints record both the puckering-coordinate and adsorption-channel kernel
+versions. Older checkpoints can be opened for inspection and emit a warning,
+but production sampling with the new kernel should start from the original
+substrate snapshot instead of continuing an old Markov chain.
 
 ## 3. Adsorbate CMC keys
 
@@ -197,7 +244,7 @@ These keys live under the `pt:` section in nested YAML for `AdsorbateReplicaExch
 | `write_debug_trajs` | `False` | Write per-replica attempted/accepted/rejected debug trajectories. Attempted trajectories contain materialized trial structures before the shared filter/acceptance pipeline. Metropolis-tested accepted/rejected frames include `Atoms.info` fields such as `mc_energy_eV`, `mc_current_energy_eV`, `mc_delta_e_eV`, `mc_acceptance_delta_eV`, `mc_accept_prob`, `mc_move_name`, `mc_event`, and `mc_reject_reason`. Geometry-filter rejections may not have energy fields because no calculator call is made. |
 | `write_accepted_traj`, `write_rejected_traj` | `False` | Individually enable accepted or rejected debug trajectories. |
 | `debug_traj_interval` | `1` | Write only every Nth debug event to attempted/accepted/rejected trajectories. |
-| `diagnostics_enabled` / `moves.diagnostics.enabled` | `False` | Collect `move_diagnostics` counters by move type and rejection reason in returned stats and checkpoints. Keep disabled for lean production runs. |
+| `diagnostics_enabled` / `moves.diagnostics.enabled` | `False` | Collect `move_diagnostics` counters for selected, materialized, null/self-transition, energy-tested, accepted, and rejected moves. Null reasons identify proposal-stage failures that do not call the MLIP. Keep disabled for lean production runs. |
 | `diagnostics_log` / `moves.diagnostics.log` | `False` | Append compact move/rejection summaries to normal report logs when diagnostics are enabled. |
 | `diagnostics_top_n` / `moves.diagnostics.top_n` | `3` | Number of top move/rejection counters shown in report logs. |
 

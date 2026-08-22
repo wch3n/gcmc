@@ -87,6 +87,7 @@ _DEFAULT_ADSORBATE_GCMC_SCAN_CONFIG = {
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
+    "puckering_heights": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
@@ -190,6 +191,7 @@ _DEFAULT_ADSORBATE_GCMC_CONFIG = {
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
+    "puckering_heights": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.25,
     "max_displacement_trials": 20,
@@ -278,6 +280,7 @@ _DEFAULT_ADSORBATE_CMC_CONFIG = {
     "puckering_elements": None,
     "puckering_height_A": 0.15,
     "puckering_height_jitter_A": None,
+    "puckering_heights": None,
     "rotation_max_angle_deg": 25.0,
     "displacement_sigma": 0.6,
     "max_displacement_trials": 20,
@@ -1735,6 +1738,7 @@ class AdsorbateGCMCScanWorkflow:
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
             puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
+            puckering_heights=getattr(cfg, "puckering_heights", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
@@ -1842,6 +1846,7 @@ class AdsorbateGCMCScanWorkflow:
             "puckering_height_jitter_A": getattr(
                 cfg, "puckering_height_jitter_A", None
             ),
+            "puckering_heights": getattr(cfg, "puckering_heights", None),
             "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
             "displacement_sigma": cfg.displacement_sigma,
             "max_displacement_trials": cfg.max_displacement_trials,
@@ -2387,6 +2392,7 @@ class AdsorbateCMCWorkflow:
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
             puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
+            puckering_heights=getattr(cfg, "puckering_heights", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,
@@ -2839,6 +2845,7 @@ class AdsorbateReplicaExchangeWorkflow:
             "puckering_height_jitter_A": getattr(
                 cfg, "puckering_height_jitter_A", None
             ),
+            "puckering_heights": getattr(cfg, "puckering_heights", None),
             "rotation_max_angle_deg": getattr(cfg, "rotation_max_angle_deg", 25.0),
             "displacement_sigma": cfg.displacement_sigma,
             "max_displacement_trials": cfg.max_displacement_trials,
@@ -3209,6 +3216,7 @@ class AdsorbateGCMCWorkflow:
             or None,
             puckering_height_A=getattr(cfg, "puckering_height_A", 0.15),
             puckering_height_jitter_A=getattr(cfg, "puckering_height_jitter_A", None),
+            puckering_heights=getattr(cfg, "puckering_heights", None),
             rotation_max_angle_deg=getattr(cfg, "rotation_max_angle_deg", 25.0),
             displacement_sigma=cfg.displacement_sigma,
             max_displacement_trials=cfg.max_displacement_trials,

@@ -208,6 +208,7 @@ output:
             frame=0,
             output_dir="/tmp/alloy_cmc_outputs",
             output_prefix="seed_067/out",
+            write_accepted_traj=True,
         )
         workflow = AlloyCMCWorkflow(cfg, calculator_factory=lambda *_: None)
 

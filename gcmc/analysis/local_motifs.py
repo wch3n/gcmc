@@ -32,7 +32,7 @@ class LocalAdsorptionMotifAnalyzer:
         site_elements: Iterable[str] = ("Ti", "Zr"),
         substrate_elements: Iterable[str] = ("Ti", "Zr", "C"),
         functional_elements: Iterable[str] = ("O",),
-        site_types: Iterable[str] = ("atop", "fcc", "hcp"),
+        site_types: Iterable[str] = ("atop", "bridge", "fcc", "hcp"),
         surface_side: str = "top",
         layer_tol: float = 0.5,
         xy_tol: float = 0.6,
@@ -44,6 +44,9 @@ class LocalAdsorptionMotifAnalyzer:
         shell1_size: int = 6,
         shell2_size: int = 6,
         functional_cutoff: float = 3.0,
+        max_site_distance_A: float | None = None,
+        max_anchor_support_distance_A: float | None = None,
+        include_blocked_sites: bool = False,
     ) -> None:
         self.site_elements = tuple(site_elements)
         self.substrate_elements = tuple(substrate_elements)
@@ -62,6 +65,15 @@ class LocalAdsorptionMotifAnalyzer:
         self.shell1_size = int(shell1_size)
         self.shell2_size = int(shell2_size)
         self.functional_cutoff = float(functional_cutoff)
+        self.max_site_distance_A = (
+            None if max_site_distance_A is None else float(max_site_distance_A)
+        )
+        self.max_anchor_support_distance_A = (
+            None
+            if max_anchor_support_distance_A is None
+            else float(max_anchor_support_distance_A)
+        )
+        self.include_blocked_sites = bool(include_blocked_sites)
 
         if self.surface_side not in {"top", "bottom"}:
             raise ValueError("surface_side must be 'top' or 'bottom'.")
@@ -71,6 +83,15 @@ class LocalAdsorptionMotifAnalyzer:
             raise ValueError("shell sizes must be >= 0.")
         if self.functional_cutoff < 0.0:
             raise ValueError("functional_cutoff must be >= 0.")
+        if self.max_site_distance_A is not None and self.max_site_distance_A <= 0.0:
+            raise ValueError("max_site_distance_A must be > 0 when provided.")
+        if (
+            self.max_anchor_support_distance_A is not None
+            and self.max_anchor_support_distance_A <= 0.0
+        ):
+            raise ValueError(
+                "max_anchor_support_distance_A must be > 0 when provided."
+            )
 
     @staticmethod
     def _parse_temperature_from_traj_name(path: str | Path) -> float:
@@ -152,6 +173,19 @@ class LocalAdsorptionMotifAnalyzer:
             return int(candidate_indices[np.argmin(z)])
         return int(candidate_indices[np.argmax(z)])
 
+    @staticmethod
+    def _coordination_family(site_type: str, support_size: int) -> tuple[str, str]:
+        """Return a coarse motif and an explicit coordination label."""
+        site_type = str(site_type).lower()
+        support_size = int(support_size)
+        if support_size == 1 or site_type == "atop":
+            return "atop", "atop_1fold"
+        if support_size == 2 or site_type == "bridge":
+            return "bridge", "bridge_2fold"
+        if support_size == 3 or site_type in {"fcc", "hcp", "hollow"}:
+            return "hollow", "hollow_3fold"
+        return "multifold", f"multifold_{support_size}fold"
+
     def _build_reference_site_descriptors(self, reference_atoms: Atoms) -> list[dict[str, object]]:
         symbols = np.asarray(reference_atoms.get_chemical_symbols(), dtype=object)
         metal_indices = np.where(np.isin(symbols, self.site_elements))[0]
@@ -167,14 +201,19 @@ class LocalAdsorptionMotifAnalyzer:
             support_xy_tol=self.support_xy_tol,
             termination_site_xy_tol=self.termination_site_xy_tol,
             vertical_offset=self.vertical_offset,
-            termination_elements=self.functional_elements,
+            termination_elements=(
+                self.functional_elements if functional_indices.size > 0 else ()
+            ),
             min_termination_dist=self.min_termination_dist,
         )
         descriptors: list[dict[str, object]] = []
         cell = reference_atoms.cell.array
         pbc = reference_atoms.pbc
         for local_index, site in enumerate(registry):
-            if bool(site.get("blocked_by_termination", False)):
+            if (
+                bool(site.get("blocked_by_termination", False))
+                and not self.include_blocked_sites
+            ):
                 continue
 
             support_indices = np.asarray(site.get("support_indices", ()), dtype=int)
@@ -249,6 +288,9 @@ class LocalAdsorptionMotifAnalyzer:
                 "nearest_termination_dist_A": float(
                     site.get("nearest_termination_dist_A", np.nan)
                 ),
+                "blocked_by_termination": bool(
+                    site.get("blocked_by_termination", False)
+                ),
                 "motif_key": (
                     f"{site['site_type']}|support={support_key}"
                     f"|shell1={shell1_key}|shell2={shell2_key}|func={functional_count}"
@@ -288,6 +330,11 @@ class LocalAdsorptionMotifAnalyzer:
             raise ValueError("No eligible adsorption sites found in the reference slab.")
 
         site_xy = np.asarray([row["_site_xy"] for row in descriptors], dtype=float)
+        surface_indices = np.unique(
+            np.concatenate(
+                [np.asarray(row["_support_indices"], dtype=int) for row in descriptors]
+            )
+        )
         frame_rows: list[dict[str, object]] = []
         temperature = self._parse_temperature_from_traj_name(traj_path)
 
@@ -313,6 +360,50 @@ class LocalAdsorptionMotifAnalyzer:
                     atoms.get_distances(anchor_index, support_indices, mic=True),
                     dtype=float,
                 )
+                site_distance = float(d_xy[site_idx])
+                support_min_distance = float(np.min(support_dists))
+                adsorption_motif, coordination_label = self._coordination_family(
+                    str(descriptor["site_type"]),
+                    int(descriptor["support_size"]),
+                )
+                coordination_n = int(descriptor["support_size"])
+                assignment_status = "assigned"
+                if (
+                    self.max_site_distance_A is not None
+                    and site_distance > self.max_site_distance_A
+                ):
+                    adsorption_motif = "off_site"
+                    coordination_label = "off_site_0fold"
+                    coordination_n = 0
+                    assignment_status = "off_site"
+                elif (
+                    self.max_anchor_support_distance_A is not None
+                    and support_min_distance > self.max_anchor_support_distance_A
+                ):
+                    adsorption_motif = "detached"
+                    coordination_label = "detached_0fold"
+                    coordination_n = 0
+                    assignment_status = "detached"
+
+                surface_shift = float(
+                    np.median(
+                        atoms.positions[surface_indices, 2]
+                        - reference_atoms.positions[surface_indices, 2]
+                    )
+                )
+                support_dz = (
+                    atoms.positions[support_indices, 2]
+                    - reference_atoms.positions[support_indices, 2]
+                    - surface_shift
+                )
+                outward_sign = 1.0 if self.surface_side == "top" else -1.0
+                support_outward = outward_sign * support_dz
+                support_z = (
+                    float(np.max(atoms.positions[support_indices, 2]))
+                    if self.surface_side == "top"
+                    else float(np.min(atoms.positions[support_indices, 2]))
+                )
+                anchor_height = outward_sign * (float(anchor_pos[2]) - support_z)
                 row = {
                     key: value
                     for key, value in descriptor.items()
@@ -330,10 +421,21 @@ class LocalAdsorptionMotifAnalyzer:
                         "anchor_x_A": float(anchor_pos[0]),
                         "anchor_y_A": float(anchor_pos[1]),
                         "anchor_z_A_inst": float(anchor_pos[2]),
-                        "anchor_site_xy_dist_A": float(d_xy[site_idx]),
-                        "anchor_support_min_dist_A": float(np.min(support_dists)),
+                        "adsorption_motif": adsorption_motif,
+                        "coordination_label": coordination_label,
+                        "coordination_n": coordination_n,
+                        "assignment_status": assignment_status,
+                        "anchor_site_xy_dist_A": site_distance,
+                        "anchor_support_min_dist_A": support_min_distance,
                         "anchor_support_mean_dist_A": float(np.mean(support_dists)),
                         "anchor_z_offset_A": float(anchor_pos[2] - float(descriptor["anchor_z_A"])),
+                        "anchor_height_above_support_A": anchor_height,
+                        "support_outward_displacement_A_mean": float(
+                            np.mean(support_outward)
+                        ),
+                        "support_outward_displacement_A_max": float(
+                            np.max(support_outward)
+                        ),
                     }
                 )
                 frame_rows.append(row)
@@ -396,6 +498,110 @@ class LocalAdsorptionMotifAnalyzer:
                 }
             )
 
+        pattern_groups: dict[
+            tuple[str, str, str], list[dict[str, object]]
+        ] = defaultdict(list)
+        family_groups: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for row in frame_rows:
+            pattern_groups[
+                (
+                    str(row["adsorption_motif"]),
+                    str(row["site_type"]),
+                    str(row["support_key"]),
+                )
+            ].append(row)
+            family_groups[str(row["adsorption_motif"])].append(row)
+
+        pattern_summary: list[dict[str, object]] = []
+        for (family, site_type, support_key), rows in sorted(
+            pattern_groups.items(), key=lambda item: (-len(item[1]), item[0])
+        ):
+            pattern_summary.append(
+                {
+                    "adsorption_motif": family,
+                    "coordination_label": str(rows[0]["coordination_label"]),
+                    "coordination_n": int(rows[0]["coordination_n"]),
+                    "site_type": site_type,
+                    "support_key": support_key,
+                    "samples": int(len(rows)),
+                    "population": (
+                        float(len(rows) / total_samples)
+                        if total_samples
+                        else float("nan")
+                    ),
+                    "n_sites": int(
+                        len({int(row["site_local_index"]) for row in rows})
+                    ),
+                    "n_frames": int(len({int(row["frame"]) for row in rows})),
+                    "anchor_site_xy_dist_A_mean": self._safe_mean(
+                        [float(row["anchor_site_xy_dist_A"]) for row in rows]
+                    ),
+                    "anchor_support_min_dist_A_mean": self._safe_mean(
+                        [float(row["anchor_support_min_dist_A"]) for row in rows]
+                    ),
+                    "anchor_height_above_support_A_mean": self._safe_mean(
+                        [float(row["anchor_height_above_support_A"]) for row in rows]
+                    ),
+                    "support_outward_displacement_A_max_mean": self._safe_mean(
+                        [
+                            float(row["support_outward_displacement_A_max"])
+                            for row in rows
+                        ]
+                    ),
+                }
+            )
+
+        family_summary: list[dict[str, object]] = []
+        for family, rows in sorted(
+            family_groups.items(), key=lambda item: (-len(item[1]), item[0])
+        ):
+            family_summary.append(
+                {
+                    "adsorption_motif": family,
+                    "samples": int(len(rows)),
+                    "population": (
+                        float(len(rows) / total_samples)
+                        if total_samples
+                        else float("nan")
+                    ),
+                    "n_sites": int(
+                        len({int(row["site_local_index"]) for row in rows})
+                    ),
+                    "n_support_compositions": int(
+                        len({str(row["support_key"]) for row in rows})
+                    ),
+                }
+            )
+
+        transition_counts: dict[tuple[str, str], int] = defaultdict(int)
+        rows_by_group: dict[int, list[dict[str, object]]] = defaultdict(list)
+        for row in frame_rows:
+            rows_by_group[int(row["group_tag"])].append(row)
+        for rows in rows_by_group.values():
+            ordered = sorted(rows, key=lambda row: int(row["frame"]))
+            for previous, current in zip(ordered[:-1], ordered[1:]):
+                transition_counts[
+                    (
+                        str(previous["adsorption_motif"]),
+                        str(current["adsorption_motif"]),
+                    )
+                ] += 1
+        transitions_from: dict[str, int] = defaultdict(int)
+        for (source, _), count in transition_counts.items():
+            transitions_from[source] += count
+        transition_summary = [
+            {
+                "from_motif": source,
+                "to_motif": target,
+                "count": int(count),
+                "probability_from": float(count / transitions_from[source]),
+                "changed": bool(source != target),
+            }
+            for (source, target), count in sorted(
+                transition_counts.items(), key=lambda item: (-item[1], item[0])
+            )
+        ]
+
         return {
             "traj": str(traj_path),
             "temperature_K": temperature,
@@ -406,6 +612,9 @@ class LocalAdsorptionMotifAnalyzer:
             "local_motif_frames": frame_rows,
             "local_motif_summary": motif_summary,
             "local_site_summary": site_summary,
+            "adsorption_pattern_summary": pattern_summary,
+            "adsorption_family_summary": family_summary,
+            "adsorption_motif_transitions": transition_summary,
         }
 
     def export_csv(self, result: Dict[str, object], out_prefix: str | Path) -> None:
@@ -433,6 +642,30 @@ class LocalAdsorptionMotifAnalyzer:
                 Path(f"{out_prefix}_site_summary.csv"),
                 site_rows,
                 list(site_rows[0].keys()),
+            )
+
+        pattern_rows = result.get("adsorption_pattern_summary", [])
+        if pattern_rows:
+            _write_csv(
+                Path(f"{out_prefix}_patterns.csv"),
+                pattern_rows,
+                list(pattern_rows[0].keys()),
+            )
+
+        family_rows = result.get("adsorption_family_summary", [])
+        if family_rows:
+            _write_csv(
+                Path(f"{out_prefix}_families.csv"),
+                family_rows,
+                list(family_rows[0].keys()),
+            )
+
+        transition_rows = result.get("adsorption_motif_transitions", [])
+        if transition_rows:
+            _write_csv(
+                Path(f"{out_prefix}_transitions.csv"),
+                transition_rows,
+                list(transition_rows[0].keys()),
             )
 
     @staticmethod
@@ -479,17 +712,20 @@ class LocalAdsorptionMotifAnalyzer:
         if not frame_rows:
             return
 
-        if group_by not in {"motif", "site"}:
-            raise ValueError("group_by must be 'motif' or 'site'.")
+        if group_by not in {"motif", "site", "pattern"}:
+            raise ValueError("group_by must be 'motif', 'site', or 'pattern'.")
         if top_k < 1 or n_per_group < 1:
             raise ValueError("top_k and n_per_group must be >= 1.")
 
-        key_field = "motif_key" if group_by == "motif" else "site_local_index"
-        summary_rows = (
-            list(result.get("local_motif_summary", []))
-            if group_by == "motif"
-            else list(result.get("local_site_summary", []))
-        )
+        if group_by == "motif":
+            key_field = "motif_key"
+            summary_rows = list(result.get("local_motif_summary", []))
+        elif group_by == "site":
+            key_field = "site_local_index"
+            summary_rows = list(result.get("local_site_summary", []))
+        else:
+            key_field = "adsorption_motif"
+            summary_rows = list(result.get("adsorption_family_summary", []))
         selected_keys = [row[key_field] for row in summary_rows[:top_k]]
         grouped_rows: dict[object, list[dict[str, object]]] = defaultdict(list)
         for row in frame_rows:
@@ -531,6 +767,8 @@ class LocalAdsorptionMotifAnalyzer:
         for row in selected_rows:
             atoms = frames[int(row["frame"])].copy()
             atoms.info["local_motif_key"] = str(row["motif_key"])
+            atoms.info["adsorption_motif"] = str(row["adsorption_motif"])
+            atoms.info["coordination_n"] = int(row["coordination_n"])
             atoms.info["local_site_index"] = int(row["site_local_index"])
             atoms.info["local_registry_index"] = int(row["registry_index"])
             atoms.info["representative_group_by"] = str(group_by)

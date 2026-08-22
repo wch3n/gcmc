@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import os
 import pickle
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from ase import Atoms
 from ase import units
@@ -25,6 +25,48 @@ from .utils import (
 )
 
 logger = logging.getLogger("mc")
+
+
+def _normalize_puckering_heights(
+    config: Optional[Mapping[str, Mapping[str, object]]],
+    *,
+    eligible_elements: Sequence[str],
+) -> Dict[str, Tuple[float, float]]:
+    if config is None:
+        return {}
+    if not isinstance(config, Mapping):
+        raise ValueError("puckering_heights must be a mapping keyed by element.")
+
+    eligible = set(str(element) for element in eligible_elements)
+    normalized: Dict[str, Tuple[float, float]] = {}
+    for raw_element, raw_parameters in config.items():
+        element = str(raw_element)
+        if element not in eligible:
+            raise ValueError(
+                f"puckering_heights contains {element!r}, which is not listed in "
+                "puckering_elements."
+            )
+        if not isinstance(raw_parameters, Mapping):
+            raise ValueError(
+                f"puckering_heights[{element!r}] must be a mapping with height_A."
+            )
+        if "height_A" not in raw_parameters:
+            raise ValueError(
+                f"puckering_heights[{element!r}] must define height_A."
+            )
+        height = float(raw_parameters["height_A"])
+        if height < 0.0:
+            raise ValueError(
+                f"puckering_heights[{element!r}].height_A must be >= 0."
+            )
+        raw_jitter = raw_parameters.get("height_jitter_A")
+        jitter = 0.1 * height if raw_jitter is None else float(raw_jitter)
+        if jitter < 0.0:
+            raise ValueError(
+                f"puckering_heights[{element!r}].height_jitter_A must be >= 0."
+            )
+        normalized[element] = (height, jitter)
+    return normalized
 
 
 def _load_adsorbate_template(
@@ -239,7 +281,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
     Tolerance conventions:
     - ``min_clearance`` is the minimum full 3D adsorbate/slab clearance.
     - ``site_match_tol`` controls how strictly high-symmetry sites are matched
-      on the instantaneous surface.
+      when the fixed site registry is built from the initial surface.
     - ``surface_layer_tol`` controls z-layer clustering for the exposed surface.
     - ``termination_clearance`` blocks sites or trial placements that come too
       close to surface terminations.
@@ -275,6 +317,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         puckering_elements: Optional[Union[str, Sequence[str]]] = None,
         puckering_height_A: float = 0.15,
         puckering_height_jitter_A: Optional[float] = None,
+        puckering_heights: Optional[Mapping[str, Mapping[str, object]]] = None,
         displacement_sigma: float = 1.5,
         max_displacement_trials: int = 10,
         max_reorientation_trials: Optional[int] = None,
@@ -428,6 +471,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         move_mode = move_mode.lower()
         if move_mode not in (
             "displacement",
+            "channel_hop",
             "site_hop",
             "reorientation",
             "hop_reorientation",
@@ -438,7 +482,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         ):
             raise ValueError(
                 "move_mode must be 'displacement', 'site_hop', 'reorientation', "
-                "'hop_reorientation', 'hop_puckering', "
+                "'channel_hop', 'hop_reorientation', 'hop_puckering', "
                 "'hop_puckering_reorientation', 'puckering', or 'hybrid'."
             )
         if not (0.0 <= site_hop_prob <= 1.0):
@@ -564,11 +608,43 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             hop_puckering_reorientation_prob
         )
         self.puckering_prob = float(puckering_prob)
+        spatial_channel_weight = (
+            self.site_hop_prob
+            + self.hop_reorientation_prob
+            + self.hop_puckering_prob
+            + self.hop_puckering_reorientation_prob
+        )
+        self.channel_hop_prob = spatial_channel_weight + self.puckering_prob
+        self.channel_reorientation_prob = (
+            (
+                self.hop_reorientation_prob
+                + self.hop_puckering_reorientation_prob
+            )
+            / spatial_channel_weight
+            if spatial_channel_weight > 1e-15
+            else 0.0
+        )
+        self.channel_puckering_enabled = bool(
+            self.puckering_prob > 0.0
+            or self.hop_puckering_prob > 0.0
+            or self.hop_puckering_reorientation_prob > 0.0
+            or self.move_mode
+            in {
+                "channel_hop",
+                "hop_puckering",
+                "hop_puckering_reorientation",
+                "puckering",
+            }
+        )
         self.puckering_height_A = float(puckering_height_A)
         self.puckering_height_jitter_A = (
             0.1 * self.puckering_height_A
             if puckering_height_jitter_A is None
             else float(puckering_height_jitter_A)
+        )
+        self.puckering_heights = _normalize_puckering_heights(
+            puckering_heights,
+            eligible_elements=self.puckering_elements,
         )
         self.displacement_sigma = displacement_sigma
         self.max_displacement_trials = int(max_displacement_trials)
@@ -588,6 +664,10 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             else int(max_displacement_trials)
         )
         self._puckering_reference_positions = self.atoms.get_positions().copy()
+        self._puckering_surface_support_indices_cache: Optional[np.ndarray] = None
+        self._puckering_local_reference_cache: dict[
+            tuple[int, tuple[int, ...]], tuple[np.ndarray, np.ndarray]
+        ] = {}
         self.rotation_max_angle_rad = np.deg2rad(float(rotation_max_angle_deg))
         self.hop_reorientation_angle_rad = np.deg2rad(
             float(hop_reorientation_angle_deg)
@@ -628,6 +708,8 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         self.checkpoint_file = checkpoint_file
         self.checkpoint_interval = checkpoint_interval
         self._site_registry: Optional[list[dict[str, object]]] = None
+        self._adsorption_channel_registry = None
+        self._adsorption_channel_lookup = None
         self._reuse_io = False
         self._persistent_traj_writers: dict[str, Trajectory] = {}
         self._persistent_thermo_handles: dict[str, object] = {}
@@ -699,6 +781,19 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         self._hybrid_move_table = self._build_hybrid_move_table()
 
         self._update_indices()
+        # Site identities and proposal counts must not depend on the current
+        # puckering/thermal state. Placement heights are still evaluated from
+        # the current coordinates of each site's fixed support atoms.
+        hop_modes = {
+            "channel_hop",
+            "site_hop",
+            "hop_reorientation",
+            "hop_puckering",
+            "hop_puckering_reorientation",
+            "hybrid",
+        }
+        if self.move_mode in hop_modes:
+            self._site_registry = self._build_site_registry()
         self.sum_E = 0.0
         self.sum_E_sq = 0.0
         self.n_samples = 0
@@ -1171,7 +1266,6 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         ]
 
     def _refresh_cached_state(self) -> None:
-        self._site_registry = None
         self._update_indices()
 
     def _slab_atoms_for_site_registry(self, atoms: Optional[Atoms] = None) -> Atoms:
@@ -1324,6 +1418,10 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             "total_moves": self.total_moves,
             "md_attempted_moves": self.md_attempted_moves,
             "md_accepted_moves": self.md_accepted_moves,
+            "site_registry": self._site_registry,
+            "puckering_reference_positions": self._puckering_reference_positions,
+            "puckering_coordinate_version": 2,
+            "adsorption_channel_version": 1,
         }
         if self.diagnostics_enabled:
             state["move_diagnostics"] = self.move_diagnostics
@@ -1355,11 +1453,43 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         self.md_accepted_moves = int(
             state.get("md_accepted_moves", self.md_accepted_moves)
         )
+        reference_positions = state.get("puckering_reference_positions")
+        if reference_positions is not None:
+            reference_positions = np.asarray(reference_positions, dtype=float)
+            if reference_positions.shape == self._puckering_reference_positions.shape:
+                self._puckering_reference_positions = reference_positions.copy()
+        checkpoint_registry = state.get("site_registry")
+        if isinstance(checkpoint_registry, list):
+            self._site_registry = checkpoint_registry
+        self._adsorption_channel_registry = None
+        self._adsorption_channel_lookup = None
+        self._puckering_surface_support_indices_cache = None
+        self._puckering_local_reference_cache.clear()
+        if int(state.get("puckering_coordinate_version", 1)) < 2 and (
+            self.puckering_prob > 0.0
+            or self.hop_puckering_prob > 0.0
+            or self.hop_puckering_reorientation_prob > 0.0
+            or self.move_mode
+            in {"puckering", "hop_puckering", "hop_puckering_reorientation"}
+        ):
+            logger.warning(
+                "Checkpoint predates the local puckering coordinate. Resume is "
+                "supported for inspection, but a fresh production trajectory is "
+                "required for a consistent proposal kernel."
+            )
+        if int(state.get("adsorption_channel_version", 0)) < 1 and (
+            self.move_mode == "channel_hop"
+            or (self.move_mode == "hybrid" and self.channel_hop_prob > 0.0)
+        ):
+            logger.warning(
+                "Checkpoint predates the adsorption-channel proposal kernel. "
+                "Resume is supported for inspection, but a fresh production "
+                "trajectory is required for a consistent Markov chain."
+            )
         if self.diagnostics_enabled:
             self.move_diagnostics = self._normalize_move_diagnostics(
                 state.get("move_diagnostics", self.move_diagnostics)
             )
-        self._site_registry = None
         self._update_indices()
         self._resumed_from_checkpoint = True
         logger.info(f"[{self.T:.0f}K] Resumed adsorbate MC from checkpoint.")
@@ -1445,7 +1575,11 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
 
     def _empty_move_diagnostics(self) -> Dict[str, Dict[str, int]]:
         return {
+            "selected_by_move": {},
             "attempted_by_move": {},
+            "null_by_reason": {},
+            "null_by_move_reason": {},
+            "energy_tested_by_move": {},
             "accepted_by_move": {},
             "rejected_by_move": {},
             "rejected_by_reason": {},
@@ -1470,6 +1604,20 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
 
     def _record_attempted_proposal(self, proposal: MoveProposal) -> None:
         self._increment_diagnostic("attempted_by_move", proposal.move_name)
+
+    def _record_selected_move(self, move_name: str) -> None:
+        self._increment_diagnostic("selected_by_move", move_name)
+
+    def _record_null_move(self, move_name: str, reason: str) -> None:
+        reason = str(reason)
+        self._increment_diagnostic("null_by_reason", reason)
+        self._increment_diagnostic(
+            "null_by_move_reason",
+            f"{move_name}:{reason}",
+        )
+
+    def _record_energy_tested_proposal(self, proposal: MoveProposal) -> None:
+        self._increment_diagnostic("energy_tested_by_move", proposal.move_name)
 
     def _record_accepted_proposal(self, proposal: MoveProposal) -> None:
         self._increment_diagnostic("accepted_by_move", proposal.move_name)
@@ -1501,7 +1649,8 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             return ""
         top_n = int(self.diagnostics_top_n)
         return (
-            f" | Moves: {self._top_diagnostics('attempted_by_move', limit=top_n)}"
+            f" | Moves: {self._top_diagnostics('selected_by_move', limit=top_n)}"
+            f" | Nulls: {self._top_diagnostics('null_by_reason', limit=top_n)}"
             f" | Rejects: {self._top_diagnostics('rejected_by_reason', limit=top_n)}"
         )
 
@@ -1585,7 +1734,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         n_ads = len(self.ads_groups)
         if n_ads == 0:
             return 0
-        if self.move_mode in ("site_hop", "hybrid"):
+        if self.move_mode in ("channel_hop", "site_hop", "hybrid"):
             active_sites = sum(
                 1
                 for row in self._get_site_registry()
@@ -1820,7 +1969,10 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             termination_elements=self.functional_elements,
             min_termination_dist=self.termination_clearance,
         )
-        return self._filter_site_registry_to_region(registry, slab_atoms)
+        filtered = self._filter_site_registry_to_region(registry, slab_atoms)
+        for site_id, site in enumerate(filtered):
+            site["site_id"] = int(site_id)
+        return filtered
 
     def _get_site_registry(self) -> list[dict[str, object]]:
         if self._site_registry is None:
@@ -2081,6 +2233,8 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
         rejected_writer: Optional[Trajectory],
     ) -> None:
         self._record_attempted_proposal(proposal)
+        if proposal.is_md:
+            self._record_energy_tested_proposal(proposal)
         self._write_debug_atoms(
             attempted_writer,
             proposal.atoms,
@@ -2131,7 +2285,6 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
                 self._record_accepted_proposal(annotated)
                 self.atoms.positions = proposal.atoms.positions
                 self.atoms.cell = proposal.atoms.cell
-                self._site_registry = None
                 self._write_debug_atoms(
                     accepted_writer,
                     self.atoms,
@@ -2151,6 +2304,7 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
                 )
             return
 
+        self._record_energy_tested_proposal(proposal)
         e_new = self.get_potential_energy(proposal.atoms)
         delta_e = e_new - self.e_old
         e_current = float(self.e_old)
@@ -2171,7 +2325,6 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
             self.e_old = e_new
             self.accepted_moves += 1
             self._record_accepted_proposal(annotated)
-            self._site_registry = None
             self._write_debug_atoms(
                 accepted_writer,
                 self.atoms,
@@ -2287,29 +2440,40 @@ class AdsorbateCMC(AdsorbateMoveProposalMixin, SurfaceMCBase):
                 write_debug_frame = self._should_write_debug_traj()
                 do_md = self.enable_hybrid_md and self.rng.random() < self.md_move_prob
                 if do_md:
+                    move_name = "md_boost"
+                    self._record_selected_move(move_name)
                     self.md_attempted_moves += 1
                     atoms_trial, delta_e, delta_h = self._propose_md_move()
                     if atoms_trial is None:
+                        self._record_null_move(move_name, "md_proposal_failed")
                         continue
                     proposal = MoveProposal(
                         atoms=atoms_trial,
-                        move_name="md_boost",
+                        move_name=move_name,
                         is_md=True,
                         delta_e=delta_e,
                         delta_h=delta_h,
                     )
                 else:
                     atoms_trial = self._propose_move()
+                    move_name = (
+                        getattr(self, "_last_proposal_move_name", None)
+                        or self.move_mode
+                    )
+                    self._record_selected_move(move_name)
                     if atoms_trial is None:
+                        self._record_null_move(
+                            move_name,
+                            getattr(self, "_last_proposal_reject_reason", None)
+                            or "proposal_unavailable",
+                        )
                         continue
                     proposal = MoveProposal(
                         atoms=atoms_trial,
-                        move_name=getattr(
-                            self,
-                            "_last_proposal_move_name",
-                            None,
-                        )
-                        or self.move_mode,
+                        move_name=move_name,
+                        metadata=dict(
+                            getattr(self, "_last_proposal_metadata", {})
+                        ),
                     )
 
                 self._process_move_proposal(

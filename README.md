@@ -8,6 +8,7 @@ Monte Carlo workflows for alloy and adsorbate sampling on ASE-compatible atomist
 - Shared workflow keys: `docs/configuration/shared.md`
 - Adsorbate workflow keys: `docs/configuration/adsorbate.md`
 - Alloy workflow keys: `docs/configuration/alloy.md`
+- Adsorption-motif analysis: `docs/adsorption_motifs.md`
 
 The codebase supports:
 
@@ -133,6 +134,12 @@ Active-learning selection and committee evaluation:
 ```bash
 gcmc-active-learning-select --help
 gcmc-active-learning-evaluate --help
+```
+
+Adsorption motifs in tagged adsorbate CMC/PT trajectories:
+
+```bash
+gcmc-analyze-adsorption-motifs --traj <run-directory> --out-dir motif_analysis
 ```
 
 These are auxiliary tools rather than part of the core `gcmc` namespace. See

@@ -118,13 +118,18 @@ moves:
     reorient:
       prob: 0.5
       angle_deg: 45.0
-      max_trials: 20
     puckering:
       prob: 0.0
       elements: [Ti, Zr]
       height_A: 0.5
       height_jitter_A: 0.1
-      max_trials: 20
+      heights:
+        Ti:
+          height_A: 1.2
+          height_jitter_A: 0.3
+        Zr:
+          height_A: 0.55
+          height_jitter_A: 0.15
   reorientation:
     prob: 0.2
     angle_deg: 45.0
@@ -142,6 +147,7 @@ slurm:
   account: htbase
   time: "12:00:00"
   signal_seconds_before_timeout: 600
+  auto_requeue: true
   gres: gpu:1
   cpus_per_task: 8
   mem_per_cpu: 8gb

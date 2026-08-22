@@ -59,6 +59,15 @@ def _parse_symbols(text: str | Iterable[str]) -> list[str]:
     return symbols
 
 
+def _parse_yaml_mapping(value: str | dict) -> dict:
+    if isinstance(value, dict):
+        return value
+    parsed = yaml.safe_load(value)
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("Expected a YAML mapping.")
+    return parsed
+
+
 def _parse_dat(path: Path | None) -> list[tuple[float, float]]:
     if path is None:
         return []
@@ -384,14 +393,20 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
         defaults["reorientation_angle_deg"] = reorientation["angle_deg"]
     if "max_trials" in reorientation:
         defaults["max_reorientation_trials"] = reorientation["max_trials"]
-    if "prob" in puckering:
-        defaults["puckering_prob"] = puckering["prob"]
+    if puckering:
+        defaults["puckering_prob"] = (
+            puckering.get("prob", 1.0)
+            if bool(puckering.get("enabled", True))
+            else 0.0
+        )
     if "elements" in puckering:
         defaults["puckering_elements"] = puckering["elements"]
     if "height_A" in puckering:
         defaults["puckering_height_A"] = puckering["height_A"]
     if "height_jitter_A" in puckering:
         defaults["puckering_height_jitter_A"] = puckering["height_jitter_A"]
+    if "heights" in puckering:
+        defaults["puckering_heights"] = puckering["heights"]
     if "max_trials" in puckering:
         defaults["max_puckering_trials"] = puckering["max_trials"]
 
@@ -461,6 +476,7 @@ def _defaults_from_prepare_yaml(path: Path) -> dict[str, object]:
         "array_concurrency",
         "job_name",
         "signal_seconds_before_timeout",
+        "auto_requeue",
     ):
         if key in slurm:
             defaults[key] = slurm[key]
@@ -506,13 +522,16 @@ def _config_for_task(
         },
     }
     if args.puckering_prob > 0.0:
-        cmc_moves["hop"]["puckering"] = {
+        puckering_config = {
             "prob": args.puckering_prob,
             "elements": _parse_symbols(args.puckering_elements),
             "height_A": args.puckering_height_A,
             "height_jitter_A": args.puckering_height_jitter_A,
             "max_trials": args.max_puckering_trials,
         }
+        if args.puckering_heights:
+            puckering_config["heights"] = args.puckering_heights
+        cmc_moves["hop"]["puckering"] = puckering_config
 
     system_config: dict[str, object] = {
         "snapshot": rel_snapshot,
@@ -742,14 +761,27 @@ def _write_slurm(root: Path, n_tasks: int, args: argparse.Namespace) -> None:
     if signal_seconds < 0:
         raise ValueError("signal_seconds_before_timeout must be >= 0")
     graceful_pt_stop = workflow == "pt" and signal_seconds > 0
+    auto_requeue = bool(getattr(args, "auto_requeue", False))
+    if auto_requeue and not graceful_pt_stop:
+        raise ValueError(
+            "auto_requeue requires a PT workflow with "
+            "signal_seconds_before_timeout > 0"
+        )
     signal_directive = (
         f"#SBATCH --signal=B:USR1@{signal_seconds}\n" if graceful_pt_stop else ""
+    )
+    requeue_directives = (
+        "#SBATCH --requeue\n#SBATCH --open-mode=append\n"
+        if auto_requeue
+        else ""
     )
     signal_handler = (
         """
 driver_pid=""
+requeue_requested=0
 
 forward_stop_signal() {
+  requeue_requested=1
   if [[ -n "${driver_pid}" ]] && kill -0 "${driver_pid}" 2>/dev/null; then
     echo "Received SIGUSR1; requesting a graceful PT checkpoint and stop."
     kill -USR1 "${driver_pid}"
@@ -758,6 +790,29 @@ forward_stop_signal() {
 trap forward_stop_signal USR1
 """
         if graceful_pt_stop
+        else ""
+    )
+    requeue_block = (
+        """
+if [[ "${requeue_requested}" -eq 1 ]]; then
+  if [[ "${driver_status}" -ne 0 ]]; then
+    echo "PT driver failed after SIGUSR1; refusing automatic requeue." >&2
+    exit "${driver_status}"
+  fi
+  if declare -F cleanup >/dev/null 2>&1; then
+    cleanup
+    trap - EXIT
+  fi
+  requeue_target="${SLURM_JOB_ID}"
+  if [[ -n "${SLURM_ARRAY_JOB_ID:-}" && -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    requeue_target="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+  fi
+  echo "Graceful checkpoint complete; requeueing ${requeue_target}."
+  scontrol requeue "${requeue_target}"
+  exit 0
+fi
+"""
+        if auto_requeue
         else ""
     )
     if graceful_pt_stop:
@@ -776,7 +831,7 @@ while true; do
   driver_status=${{wait_status}}
   break
 done
-exit "${{driver_status}}"
+{requeue_block}exit "${{driver_status}}"
 """
     else:
         driver_command = f"""python3 -u -m {module} --config "${{CONFIG}}"
@@ -797,7 +852,7 @@ exit "${{driver_status}}"
 #SBATCH --output=logs/%A_%a.log
 #SBATCH --account={args.account}
 #SBATCH --time={args.time}
-{signal_directive}#SBATCH --gres={args.gres}
+{requeue_directives}{signal_directive}#SBATCH --gres={args.gres}
 #SBATCH --cpus-per-task={args.cpus_per_task}
 #SBATCH --mem-per-cpu={args.mem_per_cpu}
 #SBATCH --array={array_spec}
@@ -904,7 +959,7 @@ echo "Ray address: ${{RAY_ADDRESS}}"
 #SBATCH --output=logs/%A_%a.log
 #SBATCH --account={args.account}
 #SBATCH --time={args.time}
-{signal_directive}#SBATCH --gres={args.gres}
+{requeue_directives}{signal_directive}#SBATCH --gres={args.gres}
 #SBATCH --cpus-per-task={args.cpus_per_task}
 #SBATCH --mem-per-cpu={args.mem_per_cpu}
 #SBATCH --array={array_spec}
@@ -1194,6 +1249,11 @@ def build_parser(defaults: dict[str, object] | None = None) -> argparse.Argument
     parser.add_argument("--puckering-elements", nargs="+", default=default("puckering_elements", ["Ti", "Zr"]))
     parser.add_argument("--puckering-height-A", type=float, default=default("puckering_height_A", 0.5))
     parser.add_argument("--puckering-height-jitter-A", type=float, default=default("puckering_height_jitter_A", 0.1))
+    parser.add_argument(
+        "--puckering-heights",
+        type=_parse_yaml_mapping,
+        default=default("puckering_heights", None),
+    )
     parser.add_argument("--max-puckering-trials", type=int, default=default("max_puckering_trials", 20))
     parser.add_argument("--adsorbate-surface-clearance-A", type=float, default=default("adsorbate_surface_clearance_A", 0.2))
     parser.add_argument("--adsorbate-surface-xy-tol-A", type=float, default=default("adsorbate_surface_xy_tol_A", 2.5))
@@ -1269,6 +1329,21 @@ def build_parser(defaults: dict[str, object] | None = None) -> argparse.Argument
             "For PT workflows, ask Slurm to send SIGUSR1 this many seconds "
             "before walltime so the driver checkpoints and stops cleanly; 0 disables it."
         ),
+    )
+    parser.add_argument(
+        "--auto-requeue",
+        dest="auto_requeue",
+        action="store_true",
+        default=default("auto_requeue", False),
+        help=(
+            "After a pre-timeout PT checkpoint, requeue the current Slurm "
+            "array task automatically."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-requeue",
+        dest="auto_requeue",
+        action="store_false",
     )
     parser.set_defaults(
         adsorbate_templates=default("adsorbate_templates", None),
